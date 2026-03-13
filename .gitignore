@@ -3,3 +3,5 @@
 /.elixir_ls/
 /*.ez
 erl_crash.dump
+
+.expert/
