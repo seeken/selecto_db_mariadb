@@ -33,4 +33,8 @@ defmodule SelectoDBMariaDB.AdapterTest do
   test "mariadb adapter does not claim stream support" do
     refute SelectoDBMariaDB.Adapter.supports?(:stream)
   end
+
+  test "mariadb adapter reports rollup support" do
+    assert SelectoDBMariaDB.Adapter.supports?(:rollup)
+  end
 end

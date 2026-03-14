@@ -60,7 +60,7 @@ defmodule SelectoDBMariaDB.Adapter do
   def quote_identifier(identifier), do: identifier |> to_string() |> quote_identifier()
 
   @impl true
-  def supports?(feature), do: feature in [:cte, :window_functions, :transactions]
+  def supports?(feature), do: feature in [:cte, :window_functions, :transactions, :rollup]
 
   defp dependency_available? do
     Code.ensure_loaded?(MyXQL) and function_exported?(MyXQL, :start_link, 1) and
