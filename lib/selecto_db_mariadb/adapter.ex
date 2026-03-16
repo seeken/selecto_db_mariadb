@@ -60,7 +60,11 @@ defmodule SelectoDBMariaDB.Adapter do
   def quote_identifier(identifier), do: identifier |> to_string() |> quote_identifier()
 
   @impl true
-  def supports?(feature), do: feature in [:cte, :window_functions, :transactions, :rollup]
+  def supports?(feature),
+    do: feature in [:cte, :window_functions, :transactions, :rollup, :rollup_with_rollup]
+
+  @impl true
+  def rollup_sql(grouped_clauses), do: [grouped_clauses, " with rollup"]
 
   defp dependency_available? do
     Code.ensure_loaded?(MyXQL) and function_exported?(MyXQL, :start_link, 1) and
