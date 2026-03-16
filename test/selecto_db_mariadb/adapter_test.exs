@@ -37,4 +37,45 @@ defmodule SelectoDBMariaDB.AdapterTest do
   test "mariadb adapter reports rollup support" do
     assert SelectoDBMariaDB.Adapter.supports?(:rollup)
   end
+
+  test "mariadb rollup uses WITH ROLLUP syntax without postgres wrapper" do
+    selecto =
+      sales_domain()
+      |> Selecto.configure(:mock_connection, adapter: SelectoDBMariaDB.Adapter, validate: false)
+      |> Selecto.select(["region", {:sum, "amount"}])
+      |> Selecto.group_by(rollup: ["region"])
+      |> Selecto.order_by([{"region", :asc}])
+
+    {sql, _aliases, _params} = Selecto.gen_sql(selecto, [])
+    normalized_sql = String.replace(sql, ~r/\s+/, " ")
+
+    assert String.contains?(
+             String.downcase(normalized_sql),
+             "group by selecto_root.region with rollup"
+           )
+
+    refute String.contains?(normalized_sql, "select * from (")
+    refute String.contains?(normalized_sql, ") as rollupfix")
+    refute String.contains?(String.downcase(normalized_sql), "nulls")
+  end
+
+  defp sales_domain do
+    %{
+      source: %{
+        source_table: "sales",
+        primary_key: :id,
+        fields: [:id, :region, :amount],
+        redact_fields: [],
+        columns: %{
+          id: %{type: :integer},
+          region: %{type: :string},
+          amount: %{type: :decimal}
+        },
+        associations: %{}
+      },
+      schemas: %{},
+      joins: %{},
+      name: "Sales"
+    }
+  end
 end
