@@ -26,17 +26,17 @@ defmodule SelectoDBMariaDB.MixProject do
 
   defp deps do
     [
-      adapter_contract_dep(),
+      selecto_dep(),
       {:myxql, "~> 0.7.0"},
       {:ex_doc, "~> 0.29", only: :dev, runtime: false}
     ]
   end
 
-  defp adapter_contract_dep do
+  defp selecto_dep do
     if use_local_ecosystem?() do
-      {:selecto_db_adapter, path: "../selecto_db_adapter"}
+      {:selecto, path: "../selecto"}
     else
-      {:selecto_db_adapter, ">= 0.1.0 and < 0.2.0"}
+      {:selecto, ">= 0.4.0 and < 0.5.0"}
     end
   end
 
@@ -52,8 +52,7 @@ defmodule SelectoDBMariaDB.MixProject do
       licenses: ["O-Saasy"],
       links: %{
         "GitHub" => @source_url,
-        "Selecto" => "https://github.com/seeken/selecto",
-        "SelectoDBAdapter" => "https://github.com/seeken/selecto_db_adapter"
+        "Selecto" => "https://github.com/seeken/selecto"
       }
     ]
   end

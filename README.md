@@ -10,8 +10,7 @@ using Selecto against MariaDB via `myxql`.
 ```elixir
 def deps do
   [
-    {:selecto, "~> 0.3.16"},
-    {:selecto_db_adapter, "~> 0.1"},
+    {:selecto, "~> 0.4.0"},
     {:selecto_db_mariadb, "~> 0.1"}
   ]
 end
@@ -42,5 +41,4 @@ For local multi-repo development against vendored ecosystem packages, set:
 SELECTO_ECOSYSTEM_USE_LOCAL=true
 ```
 
-When enabled, this package resolves
-`{:selecto_db_adapter, path: "../selecto_db_adapter"}`.
+When enabled, this package resolves `{:selecto, path: "../selecto"}`.
