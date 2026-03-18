@@ -38,6 +38,94 @@ defmodule SelectoDBMariaDB.AdapterTest do
     assert SelectoDBMariaDB.Adapter.supports?(:rollup)
   end
 
+  test "mariadb adapter reports schema introspection support" do
+    assert SelectoDBMariaDB.Adapter.supports?(:schema_introspection)
+  end
+
+  test "mariadb adapter lists tables for selecto_mix generators" do
+    conn =
+      stub_connection(fn query, params, opts ->
+        cond do
+          query =~ "SELECT DATABASE()" ->
+            assert params == []
+            assert opts == [prepared: false]
+            {:ok, %{rows: [["shop_dev"]], columns: ["DATABASE()"]}}
+
+          query =~ "information_schema.tables" ->
+            assert params == ["shop_dev"]
+            assert opts == [prepared: false]
+            {:ok, %{rows: [["orders"], ["users"]], columns: ["table_name"]}}
+
+          true ->
+            flunk("unexpected query: #{query}")
+        end
+      end)
+
+    assert {:ok, ["orders", "users"]} =
+             SelectoDBMariaDB.Adapter.list_tables(conn, schema: "public")
+  end
+
+  test "mariadb adapter introspects tables for selecto_mix generators" do
+    conn =
+      stub_connection(fn query, params, _opts ->
+        cond do
+          query =~ "FROM information_schema.columns" ->
+            assert params == ["shop_dev", "orders"]
+
+            {:ok,
+             %{
+               rows: [
+                 ["id", "int", "int(11)", "NO", nil, nil, 10, 0, nil, 1],
+                 ["customer_id", "int", "int(11)", "NO", nil, nil, 10, 0, nil, 2],
+                 ["inserted_at", "datetime", "datetime", "YES", nil, nil, nil, nil, 6, 3]
+               ],
+               columns: []
+             }}
+
+          query =~ "constraint_name = 'PRIMARY'" ->
+            {:ok, %{rows: [["id"]], columns: []}}
+
+          query =~ "referenced_table_name IS NOT NULL" ->
+            {:ok,
+             %{
+               rows: [["orders_customer_id_fkey", "customer_id", "shop_dev", "customers", "id"]],
+               columns: []
+             }}
+
+          true ->
+            flunk("unexpected query: #{query}")
+        end
+      end)
+
+    assert {:ok, metadata} =
+             SelectoDBMariaDB.Adapter.introspect_table(conn, "orders", schema: "shop_dev")
+
+    assert metadata.table_name == "orders"
+    assert metadata.schema == "shop_dev"
+    assert metadata.fields == [:id, :customer_id, :inserted_at]
+    assert metadata.field_types.id == :integer
+    assert metadata.field_types.inserted_at == :naive_datetime
+    assert metadata.primary_key == :id
+    assert metadata.source == :mariadb
+
+    assert metadata.associations == %{
+             customer: %{
+               association_type: :belongs_to,
+               constraint_name: "orders_customer_id_fkey",
+               field: :customer,
+               is_through: false,
+               join_type: :inner,
+               owner_key: :customer_id,
+               queryable: :customers,
+               related_key: :id,
+               related_module_name: "Customer",
+               related_schema: "Customer",
+               related_table: "customers",
+               type: :belongs_to
+             }
+           }
+  end
+
   test "mariadb rollup uses WITH ROLLUP syntax without postgres wrapper" do
     selecto =
       sales_domain()
@@ -78,4 +166,6 @@ defmodule SelectoDBMariaDB.AdapterTest do
       name: "Sales"
     }
   end
+
+  defp stub_connection(query_fun), do: %{query_fun: query_fun}
 end
