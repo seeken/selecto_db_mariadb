@@ -93,6 +93,47 @@ defmodule SelectoDBMariaDB.Adapter do
   end
 
   @impl true
+  def list_relations(connection, opts \\ []) do
+    include_views = Keyword.get(opts, :include_views, false)
+
+    with {:ok, schema} <- resolve_schema(connection, opts) do
+      query =
+        if include_views do
+          """
+          SELECT table_name,
+                 CASE table_type
+                   WHEN 'BASE TABLE' THEN 'table'
+                   WHEN 'VIEW' THEN 'view'
+                 END AS source_kind
+          FROM information_schema.tables
+          WHERE table_schema = ?
+            AND table_type IN ('BASE TABLE', 'VIEW')
+          ORDER BY table_name
+          """
+        else
+          """
+          SELECT table_name, 'table' AS source_kind
+          FROM information_schema.tables
+          WHERE table_schema = ?
+            AND table_type = 'BASE TABLE'
+          ORDER BY table_name
+          """
+        end
+
+      case introspection_query(connection, query, [schema]) do
+        {:ok, %{rows: rows}} ->
+          {:ok,
+           Enum.map(rows, fn [table_name, source_kind] ->
+             %{name: table_name, source_kind: normalize_relation_source_kind(source_kind)}
+           end)}
+
+        {:error, reason} ->
+          {:error, {:query_failed, reason}}
+      end
+    end
+  end
+
+  @impl true
   def introspect_table(connection, table_name, opts \\ []) do
     include_associations = Keyword.get(opts, :include_associations, true)
     expand = Keyword.get(opts, :expand, false)
@@ -185,6 +226,10 @@ defmodule SelectoDBMariaDB.Adapter do
         {:error, {:database_name_query_failed, reason}}
     end
   end
+
+  defp normalize_relation_source_kind("table"), do: :table
+  defp normalize_relation_source_kind("view"), do: :view
+  defp normalize_relation_source_kind(other), do: other
 
   defp normalize_query(query) when is_binary(query), do: query
   defp normalize_query(query), do: IO.iodata_to_binary(query)

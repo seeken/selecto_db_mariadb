@@ -65,6 +65,30 @@ defmodule SelectoDBMariaDB.AdapterTest do
              SelectoDBMariaDB.Adapter.list_tables(conn, schema: "public")
   end
 
+  test "mariadb adapter lists relations including views when requested" do
+    conn =
+      stub_connection(fn query, params, opts ->
+        cond do
+          query =~ "SELECT DATABASE()" ->
+            assert params == []
+            assert opts == [prepared: false]
+            {:ok, %{rows: [["shop_dev"]], columns: ["DATABASE()"]}}
+
+          query =~ "table_type IN ('BASE TABLE', 'VIEW')" ->
+            assert params == ["shop_dev"]
+            assert opts == [prepared: false]
+            {:ok, %{rows: [["orders", "table"], ["active_orders", "view"]], columns: []}}
+
+          true ->
+            flunk("unexpected query: #{query}")
+        end
+      end)
+
+    assert {:ok,
+            [%{name: "orders", source_kind: :table}, %{name: "active_orders", source_kind: :view}]} =
+             SelectoDBMariaDB.Adapter.list_relations(conn, schema: "public", include_views: true)
+  end
+
   test "mariadb adapter introspects tables for selecto_mix generators" do
     conn =
       stub_connection(fn query, params, _opts ->
