@@ -1,6 +1,8 @@
 defmodule SelectoDBMariaDB.AdapterTest do
   use ExUnit.Case, async: true
 
+  alias Selecto.Write.{Batch, Command, Error, Preview}
+
   test "adapter exposes the selecto adapter contract" do
     assert Code.ensure_loaded?(SelectoDBMariaDB.Adapter)
     assert function_exported?(SelectoDBMariaDB.Adapter, :name, 0)
@@ -9,11 +11,108 @@ defmodule SelectoDBMariaDB.AdapterTest do
     assert function_exported?(SelectoDBMariaDB.Adapter, :placeholder, 1)
     assert function_exported?(SelectoDBMariaDB.Adapter, :quote_identifier, 1)
     assert function_exported?(SelectoDBMariaDB.Adapter, :supports?, 1)
+    assert function_exported?(SelectoDBMariaDB.Adapter, :transaction, 3)
   end
 
   test "mariadb adapter reports expected placeholder and quoting strategy" do
     assert SelectoDBMariaDB.Adapter.placeholder(3) == "?"
     assert SelectoDBMariaDB.Adapter.quote_identifier("order") == "`order`"
+  end
+
+  test "normalizes command results whose driver columns are nil" do
+    assert SelectoDBMariaDB.Adapter.normalize_result(%{
+             rows: nil,
+             columns: nil,
+             num_rows: 0,
+             last_insert_id: nil
+           }) == %{
+             rows: [],
+             columns: [],
+             num_rows: 0,
+             metadata: %{last_insert_id: nil}
+           }
+  end
+
+  test "advertises the versioned flat-write contract without overclaiming returning or graphs" do
+    capabilities =
+      SelectoDBMariaDB.Adapter.write_capabilities(
+        stub_connection(fn _, _, _ ->
+          {:ok, %{rows: [["11.4.5-MariaDB"]], columns: ["VERSION()"]}}
+        end)
+      )
+
+    assert capabilities.protocol_version == Selecto.Write.Capabilities.protocol_version()
+    assert capabilities.insert
+    assert capabilities.update
+    assert capabilities.upsert
+    assert capabilities.delete
+    assert capabilities.atomic_batch
+    refute capabilities.returning
+    refute capabilities.generated_keys
+    refute capabilities.write_graph
+    assert capabilities.server_version == "11.4.5-MariaDB"
+    assert SelectoDBMariaDB.Adapter.write_capabilities(:unused).server_version == nil
+  end
+
+  test "previews parameterized guarded writes and native upsert syntax" do
+    insert =
+      command!(:insert,
+        assignments: [
+          %{field: :tenant_id, value: {:context, :tenant_id}},
+          %{field: :name, value: {:literal, "updated"}}
+        ],
+        metadata: %{
+          foreign_key_guards: [
+            %{field: :tenant_id, relation: :tenants, target_field: :id}
+          ]
+        }
+      )
+
+    assert {:ok, %Preview{statements: [%{text: insert_sql, params: [45, "updated", 45]}]}} =
+             SelectoDBMariaDB.Adapter.preview_write(:unused, insert, context: %{tenant_id: 45})
+
+    assert insert_sql =~ "INSERT INTO `items`"
+    assert insert_sql =~ "EXISTS (SELECT 1 FROM `tenants` WHERE `id` = ?)"
+
+    upsert =
+      command!(:upsert,
+        assignments: [
+          %{field: :id, value: {:literal, 7}},
+          %{field: :name, value: {:literal, "updated"}}
+        ],
+        metadata: %{
+          conflict_target: [:id],
+          declared_conflict_targets: [[:id]],
+          upsert_update_fields: [:name]
+        }
+      )
+
+    assert {:ok, %Preview{statements: [%{text: upsert_sql, params: [7, "updated"]}]}} =
+             SelectoDBMariaDB.Adapter.preview_write(:unused, upsert, [])
+
+    assert upsert_sql =~ "ON DUPLICATE KEY UPDATE `name` = VALUES(`name`)"
+
+    ambiguous = put_in(upsert.metadata.declared_conflict_targets, [[:id], [:external_id]])
+
+    assert {:error, %Error{type: :write_capability_missing}} =
+             SelectoDBMariaDB.Adapter.preview_write(:unused, ambiguous, [])
+  end
+
+  test "preflight rejects returning and graph semantics the adapter cannot preserve" do
+    selecto = %Selecto{adapter: SelectoDBMariaDB.Adapter, connection: :unused}
+    returning = %{command!(:insert) | returning: [:id]}
+
+    assert {:error, %Error{type: :write_capability_missing}} =
+             Selecto.Write.preview(selecto, returning)
+
+    assert {:ok, batch} = Batch.new([command!(:insert), command!(:delete)])
+    assert {:ok, %Preview{metadata: %{atomic?: true}}} = Selecto.Write.preview(selecto, batch)
+  end
+
+  test "upsert row normalization preserves a failed guard as zero" do
+    assert SelectoDBMariaDB.Adapter.logical_affected_rows(:upsert, 0) == 0
+    assert SelectoDBMariaDB.Adapter.logical_affected_rows(:upsert, 1) == 1
+    assert SelectoDBMariaDB.Adapter.logical_affected_rows(:upsert, 2) == 1
   end
 
   test "mariadb adapter rejects invalid connection options" do
@@ -192,4 +291,19 @@ defmodule SelectoDBMariaDB.AdapterTest do
   end
 
   defp stub_connection(query_fun), do: %{query_fun: query_fun}
+
+  defp command!(operation, overrides \\ []) do
+    defaults = %{
+      operation: operation,
+      relation: :items,
+      assignments: [%{field: :name, value: {:literal, "value"}}],
+      predicate: if(operation in [:update, :delete], do: {:eq, {:field, :id}, {:literal, 1}}),
+      expected_cardinality: {:exactly, 1},
+      returning: :none,
+      metadata: %{}
+    }
+
+    {:ok, command} = Command.new(Map.merge(defaults, Map.new(overrides)))
+    command
+  end
 end

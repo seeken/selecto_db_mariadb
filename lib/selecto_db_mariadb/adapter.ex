@@ -4,6 +4,10 @@ defmodule SelectoDBMariaDB.Adapter do
   """
 
   @behaviour Selecto.DB.Adapter
+  @behaviour Selecto.DB.WriteAdapter
+
+  alias Selecto.Write.{Batch, Command, Error, Graph, Result}
+  alias SelectoDBMariaDB.WriteCompiler
 
   @missing_dependency {:adapter_dependency_missing, :myxql}
 
@@ -35,6 +39,28 @@ defmodule SelectoDBMariaDB.Adapter do
     else
       execute_direct(connection, query, params, opts)
     end
+  end
+
+  @impl true
+  def transaction(connection, fun, _opts) when is_function(fun, 1) do
+    if dependency_available?() do
+      case MyXQL.transaction(resolve_connection(connection), fn tx ->
+             case fun.(tx) do
+               {:ok, result} -> result
+               {:error, reason} -> MyXQL.rollback(tx, reason)
+               result -> result
+             end
+           end) do
+        {:ok, result} -> {:ok, result}
+        {:error, reason} -> {:error, reason}
+      end
+    else
+      {:error, @missing_dependency}
+    end
+  rescue
+    exception -> {:error, exception}
+  catch
+    :exit, reason -> {:error, reason}
   end
 
   defp execute_direct(connection, query, params, opts) do
@@ -70,6 +96,157 @@ defmodule SelectoDBMariaDB.Adapter do
         :rollup_with_rollup,
         :schema_introspection
       ]
+
+  @impl Selecto.DB.WriteAdapter
+  def write_capabilities(connection) do
+    %{
+      protocol_version: Selecto.Write.Capabilities.protocol_version(),
+      insert: true,
+      update: true,
+      upsert: :single_declared_conflict_target,
+      delete: true,
+      returning: false,
+      generated_keys: false,
+      transactions: true,
+      atomic_batch: true,
+      write_graph: false,
+      dialect: :mariadb,
+      server_version: server_version(connection),
+      upsert_strategy: :on_duplicate_key
+    }
+  end
+
+  @impl Selecto.DB.WriteAdapter
+  def preview_write(_connection, %Command{} = command, opts),
+    do: WriteCompiler.preview(command, opts)
+
+  def preview_write(_connection, %Batch{} = batch, opts), do: WriteCompiler.preview(batch, opts)
+  def preview_write(_connection, %Graph{} = graph, _opts), do: unsupported_graph(graph)
+  def preview_write(_connection, write, _opts), do: invalid_write_input(write)
+
+  @impl Selecto.DB.WriteAdapter
+  def execute_write(connection, %Command{} = command, opts) do
+    with :ok <- Command.validate(command) do
+      with_write_transaction(connection, fn tx -> execute_write_command(tx, command, opts) end)
+    end
+  end
+
+  def execute_write(connection, %Batch{} = batch, opts) do
+    with :ok <- Batch.validate(batch) do
+      with_write_transaction(connection, fn tx ->
+        Enum.reduce_while(batch.commands, {:ok, []}, fn command, {:ok, results} ->
+          case execute_write_command(tx, command, opts) do
+            {:ok, result} -> {:cont, {:ok, results ++ [result]}}
+            {:error, _} = error -> {:halt, error}
+          end
+        end)
+      end)
+    end
+  end
+
+  def execute_write(_connection, %Graph{} = graph, _opts), do: unsupported_graph(graph)
+  def execute_write(_connection, write, _opts), do: invalid_write_input(write)
+
+  defp execute_write_command(connection, command, opts) do
+    with {:ok, statement} <- WriteCompiler.compile(command, opts),
+         {:ok, query_result} <- execute(connection, statement.text, statement.params, opts),
+         {:ok, affected_rows} <- enforce_cardinality(command, query_result) do
+      {:ok,
+       %Result{
+         operation: command.operation,
+         affected_rows: affected_rows,
+         rows: result_rows(query_result),
+         metadata: %{dialect: :mariadb}
+       }}
+    else
+      {:error, %Error{} = error} -> {:error, error}
+      {:error, reason} -> {:error, write_error(:execution_failed, reason)}
+    end
+  end
+
+  defp enforce_cardinality(%Command{operation: :upsert, expected_cardinality: expected}, result) do
+    # CLIENT_FOUND_ROWS makes a matched no-op report 1. A zero therefore means
+    # the guarded INSERT SELECT produced no row and must remain a cardinality
+    # failure rather than being normalized into false success.
+    physical = Map.get(result, :num_rows, 0)
+    logical = logical_affected_rows(:upsert, physical)
+    check_cardinality(logical, expected)
+  end
+
+  defp enforce_cardinality(%Command{expected_cardinality: expected}, result),
+    do: check_cardinality(Map.get(result, :num_rows, 0), expected)
+
+  @doc false
+  def logical_affected_rows(:upsert, physical) when physical in [1, 2], do: 1
+  def logical_affected_rows(_operation, physical), do: physical
+
+  defp check_cardinality(count, expected) do
+    if cardinality_matches?(count, expected) do
+      {:ok, count}
+    else
+      {:error,
+       Error.new(:cardinality_mismatch, "write affected an unexpected number of rows",
+         details: %{expected: expected, actual: count}
+       )}
+    end
+  end
+
+  defp cardinality_matches?(count, {:exactly, expected}), do: count == expected
+  defp cardinality_matches?(count, {:at_most, expected}), do: count <= expected
+  defp cardinality_matches?(count, {:at_least, expected}), do: count >= expected
+  defp cardinality_matches?(count, {:between, minimum, maximum}), do: count in minimum..maximum
+  defp cardinality_matches?(_count, :many), do: true
+
+  defp result_rows(%{rows: rows, columns: columns}) do
+    Enum.map(rows, fn row -> Map.new(Enum.zip(columns, row)) end)
+  end
+
+  defp with_write_transaction(connection, fun) do
+    case transaction(connection, fun, []) do
+      {:ok, result} ->
+        {:ok, result}
+
+      {:error, %Error{} = error} ->
+        {:error, error}
+
+      {:error, @missing_dependency} ->
+        {:error, write_error(:adapter_dependency_missing, @missing_dependency)}
+
+      {:error, reason} ->
+        {:error, write_error(:transaction_failed, reason)}
+    end
+  end
+
+  defp server_version(connection) do
+    case introspection_query(connection, "SELECT VERSION()", []) do
+      {:ok, %{rows: [[version] | _]}} -> to_string(version)
+      _ -> nil
+    end
+  rescue
+    _exception -> nil
+  catch
+    :exit, _reason -> nil
+  end
+
+  defp resolve_connection(%{adapter: _adapter, connection: connection}), do: connection
+  defp resolve_connection(connection), do: connection
+
+  defp unsupported_graph(graph) do
+    {:error,
+     Error.new(:write_capability_missing, "MariaDB adapter cannot preserve portable graph writes",
+       details: %{write: graph, missing: [:write_graph, :generated_keys]}
+     )}
+  end
+
+  defp invalid_write_input(write) do
+    {:error,
+     Error.new(:invalid_command, "expected a portable write command or batch",
+       details: %{actual: write}
+     )}
+  end
+
+  defp write_error(type, reason),
+    do: Error.adapter_failure(type, :mariadb, reason, "MariaDB write failed")
 
   @impl true
   def rollup_sql(grouped_clauses), do: [grouped_clauses, " with rollup"]
@@ -624,15 +801,19 @@ defmodule SelectoDBMariaDB.Adapter do
     end
   end
 
-  defp normalize_result(%{rows: rows} = result) do
+  @doc false
+  def normalize_result(%{rows: rows} = result) do
     columns =
       result
       |> Map.get(:columns, [])
+      |> Kernel.||([])
       |> Enum.map(&normalize_column_name/1)
 
     %{
       rows: rows || [],
-      columns: columns
+      columns: columns,
+      num_rows: Map.get(result, :num_rows, length(rows || [])),
+      metadata: %{last_insert_id: Map.get(result, :last_insert_id)}
     }
   end
 
