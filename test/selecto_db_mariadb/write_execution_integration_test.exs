@@ -14,6 +14,37 @@ defmodule SelectoDBMariaDB.WriteExecutionIntegrationTest do
       assert capabilities.server_version =~ "MariaDB"
       assert capabilities.upsert == :single_declared_conflict_target
 
+      assert {:ok, tables} = Adapter.list_tables(fixture.conn, schema: fixture.database)
+      assert Enum.sort(tables) == ["items", "tenants"]
+
+      assert {:ok, relations} =
+               Adapter.list_relations(fixture.conn,
+                 schema: fixture.database,
+                 include_views: true
+               )
+
+      assert Enum.any?(relations, &(&1 == %{name: "items", source_kind: :table}))
+
+      assert {:ok, metadata} =
+               Adapter.introspect_table(fixture.conn, "items",
+                 schema: fixture.database,
+                 expand: false
+               )
+
+      assert metadata.primary_key == :id
+      assert metadata.field_types.tenant_id == :integer
+      assert metadata.source == :mariadb
+
+      assert {:ok, %{rows: rollup_rows}} =
+               Adapter.execute(
+                 fixture.conn,
+                 "SELECT `id`, COUNT(*) FROM `tenants` GROUP BY `id` WITH ROLLUP",
+                 [],
+                 query_type: :text
+               )
+
+      assert length(rollup_rows) == 3
+
       assert {:ok, %Result{operation: :insert, affected_rows: 1}} =
                Adapter.execute_write(
                  fixture.conn,

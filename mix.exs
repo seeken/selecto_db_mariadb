@@ -1,7 +1,7 @@
 defmodule SelectoDBMariaDB.MixProject do
   use Mix.Project
 
-  @version "0.2.0"
+  @version "0.5.0"
   @source_url "https://github.com/seeken/selecto_db_mariadb"
 
   def project do
@@ -36,7 +36,7 @@ defmodule SelectoDBMariaDB.MixProject do
     if use_local_ecosystem?() do
       {:selecto, path: local_selecto_path()}
     else
-      {:selecto, ">= 0.4.13 and < 0.6.0"}
+      {:selecto, ">= 0.5.0 and < 0.6.0"}
     end
   end
 
@@ -56,7 +56,7 @@ defmodule SelectoDBMariaDB.MixProject do
 
   defp package do
     [
-      licenses: ["O-Saasy"],
+      licenses: ["LicenseRef-O-Saasy"],
       links: %{
         "GitHub" => @source_url,
         "Selecto" => "https://github.com/seeken/selecto"

@@ -10,7 +10,7 @@ using Selecto against MariaDB via `myxql`.
 ```elixir
 def deps do
   [
-    {:selecto, ">= 0.4.13 and < 0.6.0"},
+    {:selecto, ">= 0.5.0 and < 0.6.0"},
     {:selecto_db_mariadb, "~> 0.2"}
   ]
 end

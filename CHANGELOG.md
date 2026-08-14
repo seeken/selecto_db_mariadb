@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.5.0 - 2026-08-14
+
+- Normalize the custom O'Saasy Hex metadata to `LicenseRef-O-Saasy`; the
+  packaged license text and licensing terms are unchanged.
+- Raised the Selecto baseline to `0.5.0` and implemented the explicit runtime,
+  normalized result/error/type, and typed dialect-fragment ports.
+- Unsupported PostgreSQL-shaped features now fail with structured capability
+  evidence instead of inheriting core fallback SQL.
+- MariaDB now owns portable datetime-format and case-insensitive comparison
+  rendering and explicitly rejects unsupported timezone/epoch conversion.
+
 ## 0.2.0 - 2026-08-12
 
 - Added versioned portable flat writes and atomic batches through MyXQL.
