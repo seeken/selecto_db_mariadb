@@ -2,6 +2,8 @@
 
 ## 0.5.0 - 2026-08-14
 
+- Removed renderer aliases for the retired `json_extract_path`,
+  `json_extract_path_text`, and `json_insert` core operations.
 - Normalize the custom O'Saasy Hex metadata to `LicenseRef-O-Saasy`; the
   packaged license text and licensing terms are unchanged.
 - Raised the Selecto baseline to `0.5.0` and implemented the explicit runtime,

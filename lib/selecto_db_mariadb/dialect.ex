@@ -105,10 +105,10 @@ defmodule SelectoDBMariaDB.Dialect do
   @impl true
   def render_json_operation(%Operation{} = operation, selecto) do
     case operation.operation do
-      kind when kind in [:json_extract, :json_extract_path] ->
+      :json_extract ->
         operation_extraction(operation, false, selecto)
 
-      kind when kind in [:json_extract_text, :json_extract_path_text] ->
+      :json_extract_text ->
         operation_extraction(operation, true, selecto)
 
       :json_contains ->
@@ -144,9 +144,6 @@ defmodule SelectoDBMariaDB.Dialect do
 
       :json_set ->
         {:ok, json_mutation("JSON_SET", operation)}
-
-      :json_insert ->
-        {:ok, json_mutation("JSON_INSERT", operation)}
 
       :json_remove ->
         {:ok,
