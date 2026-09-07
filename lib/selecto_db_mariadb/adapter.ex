@@ -197,6 +197,7 @@ defmodule SelectoDBMariaDB.Adapter do
       transactions: true,
       atomic_batch: true,
       write_graph: false,
+      prepared_candidate_state: false,
       dialect: :mariadb,
       server_version: server_version(connection),
       upsert_strategy: :on_duplicate_key

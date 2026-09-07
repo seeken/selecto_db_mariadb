@@ -50,6 +50,7 @@ defmodule SelectoDBMariaDB.AdapterTest do
     refute capabilities.returning
     refute capabilities.generated_keys
     refute capabilities.write_graph
+    refute capabilities.prepared_candidate_state
     assert capabilities.server_version == "11.4.5-MariaDB"
     assert SelectoDBMariaDB.Adapter.write_capabilities(:unused).server_version == nil
   end
