@@ -291,6 +291,143 @@ defmodule SelectoDBMariaDB.AdapterTest do
     }
   end
 
+  test "a tenant foreign-key guard binds the referenced row's tenant behind an alias" do
+    guard = %{
+      field: :project_id,
+      relation: :projects,
+      target_field: :id,
+      tenant_field: :tenant_id,
+      tenant_value: 7
+    }
+
+    insert =
+      command!(:insert,
+        relation: :tasks,
+        assignments: [%{field: :project_id, value: {:literal, 80}}],
+        metadata: %{foreign_key_guards: [guard]}
+      )
+
+    assert {:ok, %Preview{statements: [%{text: sql, params: [80, 80, 7]}]}} =
+             SelectoDBMariaDB.Adapter.preview_write(:unused, insert, [])
+
+    assert sql ==
+             "INSERT INTO `tasks` (`project_id`) SELECT ? WHERE EXISTS " <>
+               "(SELECT 1 FROM `projects` AS `selecto_fk_parent` " <>
+               "WHERE `selecto_fk_parent`.`id` = ? AND `selecto_fk_parent`.`tenant_id` = ?)"
+
+    update =
+      command!(:update,
+        relation: :tasks,
+        assignments: [%{field: :project_id, value: {:literal, 80}}],
+        metadata: %{foreign_key_guards: [guard]}
+      )
+
+    assert {:ok, %Preview{statements: [%{text: update_sql, params: [80, 1, 80, 7]}]}} =
+             SelectoDBMariaDB.Adapter.preview_write(:unused, update, [])
+
+    assert update_sql =~
+             "WHERE `id` = ? AND EXISTS (SELECT 1 FROM `projects` AS `selecto_fk_parent` " <>
+               "WHERE `selecto_fk_parent`.`id` = ? AND `selecto_fk_parent`.`tenant_id` = ?)"
+
+    base = Map.drop(guard, [:tenant_field, :tenant_value])
+
+    for invalid <- [
+          Map.put(base, :tenant_field, :tenant_id),
+          Map.merge(base, %{tenant_field: :tenant_id, tenant_value: nil}),
+          Map.merge(base, %{tenant_field: 7, tenant_value: 7}),
+          Map.merge(base, %{tenant_field: nil, tenant_value: 7}),
+          Map.merge(base, %{tenant_field: " ", tenant_value: 7})
+        ] do
+      command = %{insert | metadata: %{foreign_key_guards: [invalid]}}
+
+      assert {:error, %Error{type: :invalid_foreign_key_guard}} =
+               SelectoDBMariaDB.Adapter.preview_write(:unused, command, [])
+    end
+  end
+
+  test "refuses upserts under any write scope because ON DUPLICATE KEY ignores the target" do
+    upsert =
+      command!(:upsert,
+        assignments: [
+          %{field: :tenant_id, value: {:literal, 7}},
+          %{field: :sku, value: {:literal, "B"}},
+          %{field: :name, value: {:literal, "updated"}}
+        ],
+        metadata: %{
+          conflict_target: [:tenant_id, :sku],
+          declared_conflict_targets: [[:tenant_id, :sku]],
+          upsert_update_fields: [:name]
+        }
+      )
+
+    assert {:ok, %Preview{}} = SelectoDBMariaDB.Adapter.preview_write(:unused, upsert, [])
+
+    assert {:ok, %Preview{}} =
+             SelectoDBMariaDB.Adapter.preview_write(:unused, upsert, context: %{actor: 3})
+
+    scoped = [
+      {upsert, [context: %{tenant_id: 7}], :tenant},
+      {upsert, [context: %{"tenant" => 7}], :tenant},
+      {upsert, [context: %{required_filters: [{"tenant_id", 7}]}], :tenant},
+      {%{upsert | predicate: {:eq, {:field, :tenant_id}, {:literal, 7}}}, [], :predicate},
+      {put_in(upsert.metadata[:query_enforcement], %{}), [], :query_enforcement}
+    ]
+
+    for {command, opts, scope} <- scoped do
+      assert {:error, %Error{type: :unsupported_scope_predicate, details: %{scope: ^scope}}} =
+               SelectoDBMariaDB.Adapter.preview_write(:unused, command, opts)
+    end
+  end
+
+  test "execute/4 refuses non-binary protocols before contacting the server" do
+    for query_type <- [:text, :binary_then_text] do
+      assert {:error, %Selecto.Error{type: :validation_error, details: %{option: :query_type}}} =
+               SelectoDBMariaDB.Adapter.execute(:unused, "SELECT 1; SELECT 2", [],
+                 query_type: query_type
+               )
+    end
+  end
+
+  test "driver errors keep a stable category and drop server text and SQL" do
+    duplicate = %MyXQL.Error{
+      message: "Duplicate entry 'secret@example.test' for key 'people.email'",
+      statement: "INSERT INTO `people` VALUES ('secret@example.test')",
+      mysql: %{code: 1062, name: :ER_DUP_ENTRY}
+    }
+
+    connection = %DBConnection.ConnectionError{
+      message: "tcp connect (db.internal:3306): connection refused - :econnrefused"
+    }
+
+    assert %Selecto.Error{
+             type: :query_error,
+             query: nil,
+             params: [],
+             details: %{adapter: :mariadb, category: :unique_violation, code: 1062}
+           } = error = SelectoDBMariaDB.Adapter.normalize_error(duplicate)
+
+    refute inspect(error) =~ "secret"
+    refute inspect(error) =~ "people"
+
+    assert %Selecto.Error{type: :connection_error, details: %{category: :connection_error}} =
+             connection_error = SelectoDBMariaDB.Adapter.normalize_error(connection)
+
+    refute inspect(connection_error) =~ "db.internal"
+
+    for {code, category} <- [
+          {1452, :foreign_key_violation},
+          {1048, :not_null_violation},
+          {4025, :check_violation},
+          {1064, :database_error}
+        ] do
+      assert %Selecto.Error{details: %{category: ^category}} =
+               SelectoDBMariaDB.Adapter.sanitize_error(%MyXQL.Error{
+                 message: "x",
+                 mysql: %{code: code, name: nil}
+               })
+    end
+  end
+
   defp stub_connection(query_fun), do: %{query_fun: query_fun}
 
   defp command!(operation, overrides \\ []) do

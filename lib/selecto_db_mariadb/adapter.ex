@@ -72,6 +72,8 @@ defmodule SelectoDBMariaDB.Adapter do
 
   @impl true
   def normalize_error(%Selecto.Error{} = error), do: error
+  def normalize_error(%MyXQL.Error{} = error), do: sanitize_error(error)
+  def normalize_error(%DBConnection.ConnectionError{} = error), do: sanitize_error(error)
   def normalize_error(reason), do: Selecto.Error.from_reason(reason)
 
   @impl true
@@ -133,14 +135,73 @@ defmodule SelectoDBMariaDB.Adapter do
 
   defp execute_direct(connection, query, params, opts) do
     if dependency_available?() do
-      case MyXQL.query(connection, normalize_query(query), params, opts) do
-        {:ok, result} -> {:ok, normalize_result(result)}
-        {:error, reason} -> {:error, reason}
+      with :ok <- require_binary_protocol(opts) do
+        case MyXQL.query(connection, normalize_query(query), params, opts) do
+          {:ok, result} -> {:ok, normalize_result(result)}
+          {:error, reason} -> {:error, sanitize_error(reason)}
+        end
       end
     else
       {:error, @missing_dependency}
     end
   end
+
+  # MyXQL always negotiates CLIENT_MULTI_STATEMENTS, so a text-protocol query
+  # would run every statement in the string. Prepared (binary) statements hold
+  # exactly one.
+  defp require_binary_protocol(opts) do
+    case Keyword.get(opts, :query_type, :binary) do
+      :binary ->
+        :ok
+
+      query_type ->
+        {:error,
+         Selecto.Error.validation_error("MariaDB adapter executes only prepared statements", %{
+           adapter: :mariadb,
+           option: :query_type,
+           value: query_type
+         })}
+    end
+  end
+
+  @unique_violation_codes [1022, 1062, 1169, 1586]
+  @foreign_key_violation_codes [1216, 1217, 1451, 1452]
+  @not_null_violation_codes [1048, 1364]
+  @check_violation_codes [3819, 4025]
+
+  # Driver errors carry the server's message (which can quote row values) and
+  # the statement text. Only a stable category and the numeric server code
+  # leave the adapter.
+  @doc false
+  def sanitize_error(%MyXQL.Error{mysql: %{code: code}}) when is_integer(code) do
+    Selecto.Error.query_error("MariaDB rejected the statement", nil, [], %{
+      adapter: :mariadb,
+      category: error_category(code),
+      code: code
+    })
+  end
+
+  def sanitize_error(%DBConnection.ConnectionError{}) do
+    Selecto.Error.connection_error("MariaDB connection failed", %{
+      adapter: :mariadb,
+      category: :connection_error
+    })
+  end
+
+  def sanitize_error(%Selecto.Error{} = error), do: error
+
+  def sanitize_error(_reason) do
+    Selecto.Error.query_error("MariaDB query failed", nil, [], %{
+      adapter: :mariadb,
+      category: :database_error
+    })
+  end
+
+  defp error_category(code) when code in @unique_violation_codes, do: :unique_violation
+  defp error_category(code) when code in @foreign_key_violation_codes, do: :foreign_key_violation
+  defp error_category(code) when code in @not_null_violation_codes, do: :not_null_violation
+  defp error_category(code) when code in @check_violation_codes, do: :check_violation
+  defp error_category(_code), do: :database_error
 
   @impl true
   def placeholder(_index), do: "?"
@@ -248,9 +309,12 @@ defmodule SelectoDBMariaDB.Adapter do
        }}
     else
       {:error, %Error{} = error} -> {:error, error}
+      {:error, %Selecto.Error{details: %{category: category}}} -> execution_failed(category)
       {:error, reason} -> {:error, write_error(:execution_failed, reason)}
     end
   end
+
+  defp execution_failed(category), do: {:error, write_error(:execution_failed, category)}
 
   defp enforce_cardinality(%Command{operation: :upsert, expected_cardinality: expected}, result) do
     # CLIENT_FOUND_ROWS makes a matched no-op report 1. A zero therefore means

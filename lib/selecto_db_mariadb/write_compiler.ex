@@ -51,7 +51,8 @@ defmodule SelectoDBMariaDB.WriteCompiler do
   defp compile_upsert(command, opts) do
     opts = with_field_types(opts, command.metadata)
 
-    with {:ok, assignments} <- compile_assignments(command.assignments, opts),
+    with :ok <- refuse_scoped_upsert(command, opts),
+         {:ok, assignments} <- compile_assignments(command.assignments, opts),
          :ok <- require_assignments(assignments, :upsert),
          :ok <- validate_conflict_target(command.metadata),
          {:ok, update_assignments} <-
@@ -245,6 +246,11 @@ defmodule SelectoDBMariaDB.WriteCompiler do
     end
   end
 
+  # A guard proves the referenced row exists. A guard that names
+  # `tenant_field` must also carry `tenant_value`; the referenced row must then
+  # belong to that tenant. Its columns are qualified by a subquery alias so a
+  # column missing from the referenced relation fails instead of resolving to
+  # the outer write target.
   defp compile_foreign_key_guards(metadata, assignments) do
     metadata
     |> Map.get(:foreign_key_guards, [])
@@ -255,12 +261,11 @@ defmodule SelectoDBMariaDB.WriteCompiler do
       with %{field: field, relation: relation, target_field: target_field} <- guard,
            %{params: [value]} <-
              Enum.find(assignments, &(to_string(&1.field) == to_string(field))),
-           true <- valid_ref?(relation) and valid_ref?(target_field) do
-        text =
-          "EXISTS (SELECT 1 FROM #{quote_relation(relation)} WHERE " <>
-            "#{quote_identifier(target_field)} = ?)"
+           true <- valid_ref?(relation) and valid_ref?(target_field),
+           {:ok, tenant} <- foreign_key_guard_tenant(guard) do
+        {text, guard_params} = foreign_key_guard_text(relation, target_field, value, tenant)
 
-        {:cont, {:ok, [text | texts], params ++ [value], offset + 1}}
+        {:cont, {:ok, [text | texts], params ++ guard_params, offset + length(guard_params)}}
       else
         _ ->
           {:halt,
@@ -282,6 +287,32 @@ defmodule SelectoDBMariaDB.WriteCompiler do
       error ->
         error
     end
+  end
+
+  defp foreign_key_guard_tenant(guard) do
+    case {Map.fetch(guard, :tenant_field), Map.get(guard, :tenant_value)} do
+      {:error, _value} ->
+        {:ok, nil}
+
+      {{:ok, tenant_field}, tenant_value} when not is_nil(tenant_value) ->
+        if valid_ref?(tenant_field), do: {:ok, {tenant_field, tenant_value}}, else: :error
+
+      _invalid ->
+        :error
+    end
+  end
+
+  defp foreign_key_guard_text(relation, target_field, value, nil) do
+    {"EXISTS (SELECT 1 FROM #{quote_relation(relation)} WHERE " <>
+       "#{quote_identifier(target_field)} = ?)", [value]}
+  end
+
+  defp foreign_key_guard_text(relation, target_field, value, {tenant_field, tenant}) do
+    alias_name = quote_identifier("selecto_fk_parent")
+
+    {"EXISTS (SELECT 1 FROM #{quote_relation(relation)} AS #{alias_name} " <>
+       "WHERE #{alias_name}.#{quote_identifier(target_field)} = ? " <>
+       "AND #{alias_name}.#{quote_identifier(tenant_field)} = ?)", [value, tenant]}
   end
 
   defp compile_predicate_list([], _separator, _opts, _offset),
@@ -345,6 +376,44 @@ defmodule SelectoDBMariaDB.WriteCompiler do
         :ok
     end
   end
+
+  # ON DUPLICATE KEY UPDATE fires on the primary key and on every unique index,
+  # not only on the declared conflict target, so it can update a row that lies
+  # outside a tenant or other write scope. Like the Go MySQL-family adapters,
+  # refuse an upsert whenever any write scope applies.
+  defp refuse_scoped_upsert(command, opts) do
+    case upsert_scope(command, Keyword.get(opts, :context, %{})) do
+      nil ->
+        :ok
+
+      scope ->
+        {:error,
+         Error.new(
+           :unsupported_scope_predicate,
+           "MySQL-family adapters cannot apply write scope predicates to upserts",
+           details: %{scope: scope, upsert_strategy: :on_duplicate_key}
+         )}
+    end
+  end
+
+  defp upsert_scope(%Command{predicate: predicate}, _context) when not is_nil(predicate),
+    do: :predicate
+
+  defp upsert_scope(%Command{metadata: metadata}, context) do
+    cond do
+      Map.has_key?(metadata, :query_enforcement) -> :query_enforcement
+      trusted_tenant?(context) -> :tenant
+      true -> nil
+    end
+  end
+
+  defp trusted_tenant?(context) when is_map(context) do
+    Enum.any?([:tenant_id, "tenant_id", :tenant, "tenant"], &(Map.get(context, &1) != nil)) or
+      List.wrap(Map.get(context, :required_filters) || Map.get(context, "required_filters")) !=
+        []
+  end
+
+  defp trusted_tenant?(_context), do: false
 
   defp single_matching_conflict_target?(target, [declared]) when is_list(declared) do
     normalize_fields(target) == normalize_fields(declared)

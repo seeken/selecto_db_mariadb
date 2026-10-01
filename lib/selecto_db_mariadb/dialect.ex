@@ -48,8 +48,8 @@ defmodule SelectoDBMariaDB.Dialect do
 
   @impl true
   def render_json_contains(%Contains{} = fragment, _selecto) do
-    encoded = fragment.value |> Jason.encode!() |> escape_literal()
-    {:ok, ["JSON_CONTAINS(", column_ref(fragment), ", '", encoded, "')"]}
+    candidate = fragment.value |> Jason.encode!() |> string_literal()
+    {:ok, ["JSON_CONTAINS(", column_ref(fragment), ", ", candidate, ")"]}
   end
 
   @impl true
@@ -73,15 +73,15 @@ defmodule SelectoDBMariaDB.Dialect do
   end
 
   def render_json_array_contains(%ArrayContains{} = fragment, _selecto) do
-    candidate = fragment.value |> Jason.encode!() |> escape_literal()
+    candidate = fragment.value |> Jason.encode!() |> string_literal()
 
     {:ok,
      [
        "JSON_CONTAINS(",
        column_ref(fragment),
-       ", '",
+       ", ",
        candidate,
-       "', '",
+       ", '",
        json_path(fragment.path),
        "')"
      ]}
@@ -270,7 +270,7 @@ defmodule SelectoDBMariaDB.Dialect do
   defp json_values(values) when is_list(values),
     do: values |> Enum.map(&json_value/1) |> Enum.intersperse(", ")
 
-  defp json_value(value) when is_binary(value), do: ["'", escape_literal(value), "'"]
+  defp json_value(value) when is_binary(value), do: string_literal(value)
   defp json_value(value) when is_integer(value), do: Integer.to_string(value)
   defp json_value(value) when is_float(value), do: Float.to_string(value)
   defp json_value(true), do: "true"
@@ -278,9 +278,9 @@ defmodule SelectoDBMariaDB.Dialect do
   defp json_value(nil), do: "null"
 
   defp json_value(value) when is_map(value) or is_list(value),
-    do: ["CAST('", value |> Jason.encode!() |> escape_literal(), "' AS JSON)"]
+    do: ["CAST(", value |> Jason.encode!() |> string_literal(), " AS JSON)"]
 
-  defp json_value(value), do: ["'", value |> inspect() |> escape_literal(), "'"]
+  defp json_value(value), do: value |> inspect() |> string_literal()
 
   defp operation_column(%{options: options} = operation) when is_map(options),
     do:
@@ -385,5 +385,15 @@ defmodule SelectoDBMariaDB.Dialect do
      })}
   end
 
+  # JSON paths contain only validated identifier segments and array indexes.
   defp escape_literal(value), do: value |> to_string() |> String.replace("'", "''")
+
+  # A hexadecimal literal has no quote or escape characters, so its meaning does
+  # not depend on NO_BACKSLASH_ESCAPES or any other sql_mode. The introducer
+  # keeps it a utf8mb4 character string rather than a binary string.
+  defp string_literal(value) when is_binary(value) do
+    if String.valid?(value),
+      do: ["_utf8mb4 X'", Base.encode16(value), "'"],
+      else: raise(ArgumentError, "MariaDB JSON string values must be valid UTF-8")
+  end
 end

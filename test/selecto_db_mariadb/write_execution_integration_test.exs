@@ -40,7 +40,7 @@ defmodule SelectoDBMariaDB.WriteExecutionIntegrationTest do
                  fixture.conn,
                  "SELECT `id`, COUNT(*) FROM `tenants` GROUP BY `id` WITH ROLLUP",
                  [],
-                 query_type: :text
+                 []
                )
 
       assert length(rollup_rows) == 3
@@ -209,7 +209,7 @@ defmodule SelectoDBMariaDB.WriteExecutionIntegrationTest do
       execute!(conn, "INSERT INTO `tenants` (`id`) VALUES (45), (99)")
       fun.(%{conn: conn, database: database})
     after
-      Adapter.execute(conn, "DROP DATABASE IF EXISTS `#{database}`", [], query_type: :text)
+      MyXQL.query(conn, "DROP DATABASE IF EXISTS `#{database}`", [], query_type: :text)
       if Process.alive?(conn), do: GenServer.stop(conn)
     end
   end
@@ -232,7 +232,8 @@ defmodule SelectoDBMariaDB.WriteExecutionIntegrationTest do
   defp assignment(field, value), do: %{field: field, value: {:literal, value}}
 
   defp execute!(conn, sql) do
-    assert {:ok, _result} = Adapter.execute(conn, sql, [], query_type: :text)
+    # Test-owned DDL uses the driver; the adapter executes prepared statements only.
+    assert {:ok, _result} = MyXQL.query(conn, sql, [], query_type: :text)
   end
 
   defp scalar!(conn, sql, params) do
