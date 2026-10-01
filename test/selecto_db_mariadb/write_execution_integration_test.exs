@@ -46,7 +46,7 @@ defmodule SelectoDBMariaDB.WriteExecutionIntegrationTest do
       assert length(rollup_rows) == 3
 
       assert {:ok, %Result{operation: :insert, affected_rows: 1}} =
-               Adapter.execute_write(
+               Adapter.execute_write_unsafe(
                  fixture.conn,
                  command!(:insert,
                    assignments: [
@@ -69,7 +69,7 @@ defmodule SelectoDBMariaDB.WriteExecutionIntegrationTest do
          ]}
 
       assert {:ok, %Result{affected_rows: 1}} =
-               Adapter.execute_write(
+               Adapter.execute_write_unsafe(
                  fixture.conn,
                  command!(:update,
                    assignments: [assignment(:name, "tenant-updated")],
@@ -79,7 +79,7 @@ defmodule SelectoDBMariaDB.WriteExecutionIntegrationTest do
                )
 
       assert {:error, %Error{type: :cardinality_mismatch, details: %{actual: 0}}} =
-               Adapter.execute_write(
+               Adapter.execute_write_unsafe(
                  fixture.conn,
                  command!(:update,
                    assignments: [assignment(:name, "cross-tenant")],
@@ -105,7 +105,8 @@ defmodule SelectoDBMariaDB.WriteExecutionIntegrationTest do
           }
         )
 
-      assert {:ok, %Result{affected_rows: 1}} = Adapter.execute_write(fixture.conn, upsert, [])
+      assert {:ok, %Result{affected_rows: 1}} =
+               Adapter.execute_write_unsafe(fixture.conn, upsert, [])
 
       changed =
         update_in(upsert.assignments, fn assignments ->
@@ -115,8 +116,11 @@ defmodule SelectoDBMariaDB.WriteExecutionIntegrationTest do
           end)
         end)
 
-      assert {:ok, %Result{affected_rows: 1}} = Adapter.execute_write(fixture.conn, changed, [])
-      assert {:ok, %Result{affected_rows: 1}} = Adapter.execute_write(fixture.conn, changed, [])
+      assert {:ok, %Result{affected_rows: 1}} =
+               Adapter.execute_write_unsafe(fixture.conn, changed, [])
+
+      assert {:ok, %Result{affected_rows: 1}} =
+               Adapter.execute_write_unsafe(fixture.conn, changed, [])
 
       assert scalar!(fixture.conn, "SELECT `name` FROM `items` WHERE `external_id` = ?", [
                "upsert-1"
@@ -124,7 +128,7 @@ defmodule SelectoDBMariaDB.WriteExecutionIntegrationTest do
                "upsert-updated"
 
       assert {:error, %Error{type: :cardinality_mismatch, details: %{actual: 0}}} =
-               Adapter.execute_write(
+               Adapter.execute_write_unsafe(
                  fixture.conn,
                  command!(:insert,
                    assignments: [
@@ -159,7 +163,7 @@ defmodule SelectoDBMariaDB.WriteExecutionIntegrationTest do
       {:ok, batch} = Batch.new([first, fails_cardinality])
 
       assert {:error, %Error{type: :cardinality_mismatch}} =
-               Adapter.execute_write(fixture.conn, batch, [])
+               Adapter.execute_write_unsafe(fixture.conn, batch, [])
 
       assert scalar!(fixture.conn, "SELECT COUNT(*) FROM `items` WHERE `external_id` = ?", [
                "batch-first"
@@ -167,7 +171,7 @@ defmodule SelectoDBMariaDB.WriteExecutionIntegrationTest do
                0
 
       assert {:ok, %Result{operation: :delete, affected_rows: 1}} =
-               Adapter.execute_write(
+               Adapter.execute_write_unsafe(
                  fixture.conn,
                  command!(:delete,
                    assignments: [],

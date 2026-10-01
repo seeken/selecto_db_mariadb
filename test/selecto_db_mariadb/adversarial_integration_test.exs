@@ -176,7 +176,7 @@ defmodule SelectoDBMariaDB.AdversarialIntegrationTest do
           upsert!(id: 1, tenant_id: 7, sku: "C", email: "t7@example.test", name: "from tenant 7")
 
         for command <- [email_collision, pk_collision] do
-          result = Adapter.execute_write(conn, command, context: %{tenant_id: 7})
+          result = Adapter.execute_write_unsafe(conn, command, context: %{tenant_id: 7})
 
           assert sku_row(conn, 1) == original
           assert {:error, %Error{type: :unsupported_scope_predicate}} = result
@@ -184,7 +184,7 @@ defmodule SelectoDBMariaDB.AdversarialIntegrationTest do
 
         # An unscoped upsert on the same table keeps its native behavior.
         unscoped = upsert!(tenant_id: 7, sku: "D", email: "d@example.test", name: "unscoped")
-        assert {:ok, %{affected_rows: 1}} = Adapter.execute_write(conn, unscoped, [])
+        assert {:ok, %{affected_rows: 1}} = Adapter.execute_write_unsafe(conn, unscoped, [])
       end)
     end
   end
@@ -215,15 +215,19 @@ defmodule SelectoDBMariaDB.AdversarialIntegrationTest do
         )
 
         assert {:error, %Error{type: :cardinality_mismatch, details: %{actual: 0}}} =
-                 Adapter.execute_write(conn, task_insert!(80), [])
+                 Adapter.execute_write_unsafe(conn, task_insert!(80), [])
 
         assert {:error, %Error{type: :cardinality_mismatch, details: %{actual: 0}}} =
-                 Adapter.execute_write(conn, task_update!(80), [])
+                 Adapter.execute_write_unsafe(conn, task_update!(80), [])
 
         assert task_rows(conn) == [[1, 7, 70, "seed"]]
 
-        assert {:ok, %{affected_rows: 1}} = Adapter.execute_write(conn, task_insert!(70), [])
-        assert {:ok, %{affected_rows: 1}} = Adapter.execute_write(conn, task_update!(70), [])
+        assert {:ok, %{affected_rows: 1}} =
+                 Adapter.execute_write_unsafe(conn, task_insert!(70), [])
+
+        assert {:ok, %{affected_rows: 1}} =
+                 Adapter.execute_write_unsafe(conn, task_update!(70), [])
+
         assert task_rows(conn) |> Enum.map(&tl/1) == [[7, 70, "t"], [7, 70, "t"]]
       end)
     end

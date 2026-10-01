@@ -1,6 +1,12 @@
 defmodule SelectoDBMariaDB.Adapter do
   @moduledoc """
   MariaDB adapter for Selecto backed by `MyXQL`.
+
+  Writes reach this adapter through the governed entry point, `SelectoUpdato`.
+  `execute_write/3` refuses a write without the `Selecto.Write.Authorization`
+  issued for exactly that payload (`:ungoverned_write`).
+  `execute_write_unsafe/3` skips that check and exists for trusted tooling and
+  adapter tests only.
   """
 
   @behaviour Selecto.DB.Adapter
@@ -273,14 +279,35 @@ defmodule SelectoDBMariaDB.Adapter do
   def preview_write(_connection, %Graph{} = graph, _opts), do: unsupported_graph(graph)
   def preview_write(_connection, write, _opts), do: invalid_write_input(write)
 
+  @doc """
+  Executes a governed write.
+
+  `opts[:authorization]` must be the `Selecto.Write.Authorization` that the
+  governed entry point (`SelectoUpdato`) issued for exactly this command,
+  batch, or graph. Without it the write fails with `:ungoverned_write` before
+  any statement runs.
+  """
   @impl Selecto.DB.WriteAdapter
-  def execute_write(connection, %Command{} = command, opts) do
+  def execute_write(connection, write, opts) do
+    with :ok <- Selecto.Write.Authorization.require_for(write, opts) do
+      execute_write_unsafe(connection, write, opts)
+    end
+  end
+
+  @doc """
+  Executes a write without domain governance.
+
+  For trusted tooling and adapter tests only; application code writes through
+  `SelectoUpdato`.
+  """
+  @impl Selecto.DB.WriteAdapter
+  def execute_write_unsafe(connection, %Command{} = command, opts) do
     with :ok <- Command.validate(command) do
       with_write_transaction(connection, fn tx -> execute_write_command(tx, command, opts) end)
     end
   end
 
-  def execute_write(connection, %Batch{} = batch, opts) do
+  def execute_write_unsafe(connection, %Batch{} = batch, opts) do
     with :ok <- Batch.validate(batch) do
       with_write_transaction(connection, fn tx ->
         Enum.reduce_while(batch.commands, {:ok, []}, fn command, {:ok, results} ->
@@ -293,8 +320,8 @@ defmodule SelectoDBMariaDB.Adapter do
     end
   end
 
-  def execute_write(_connection, %Graph{} = graph, _opts), do: unsupported_graph(graph)
-  def execute_write(_connection, write, _opts), do: invalid_write_input(write)
+  def execute_write_unsafe(_connection, %Graph{} = graph, _opts), do: unsupported_graph(graph)
+  def execute_write_unsafe(_connection, write, _opts), do: invalid_write_input(write)
 
   defp execute_write_command(connection, command, opts) do
     with {:ok, statement} <- WriteCompiler.compile(command, opts),

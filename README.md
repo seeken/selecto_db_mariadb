@@ -39,6 +39,16 @@ selecto =
 - Arbitrary DML returning and generated-key graphs are not advertised by this
   release; requests requiring them fail before adapter dispatch.
 
+## Governed writes
+
+Applications write through `SelectoUpdato`, which validates every command,
+batch, and graph against the domain's `writes` contract and hands this adapter
+a single-use `Selecto.Write.Authorization` for exactly that payload.
+`execute_write/3` refuses a write without one with `:ungoverned_write` before
+any statement runs, leaving every row unchanged. `execute_write_unsafe/3` skips
+that check; it exists for trusted tooling and this package's own tests, never
+for application code.
+
 ## Local Workspace Development
 
 For local multi-repo development against vendored ecosystem packages, set:
