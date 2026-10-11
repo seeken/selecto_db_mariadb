@@ -27,7 +27,7 @@ defmodule SelectoDBMariaDB.MixProject do
   defp deps do
     [
       selecto_dep(),
-      {:myxql, "~> 0.7.0"},
+      {:myxql, "~> 0.8.2"},
       {:ex_doc, "~> 0.29", only: :dev, runtime: false}
     ]
   end
