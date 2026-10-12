@@ -5,12 +5,17 @@
 - Guarded inserts (a captured query predicate or tenant scope) are admitted
   on storage semantics (`typed_insert_admission`, `typed_insert_precision`):
   after the portable candidate check, the INSERT runs in the write
-  transaction and the row is re-read by its primary key (the assigned key, or
-  LAST_INSERT_ID only when the server generated one) under the predicate, so
-  DECIMAL rounding and collations decide; no matching row is
-  `query_rule_violation` and rolls back. A session without strict sql_mode, a
-  table with an INSERT trigger, an unknown key, or a strict-mode conversion
-  failure (1264, 1265, 1292, 1366) is `query_rule_not_evaluable`.
+  transaction and the row is re-read by its declared single-column primary
+  key under the predicate, so DECIMAL rounding and collations decide; no
+  matching row is `query_rule_violation` and rolls back. The key is the
+  assigned value compared in the column's own type, or LAST_INSERT_ID only
+  when that key column is the table's AUTO_INCREMENT column; exactly one row
+  must carry it. A session without strict sql_mode, a non-InnoDB table, a
+  table with an INSERT trigger, a composite or unknown key, or a strict-mode
+  conversion failure (1264, 1265, 1292, 1366) is `query_rule_not_evaluable`.
+  information_schema shows only objects the writing user holds a privilege
+  on, so trigger detection assumes the writer has its normal table
+  privileges.
 - ORDER BY places NULLs as PostgreSQL does: last for an ascending and first
   for a descending sort, through a leading `(expr IS NULL)` term
   (`:postgresql_null_order`). An explicit NULLS FIRST/LAST still wins, and
