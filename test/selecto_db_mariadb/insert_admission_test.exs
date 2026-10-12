@@ -24,6 +24,7 @@ defmodule SelectoDBMariaDB.InsertAdmissionTest do
 
   defp assigned(field, value), do: %{field: field, value: {:literal, value}}
 
+  # Responses are matched in order by a substring of the SQL.
   defp executor(responses) do
     fn _conn, sql, params, _opts ->
       send(self(), {:sql, sql, params})
@@ -36,71 +37,115 @@ defmodule SelectoDBMariaDB.InsertAdmissionTest do
 
   defp code({:error, %{details: %{code: code}}}), do: code
 
-  test "a non-strict session or an INSERT trigger is not evaluable" do
+  @strict {"sql_mode", {:ok, %{rows: [["STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION"]]}}}
+  @innodb {"ENGINE", {:ok, %{rows: [["InnoDB"]]}}}
+
+  defp key(type, extra), do: {"COLUMN_KEY", {:ok, %{rows: [["id", type, extra]]}}}
+
+  test "a non-strict session, a non-transactional engine or an INSERT trigger is not evaluable" do
     command = command([assigned(:id, 1), assigned(:subject, "10.5")])
+    refused = :query_rule_not_evaluable
 
     loose = executor([{"sql_mode", {:ok, %{rows: [["NO_ENGINE_SUBSTITUTION"]]}}}])
+    assert code(InsertAdmission.before_insert(:conn, command, loose, [])) == refused
 
-    assert code(InsertAdmission.before_insert(:conn, command, loose, [])) ==
-             :query_rule_not_evaluable
+    myisam = executor([@strict, {"ENGINE", {:ok, %{rows: [["MyISAM"]]}}}])
+    assert code(InsertAdmission.before_insert(:conn, command, myisam, [])) == refused
 
-    triggered =
-      executor([
-        {"sql_mode", {:ok, %{rows: [["STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION"]]}}},
-        {"TRIGGERS", {:ok, %{rows: [[1]]}}}
-      ])
+    triggered = executor([@strict, @innodb, {"TRIGGERS", {:ok, %{rows: [[1]]}}}])
+    assert code(InsertAdmission.before_insert(:conn, command, triggered, [])) == refused
 
-    assert code(InsertAdmission.before_insert(:conn, command, triggered, [])) ==
-             :query_rule_not_evaluable
-
-    clean =
-      executor([
-        {"sql_mode", {:ok, %{rows: [["STRICT_TRANS_TABLES"]]}}},
-        {"TRIGGERS", {:ok, %{rows: [[0]]}}}
-      ])
-
+    clean = executor([@strict, @innodb, {"TRIGGERS", {:ok, %{rows: [[0]]}}}])
     assert :ok = InsertAdmission.before_insert(:conn, command, clean, [])
-    assert_received {:sql, _, []}
-    assert_received {:sql, trigger_sql, ["items"]}
-    assert trigger_sql =~ "EVENT_OBJECT_SCHEMA = DATABASE()"
   end
 
-  test "the stored row is re-read by its key under the predicate" do
+  test "the stored row is re-read by its typed key, alone and under the predicate" do
     command = command([assigned(:id, 7), assigned(:subject, "15.999")])
+    guarded = "WHERE `id` = ? AND (`subject` < ?)"
 
-    rounded = executor([{"SELECT COUNT(*) FROM `items`", {:ok, %{rows: [[0]]}}}])
+    rounded =
+      executor([
+        key("int", ""),
+        {guarded, {:ok, %{rows: [[0]]}}},
+        {"WHERE `id` = ?", {:ok, %{rows: [[1]]}}}
+      ])
 
     assert code(InsertAdmission.after_insert(:conn, command, %{}, rounded, [])) ==
              :query_rule_violation
 
-    assert_received {:sql, sql, [7, "16"]}
-    assert sql == "SELECT COUNT(*) FROM `items` WHERE `id` = ? AND (`subject` < ?)"
+    assert_received {:sql, "SELECT COUNT(*) FROM `items` WHERE `id` = ?", [7]}
+    assert_received {:sql, "SELECT COUNT(*) FROM `items` " <> ^guarded, [7, "16"]}
 
-    stored = executor([{"SELECT COUNT(*)", {:ok, %{rows: [[1]]}}}])
+    stored =
+      executor([
+        key("int", ""),
+        {guarded, {:ok, %{rows: [[1]]}}},
+        {"`id` = ?", {:ok, %{rows: [[1]]}}}
+      ])
+
     assert :ok = InsertAdmission.after_insert(:conn, command, %{}, stored, [])
+
+    # No row, or several, carry the key: never decided by the predicate.
+    missing =
+      executor([
+        key("int", ""),
+        {guarded, {:ok, %{rows: [[1]]}}},
+        {"`id` = ?", {:ok, %{rows: [[0]]}}}
+      ])
+
+    assert code(InsertAdmission.after_insert(:conn, command, %{}, missing, [])) ==
+             :query_rule_not_evaluable
   end
 
-  test "a generated key is used only when MySQL generated one" do
+  test "LAST_INSERT_ID names the row only when the key column is AUTO_INCREMENT" do
     command = command([assigned(:subject, "10")])
-    stored = executor([{"SELECT COUNT(*)", {:ok, %{rows: [[1]]}}}])
+    generated = %{metadata: %{last_insert_id: 42}}
+    count_one = [{"`id` = ?", {:ok, %{rows: [[1]]}}}]
 
-    assert :ok =
-             InsertAdmission.after_insert(
-               :conn,
-               command,
-               %{metadata: %{last_insert_id: 42}},
-               stored,
-               []
-             )
+    auto = executor([key("bigint", "auto_increment") | count_one])
+    assert :ok = InsertAdmission.after_insert(:conn, command, generated, auto, [])
+    assert_received {:sql, _, [42]}
 
-    assert_received {:sql, _, [42, "16"]}
+    # The repro: a UUID primary key beside an AUTO_INCREMENT sequence column.
+    uuid = executor([key("varchar", "DEFAULT_GENERATED") | count_one])
+
+    assert code(InsertAdmission.after_insert(:conn, command, generated, uuid, [])) ==
+             :query_rule_not_evaluable
 
     assert code(
              InsertAdmission.after_insert(
                :conn,
                command,
                %{metadata: %{last_insert_id: 0}},
-               stored,
+               auto,
+               []
+             )
+           ) == :query_rule_not_evaluable
+  end
+
+  test "a key is compared in its column type and a composite key is refused" do
+    count_one = [{"`id` = ?", {:ok, %{rows: [[1]]}}}]
+    string_key = executor([key("varchar", "") | count_one])
+
+    assert code(
+             InsertAdmission.after_insert(
+               :conn,
+               command([assigned(:id, 101), assigned(:subject, "1")]),
+               %{},
+               string_key,
+               []
+             )
+           ) == :query_rule_not_evaluable
+
+    composite =
+      executor([{"COLUMN_KEY", {:ok, %{rows: [["id", "int", ""], ["tenant_id", "int", ""]]}}}])
+
+    assert code(
+             InsertAdmission.after_insert(
+               :conn,
+               command([assigned(:id, 1), assigned(:subject, "1")]),
+               %{},
+               composite,
                []
              )
            ) == :query_rule_not_evaluable

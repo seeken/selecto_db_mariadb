@@ -6,8 +6,9 @@ defmodule SelectoDBMariaDB.InsertAdmission do
   # this then decides on what MariaDB actually stored, inside the write's own
   # transaction:
   #
-  # - before the INSERT, a session without strict sql_mode, or a table with an
-  #   INSERT trigger, is refused
+  # - before the INSERT, a session without strict sql_mode, a table that is not
+  #   InnoDB (a non-transactional engine keeps a violating row after the
+  #   rollback), or a table with an INSERT trigger is refused
   #   (`query_rule_not_evaluable`): a trigger can rewrite the row or write
   #   elsewhere after any check;
   # - after the INSERT, the row is re-read by its primary key together with
@@ -15,8 +16,17 @@ defmodule SelectoDBMariaDB.InsertAdmission do
   #   defaults decide. No matching row is `query_rule_violation`; the caller's
   #   transaction then rolls the INSERT back.
   #
-  # The key is the assigned primary key, or LAST_INSERT_ID() for a generated
-  # one. Anything else is not evaluable.
+  # The key is the declared single-column primary key: its assigned value, or
+  # LAST_INSERT_ID() only when that column is the table's AUTO_INCREMENT
+  # column and the statement generated a value. The key is compared in the
+  # column's own type (a string key is never compared to a number, which
+  # MariaDB would coerce: '101-existing' = 101), and exactly one row must carry
+  # it before the predicate is applied. Anything else is not evaluable.
+  #
+  # information_schema shows only objects the session user has a privilege
+  # on; a least-privilege user without one on the table sees no trigger. Give
+  # the writing user its normal table privileges (TRIGGER is not required to
+  # see triggers on tables it can write).
 
   alias Selecto.Write.{Command, Error}
   alias SelectoDBMariaDB.WriteCompiler
@@ -37,6 +47,15 @@ defmodule SelectoDBMariaDB.InsertAdmission do
          {:ok, %{rows: [[sql_mode]]}} <-
            execute.(connection, "SELECT @@SESSION.sql_mode", [], opts),
          true <- strict?(sql_mode),
+         {:ok, %{rows: [[engine]]}} <-
+           execute.(
+             connection,
+             "SELECT ENGINE FROM information_schema.TABLES WHERE TABLE_SCHEMA = " <>
+               schema_sql(schema) <> " AND TABLE_NAME = ?",
+             schema_params(schema) ++ [table],
+             opts
+           ),
+         true <- is_binary(engine) and String.downcase(engine) == "innodb",
          {:ok, %{rows: [[count]]}} <-
            execute.(
              connection,
@@ -69,14 +88,22 @@ defmodule SelectoDBMariaDB.InsertAdmission do
         opts
       ) do
     with %{predicate: predicate, primary_key: key} <- admission,
-         {:ok, key_value} <- key_value(command, key, insert_result),
+         true <- is_binary(key) and Regex.match?(@identifier, key),
+         {:ok, schema, table} <- relation(command.relation),
+         {:ok, column} <- key_column(connection, schema, table, key, execute, opts),
+         {:ok, key_value} <- key_value(command, key, column, insert_result),
          {:ok, guard} <-
            WriteCompiler.compile_predicate(predicate, context: Keyword.get(opts, :context, %{})),
-         sql =
-           "SELECT COUNT(*) FROM " <>
-             quote_relation(command.relation) <>
-             " WHERE " <> quote_id(key) <> " = ? AND (" <> guard.text <> ")",
-         {:ok, %{rows: [[count]]}} <- execute.(connection, sql, [key_value | guard.params], opts) do
+         from = "SELECT COUNT(*) FROM " <> quote_relation(command.relation),
+         by_key = " WHERE " <> quote_id(key) <> " = ?",
+         {:ok, %{rows: [[1]]}} <- execute.(connection, from <> by_key, [key_value], opts),
+         {:ok, %{rows: [[count]]}} <-
+           execute.(
+             connection,
+             from <> by_key <> " AND (" <> guard.text <> ")",
+             [key_value | guard.params],
+             opts
+           ) do
       if count == 1, do: :ok, else: denied(:query_rule_violation)
     else
       {:error, %Error{type: :query_enforcement}} = error -> error
@@ -100,21 +127,65 @@ defmodule SelectoDBMariaDB.InsertAdmission do
 
   def storage_error(_command, result), do: result
 
-  defp key_value(%Command{assignments: assignments}, key, insert_result) do
+  # The declared key must be the table's whole primary key.
+  defp key_column(connection, schema, table, key, execute, opts) do
+    case execute.(
+           connection,
+           "SELECT COLUMN_NAME, DATA_TYPE, EXTRA FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = " <>
+             schema_sql(schema) <> " AND TABLE_NAME = ? AND COLUMN_KEY = 'PRI'",
+           schema_params(schema) ++ [table],
+           opts
+         ) do
+      {:ok, %{rows: [[name, type, extra]]}} when is_binary(name) ->
+        if String.downcase(name) == String.downcase(key),
+          do:
+            {:ok,
+             %{
+               type: type |> to_string() |> String.downcase(),
+               auto_increment: extra |> to_string() |> String.downcase() =~ "auto_increment"
+             }},
+          else: :error
+
+      _ ->
+        :error
+    end
+  end
+
+  @integer_types ~w(tinyint smallint mediumint int integer bigint)
+  @string_types ~w(char varchar binary varbinary tinytext text mediumtext longtext)
+
+  defp key_value(%Command{assignments: assignments}, key, column, insert_result) do
     case Enum.find(assignments, &(to_string(field_name(&1.field)) == key)) do
       %{value: {:literal, value}} when not is_nil(value) ->
-        {:ok, value}
+        typed_key(value, column.type)
 
       nil ->
+        # The OK packet reports a value generated by this statement only; it
+        # names this row only when the key column is the AUTO_INCREMENT one.
         case get_in(insert_result, [:metadata, :last_insert_id]) do
-          id when is_integer(id) and id > 0 -> {:ok, id}
-          _ -> :error
+          id when is_integer(id) and id > 0 and column.auto_increment ->
+            typed_key(id, column.type)
+
+          _ ->
+            :error
         end
 
       _ ->
         :error
     end
   end
+
+  defp typed_key(value, type) when type in @integer_types and is_integer(value), do: {:ok, value}
+
+  defp typed_key(value, type) when type in @integer_types and is_binary(value) do
+    case Integer.parse(value) do
+      {integer, ""} -> {:ok, integer}
+      _ -> :error
+    end
+  end
+
+  defp typed_key(value, type) when type in @string_types and is_binary(value), do: {:ok, value}
+  defp typed_key(_value, _type), do: :error
 
   defp field_name({:field, field}), do: field
   defp field_name(field), do: field
