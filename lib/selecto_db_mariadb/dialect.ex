@@ -7,6 +7,8 @@ defmodule SelectoDBMariaDB.Dialect do
   alias Selecto.Dialect.DateTime.Operation, as: DateTimeOperation
   alias Selecto.Dialect.Predicate.Comparison
   alias Selecto.Dialect.Window.FrameBoundary
+  alias Selecto.Dialect.TextSearch.{Predicate, Rank}
+  alias Selecto.Dialect.TableFunction.Join, as: TableFunctionJoin
 
   @impl true
   def render_datetime_operation(%DateTimeOperation{operation: :format} = operation, _selecto) do
@@ -121,7 +123,7 @@ defmodule SelectoDBMariaDB.Dialect do
         render_json_key_exists(operation_key_exists(operation), selecto)
 
       :json_agg ->
-        {:ok, ["JSON_ARRAYAGG(", operation_column(operation), ")"]}
+        json_array_aggregate(operation)
 
       :json_object_agg ->
         {:ok,
@@ -163,6 +165,37 @@ defmodule SelectoDBMariaDB.Dialect do
     end
   end
 
+  # MariaDB's JSON_ARRAYAGG takes ORDER BY and LIMIT, so ordered and
+  # per-parent-limited collections aggregate directly (`:json_agg_limit`).
+  defp json_array_aggregate(operation) do
+    options = operation.options || %{}
+
+    order_by =
+      case Map.get(options, :order_by_sql) do
+        order_by when order_by in [nil, []] -> []
+        order_by -> [" ORDER BY ", order_by]
+      end
+
+    case Map.get(options, :limit) do
+      nil ->
+        {:ok, ["JSON_ARRAYAGG(", operation_column(operation), order_by, ")"]}
+
+      limit when is_integer(limit) and limit > 0 ->
+        {:ok,
+         [
+           "JSON_ARRAYAGG(",
+           operation_column(operation),
+           order_by,
+           " LIMIT ",
+           Integer.to_string(limit),
+           ")"
+         ]}
+
+      _limit ->
+        unsupported_json(operation)
+    end
+  end
+
   @impl true
   def render_collection_operation(%CollectionOperation{} = operation, _selecto) do
     case operation.operation do
@@ -184,13 +217,384 @@ defmodule SelectoDBMariaDB.Dialect do
             ")"
           ], [delimiter]}}
 
+      kind when kind in [:array_contains, :array_overlap, :array_contained] ->
+        array_predicate(kind, operation.column, operation.value)
+
+      :unnest ->
+        {:ok, json_table_source(operation.column)}
+
       unsupported ->
-        {:error,
-         Selecto.Error.validation_error("MariaDB does not support this collection operation", %{
-           operation: unsupported,
-           unsupported_feature: :collection_operation
-         })}
+        unsupported_collection(unsupported)
     end
+  end
+
+  defp unsupported_collection(operation) do
+    {:error,
+     Selecto.Error.validation_error("MariaDB does not support this collection operation", %{
+       operation: operation,
+       unsupported_feature: :collection_operation
+     })}
+  end
+
+  # Arrays are JSON arrays. NULL stays unknown and a non-array document never
+  # matches. The bound values travel as one JSON document parameter, so element
+  # types compare as JSON values ("1" is not 1).
+  @array_scalar_types [:string, :integer, :float, :boolean]
+
+  defp array_predicate(kind, column, values) when is_list(values) do
+    with true <- Enum.all?(values, &array_scalar?/1),
+         {:ok, encoded} <- Jason.encode(values) do
+      bound = {:param, encoded}
+
+      predicate =
+        case kind do
+          :array_contains -> ["JSON_CONTAINS(", column, ", ", bound, ")"]
+          :array_overlap -> ["JSON_OVERLAPS(", column, ", ", bound, ")"]
+          :array_contained -> ["JSON_CONTAINS(", bound, ", ", column, ")"]
+        end
+
+      {:ok,
+       [
+         "(CASE WHEN ",
+         column,
+         " IS NULL THEN NULL WHEN JSON_TYPE(",
+         column,
+         ") = 'ARRAY' THEN ",
+         predicate,
+         " ELSE 0 END)"
+       ]}
+    else
+      _ -> unsupported_collection(kind)
+    end
+  end
+
+  defp array_predicate(kind, _column, _values), do: unsupported_collection(kind)
+
+  defp array_scalar?(value),
+    do: Enum.any?(@array_scalar_types, &array_scalar_type?(&1, value))
+
+  defp array_scalar_type?(:string, value), do: is_binary(value)
+  defp array_scalar_type?(:integer, value), do: is_integer(value)
+  defp array_scalar_type?(:float, value), do: is_float(value)
+  defp array_scalar_type?(:boolean, value), do: is_boolean(value)
+
+  # JSON_TABLE expands a JSON array in element order; render_table_function_join
+  # adds the requested 1-based ordinality column to exactly this shape. MariaDB
+  # has no JSON value type to decode, so elements are their unquoted scalar
+  # text (strings exact; numbers and booleans as text; documents NULL).
+  defp json_table_source(column),
+    do: ["JSON_TABLE(", column, ", '$[*]' COLUMNS (", "value LONGTEXT PATH '$'))"]
+
+  # Canonical computed-value casts. A decimal keeps 10 fractional digits so
+  # decimal division keeps its fraction (division adds 4 more), while results
+  # stay within the 34 significant digits MyXQL's decimal decoding accepts;
+  # strings compare by code point, as the fixture tables' binary collation does. MariaDB has no boolean cast target,
+  # so a boolean cast fails closed rather than reinterpreting text as 0.
+  @computed_casts %{
+    "string" => "CHAR CHARACTER SET utf8mb4) COLLATE utf8mb4_bin",
+    "integer" => "SIGNED)",
+    "decimal" => "DECIMAL(65, 10))",
+    "date" => "DATE)",
+    "utc_datetime" => "DATETIME(6))"
+  }
+
+  @impl true
+  def render_computed_value(
+        %{
+          __struct__: Selecto.Dialect.ComputedValue,
+          operation: :cast,
+          expression: expression,
+          type: type,
+          path: []
+        } = fragment,
+        _selecto
+      )
+      when map_size(fragment) == 5 do
+    with {:ok, target} <- Map.fetch(@computed_casts, type),
+         true <- computed_expression?(expression) do
+      {:ok, ["CAST(", expression, " AS ", target]}
+    else
+      _ -> invalid_computed_value(:cast)
+    end
+  end
+
+  # JSON null and an absent path are SQL NULL; strings are unquoted, other
+  # scalars use their JSON spelling. Each bound path segment stays a marker.
+  def render_computed_value(
+        %{
+          __struct__: Selecto.Dialect.ComputedValue,
+          operation: :json_text,
+          expression: expression,
+          type: nil,
+          path: [_ | _] = path
+        } = fragment,
+        _selecto
+      )
+      when map_size(fragment) == 5 do
+    if computed_expression?(expression) and Enum.all?(path, &computed_path_marker?/1) do
+      path_sql = [
+        "CONCAT('$', ",
+        path |> Enum.map(&path_segment/1) |> Enum.intersperse(", "),
+        ")"
+      ]
+
+      extracted = ["JSON_EXTRACT(", expression, ", ", path_sql, ")"]
+
+      {:ok,
+       [
+         "(CASE WHEN JSON_TYPE(",
+         extracted,
+         ") = 'NULL' THEN NULL ELSE JSON_UNQUOTE(",
+         extracted,
+         ") END)"
+       ]}
+    else
+      invalid_computed_value(:json_text)
+    end
+  end
+
+  def render_computed_value(_fragment, _selecto), do: invalid_computed_value(:unknown)
+
+  defp path_segment({:param, value} = marker) do
+    if Regex.match?(~r/\A[0-9]+\z/, value),
+      do: ["'[', ", marker, ", ']'"],
+      else: ["'.\"', ", marker, ", '\"'"]
+  end
+
+  defp computed_expression?(expression),
+    do: computed_sql?(expression) and computed_sql_present?(expression)
+
+  defp computed_sql?(value) when is_binary(value), do: true
+  defp computed_sql?(value) when is_integer(value), do: value in 0..255
+  defp computed_sql?({:param, _value}), do: true
+  defp computed_sql?(value) when is_list(value), do: Enum.all?(value, &computed_sql?/1)
+  defp computed_sql?(_value), do: false
+
+  defp computed_sql_present?(value) when is_binary(value), do: byte_size(value) > 0
+
+  defp computed_sql_present?(value) when is_list(value),
+    do: Enum.any?(value, &computed_sql_present?/1)
+
+  defp computed_sql_present?(_value), do: true
+
+  defp computed_path_marker?({:param, segment}) when is_binary(segment),
+    do: Regex.match?(~r/\A[A-Za-z0-9_]+\z/, segment)
+
+  defp computed_path_marker?(_marker), do: false
+
+  defp invalid_computed_value(operation) do
+    {:error,
+     Selecto.Error.validation_error("Invalid MariaDB computed-value fragment", %{
+       operation: operation,
+       unsupported_feature: :computed_value
+     })}
+  end
+
+  # MariaDB has no LATERAL derived tables; JSON_TABLE may still read columns
+  # of the tables before it.
+  @impl true
+  def render_table_function_join(
+        %TableFunctionJoin{
+          join_type: join_type,
+          source_sql: ["JSON_TABLE(", column, ", '$[*]' COLUMNS (", "value LONGTEXT PATH '$'))"]
+        } = join,
+        _selecto
+      )
+      when join_type in [:cross, :inner, :left] do
+    columns =
+      case join.ordinality_alias do
+        nil -> []
+        ordinality -> [quote_field(ordinality), " FOR ORDINALITY, "]
+      end
+
+    source = [
+      "JSON_TABLE(",
+      column,
+      ", '$[*]' COLUMNS (",
+      columns,
+      "value LONGTEXT PATH '$')) AS ",
+      quote_field(join.alias)
+    ]
+
+    case join_type do
+      :cross -> {:ok, ["CROSS JOIN ", source]}
+      :inner -> {:ok, ["INNER JOIN ", source, " ON TRUE"]}
+      :left -> {:ok, ["LEFT JOIN ", source, " ON TRUE"]}
+    end
+  end
+
+  # A json_each-style rowset over a JSON array: one row per element, its
+  # document in `value`. JSON_TABLE requires a literal path, so only a plain
+  # `$`, `.member` and `[index]` path is inlined; anything else is refused.
+  def render_table_function_join(
+        %TableFunctionJoin{
+          source_kind: :json_rowset,
+          join_type: join_type,
+          options: %{function: :json_each, source: source, path: path}
+        } = join,
+        _selecto
+      )
+      when join_type in [:inner, :left] and is_binary(source) do
+    with {:ok, path} <- json_rowset_path(path),
+         true <- Regex.match?(~r/\A[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*\z/, source) do
+      join_sql = if join_type == :left, do: "LEFT JOIN ", else: "INNER JOIN "
+
+      {:ok,
+       [
+         join_sql,
+         "JSON_TABLE(",
+         source,
+         ", '",
+         path,
+         "[*]' COLUMNS (value JSON PATH '$')) AS ",
+         quote_field(join.alias),
+         " ON TRUE"
+       ]}
+    else
+      _ -> unsupported_join(:json_rowset)
+    end
+  end
+
+  def render_table_function_join(%TableFunctionJoin{} = join, _selecto),
+    do: unsupported_join(join.source_kind)
+
+  defp json_rowset_path(nil), do: {:ok, "$"}
+
+  defp json_rowset_path(path) when is_binary(path) do
+    if Regex.match?(~r/\A\$(?:\.[A-Za-z_][A-Za-z0-9_]*|\[[0-9]+\])*\z/, path),
+      do: {:ok, path},
+      else: :error
+  end
+
+  defp json_rowset_path(_path), do: :error
+
+  defp unsupported_join(kind) do
+    {:error,
+     Selecto.Error.validation_error("MariaDB does not support this lateral join", %{
+       join: kind,
+       unsupported_feature: :table_function_join
+     })}
+  end
+
+  @impl true
+  def render_text_search_predicate(%Predicate{selectors: []}, _selecto) do
+    text_search_error("MariaDB text search requires at least one field")
+  end
+
+  def render_text_search_predicate(%Predicate{} = predicate, _selecto) do
+    with {:ok, mode_sql} <- mode_sql(predicate.mode),
+         {:ok, query_sql} <- search_query_sql(predicate.query, predicate.mode) do
+      {:ok,
+       [
+         " MATCH(",
+         Enum.intersperse(predicate.selectors, ", "),
+         ") AGAINST (",
+         query_sql,
+         mode_sql,
+         ") "
+       ]}
+    end
+  end
+
+  # Governed prefix lookups bind normalized `word:* & word:*` text. Boolean
+  # mode requires every word (`+word*`); the regex admits no boolean operator,
+  # quote or parenthesis, and the text stays a bound parameter.
+  defp search_query_sql(text, :prefix) when is_binary(text) and byte_size(text) <= 4096 do
+    if Regex.match?(~r/\A[\p{L}\p{N}_]+:\*(?: & [\p{L}\p{N}_]+:\*)*\z/u, text),
+      do: {:ok, ["CONCAT('+', REPLACE(REPLACE(", {:param, text}, ", ':*', '*'), ' & ', ' +'))"]},
+      else: text_search_error("MariaDB prefix search requires normalized word prefixes")
+  end
+
+  defp search_query_sql(_text, :prefix),
+    do: text_search_error("MariaDB prefix search requires normalized word prefixes")
+
+  defp search_query_sql(text, _mode), do: {:ok, {:param, text}}
+
+  @impl true
+  def render_text_search_rank(%Rank{} = rank, selecto) do
+    with :ok <- require_fields(rank.fields),
+         :ok <- require_query(rank.query),
+         :ok <- reject_weights(rank.weights),
+         :ok <- validate_fields(selecto, rank.fields),
+         {:ok, mode_sql} <- mode_sql(rank.mode),
+         {:ok, query_sql} <- search_query_sql(rank.query, rank.mode) do
+      field_sql =
+        rank.fields
+        |> Enum.map(&qualified_root_field(selecto, &1))
+        |> Enum.intersperse(", ")
+
+      # A field selector, like PostgreSQL's, so callers can also order by the
+      # rank expression (governed co-domain lookups do).
+      {:ok,
+       {:field,
+        {:custom_sql, ["MATCH(", field_sql, ") AGAINST (", query_sql, mode_sql, ")"], %{}},
+        rank.alias}}
+    end
+  end
+
+  defp mode_sql(mode) when mode in [nil, :natural, :websearch, :plain],
+    do: {:ok, " IN NATURAL LANGUAGE MODE"}
+
+  defp mode_sql(mode) when mode in [:boolean, :prefix], do: {:ok, " IN BOOLEAN MODE"}
+
+  defp mode_sql(:query_expansion),
+    do: {:ok, " IN NATURAL LANGUAGE MODE WITH QUERY EXPANSION"}
+
+  defp mode_sql(mode),
+    do: text_search_error("MariaDB does not support this text-search mode", mode: mode)
+
+  defp require_fields([]),
+    do: text_search_error("MariaDB text_search_rank/3 requires at least one field")
+
+  defp require_fields(_fields), do: :ok
+
+  defp require_query(nil),
+    do: text_search_error("MariaDB text_search_rank/3 requires a :query option")
+
+  defp require_query(_query), do: :ok
+
+  defp reject_weights([]), do: :ok
+
+  defp reject_weights(_weights),
+    do: text_search_error("MariaDB text_search_rank/3 does not support :weights yet")
+
+  defp validate_fields(selecto, fields) do
+    missing = Enum.reject(fields, &root_column_conf(selecto, &1))
+
+    if missing == [],
+      do: :ok,
+      else: text_search_error("MariaDB text_search_rank/3 field not found", fields: missing)
+  end
+
+  defp qualified_root_field(selecto, field) do
+    [
+      Selecto.Builder.Sql.Helpers.quote_identifier(selecto, "selecto_root"),
+      ".",
+      Selecto.Builder.Sql.Helpers.quote_identifier(selecto, field)
+    ]
+  end
+
+  defp root_column_conf(selecto, field) do
+    columns = selecto |> Map.get(:config, %{}) |> Map.get(:columns, %{})
+    Map.get(columns, field) || Map.get(columns, safe_existing_atom(field))
+  end
+
+  defp safe_existing_atom(field) when is_binary(field) do
+    try do
+      String.to_existing_atom(field)
+    rescue
+      ArgumentError -> nil
+    end
+  end
+
+  defp safe_existing_atom(_field), do: nil
+
+  defp text_search_error(message, details \\ []) do
+    {:error,
+     Selecto.Error.validation_error(
+       message,
+       Map.new([unsupported_feature: :text_search] ++ details)
+     )}
   end
 
   @impl true

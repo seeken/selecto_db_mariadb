@@ -130,8 +130,11 @@ defmodule SelectoDBMariaDB.AdapterTest do
     end
   end
 
-  test "mariadb adapter does not claim stream support" do
-    refute SelectoDBMariaDB.Adapter.supports?(:stream)
+  test "mariadb adapter claims cursor streams and no LATERAL or GROUPING()" do
+    # MariaDB 11.4: LATERAL is ERROR 1064 and GROUPING() is ERROR 1305.
+    assert SelectoDBMariaDB.Adapter.supports?(:stream)
+    refute SelectoDBMariaDB.Adapter.supports?(:lateral_join)
+    refute SelectoDBMariaDB.Adapter.supports?(:lateral_projection_aliases)
   end
 
   test "mariadb adapter reports rollup support" do

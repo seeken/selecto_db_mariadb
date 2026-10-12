@@ -13,7 +13,7 @@ defmodule SelectoDBMariaDB.Adapter do
   @behaviour Selecto.DB.WriteAdapter
 
   alias Selecto.Write.{Batch, Command, Error, Graph, Result}
-  alias SelectoDBMariaDB.WriteCompiler
+  alias SelectoDBMariaDB.{InsertAdmission, WriteCompiler}
 
   @missing_dependency {:adapter_dependency_missing, :myxql}
 
@@ -24,6 +24,21 @@ defmodule SelectoDBMariaDB.Adapter do
   def dialect, do: SelectoDBMariaDB.Dialect
 
   @impl true
+  def capability(:text_search) do
+    %{
+      feature: :text_search,
+      supported?: true,
+      modes: [:natural, :websearch, :plain, :boolean, :query_expansion, :prefix],
+      # MATCH reads only a FULLTEXT index on the searched table's own columns,
+      # and MariaDB refuses a column list without one, so a governed lookup
+      # never searches content outside its relation.
+      governed_lookup?: true,
+      default_mode: :natural,
+      document_type: :text_search_document,
+      help: "MariaDB full-text search with natural-language, boolean, and query-expansion modes."
+    }
+  end
+
   def capability(feature), do: %{feature: feature, supported?: supports?(feature)}
 
   @impl true
@@ -114,6 +129,27 @@ defmodule SelectoDBMariaDB.Adapter do
       execute_direct(Map.get(connection, :connection), query, params, opts)
     else
       execute_direct(connection, query, params, opts)
+    end
+  end
+
+  @impl true
+  # A read-only server-side cursor; see SelectoDBMariaDB.RowStream for the
+  # connection-ownership rules (no transaction control statements are issued).
+  def stream(connection, query, params, opts) do
+    connection = resolve_connection(connection)
+
+    cond do
+      not dependency_available?() ->
+        {:error, @missing_dependency}
+
+      is_pid(connection) and Process.alive?(connection) ->
+        SelectoDBMariaDB.RowStream.open(connection, normalize_query(query), params, opts)
+
+      is_atom(connection) and not is_nil(connection) and is_pid(Process.whereis(connection)) ->
+        SelectoDBMariaDB.RowStream.open(connection, normalize_query(query), params, opts)
+
+      true ->
+        {:error, {:invalid_connection, connection}}
     end
   end
 
@@ -242,6 +278,12 @@ defmodule SelectoDBMariaDB.Adapter do
   def supports?(feature),
     do:
       feature in [
+        :stream,
+        :json_agg_limit,
+        :json_table_rowset,
+        :postgresql_null_order,
+        :text_search,
+        :fulltext_search,
         :cte,
         :window_functions,
         :transactions,
@@ -265,6 +307,11 @@ defmodule SelectoDBMariaDB.Adapter do
       atomic_batch: true,
       write_graph: false,
       prepared_candidate_state: false,
+      # Guarded inserts are re-read under their predicate in the write
+      # transaction (SelectoDBMariaDB.InsertAdmission), so DECIMAL scale
+      # rounding is part of admission.
+      typed_insert_admission: true,
+      typed_insert_precision: true,
       dialect: :mariadb,
       server_version: server_version(connection),
       upsert_strategy: :on_duplicate_key
@@ -324,9 +371,15 @@ defmodule SelectoDBMariaDB.Adapter do
   def execute_write_unsafe(_connection, write, _opts), do: invalid_write_input(write)
 
   defp execute_write_command(connection, command, opts) do
-    with {:ok, statement} <- WriteCompiler.compile(command, opts),
-         {:ok, query_result} <- execute(connection, statement.text, statement.params, opts),
-         {:ok, affected_rows} <- enforce_cardinality(command, query_result) do
+    with :ok <- InsertAdmission.before_insert(connection, command, &execute/4, opts),
+         {:ok, statement} <- WriteCompiler.compile(command, opts),
+         {:ok, query_result} <-
+           InsertAdmission.storage_error(
+             command,
+             execute(connection, statement.text, statement.params, opts)
+           ),
+         {:ok, affected_rows} <- enforce_cardinality(command, query_result),
+         :ok <- InsertAdmission.after_insert(connection, command, query_result, &execute/4, opts) do
       {:ok,
        %Result{
          operation: command.operation,
