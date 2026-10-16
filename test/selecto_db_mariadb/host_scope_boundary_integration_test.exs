@@ -42,6 +42,34 @@ defmodule SelectoDBMariaDB.HostScopeBoundaryIntegrationTest do
     end
   end
 
+  describe "a canned page's dataset filters" do
+    test "compare exactly in the result, total and facet queries" do
+      with_database(fn conn ->
+        scope_tables!(conn)
+
+        for {domain, column, value, bind} <- [
+              {hs_domain(), "org_key", "t1", & &1},
+              {site_domain(), "site", "s1", &Selecto.with_tenant(&1, 1)}
+            ] do
+          base = domain |> Selecto.configure(conn, adapter: Adapter, validate: false) |> bind.()
+
+          page =
+            Selecto.CannedPage.new!(Selecto.filter(base, [{column, value}]),
+              id: "scope",
+              views: [%{id: "detail", kind: :detail, query: Selecto.select(base, ["id", "name"])}],
+              controls: [%{id: "name", kind: :facet, field: "name"}]
+            )
+
+          {:ok, plan} = Selecto.CannedPage.plan(page, base, %{})
+
+          assert plan.query |> rows() |> Enum.map(&hd/1) == [1], column
+          assert rows(plan.total_query) == [[1]], column
+          assert plan.facets["name"].options |> rows() |> Enum.map(&hd/1) == ["a alpha"], column
+        end
+      end)
+    end
+  end
+
   describe "a co-domain lookup's host scope" do
     test "compares exactly on a tenantless target and as a site pin beside a tenant" do
       with_database(fn conn ->
