@@ -277,21 +277,20 @@ defmodule SelectoDBMariaDB.TenantExactCompareIntegrationTest do
       end)
     end
 
-    test "stored as BINARY(16), reads match the exact UUID without CONVERT" do
+    test "stored as text, reads bind the string form and match the exact UUID" do
       with_database(fn conn ->
         ddl!(
           conn,
-          "CREATE TABLE orders (id INT PRIMARY KEY, tenant_id BINARY(16) NOT NULL, customer_id INT, bin_id INT, total INT) ENGINE=InnoDB"
+          "CREATE TABLE orders (id INT PRIMARY KEY, tenant_id VARCHAR(40) NOT NULL, " <>
+            "customer_id INT, bin_id INT, total INT) ENGINE=InnoDB"
         )
 
-        other = "b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"
-
-        for {id, uuid} <- [{1, @uuid}, {2, other}, {3, @uuid}] do
-          MyXQL.query!(conn, "INSERT INTO orders VALUES (?, ?, NULL, NULL, 1)", [
-            id,
-            UUID.string_to_binary!(uuid)
-          ])
-        end
+        ddl!(
+          conn,
+          "INSERT INTO orders VALUES (1, '#{@uuid}', NULL, NULL, 1), " <>
+            "(2, '#{String.upcase(@uuid)}', NULL, NULL, 1), (3, '#{@uuid} ', NULL, NULL, 1), " <>
+            "(4, '#{@uuid}', NULL, NULL, 1)"
+        )
 
         domain = put_in(domain(), [:source, :columns, :tenant_id], %{type: :uuid})
 
@@ -300,10 +299,11 @@ defmodule SelectoDBMariaDB.TenantExactCompareIntegrationTest do
           |> Selecto.with_tenant(@uuid)
           |> Selecto.select(["id"])
 
-        {sql, _params} = Selecto.to_sql(query)
+        {sql, params} = Selecto.to_sql(query)
         assert sql =~ "CAST(selecto_root.tenant_id AS BINARY) = CAST(? AS BINARY)"
         refute sql =~ "CONVERT"
-        assert ids(query) == [1, 3]
+        assert params == [@uuid, @uuid]
+        assert ids(query) == [1, 4]
       end)
     end
   end
