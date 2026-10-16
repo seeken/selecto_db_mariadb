@@ -58,6 +58,9 @@ for application code.
   `STRICT_ALL_TABLES`. If any check fails, the call is refused before any
   statement runs. Set these with MyXQL's `after_connect` if the server
   defaults differ.
+- UUID columns (`:uuid`, `:binary_id`) are stored as text: CHAR(36), or
+  MariaDB's native UUID type. Filters and writes bind the string form.
+  BINARY(16) UUID storage is not supported.
 - Tenant and site columns compare by their utf8mb4 bytes, whatever their
   collation or character set, so tenant `'t1'` never reaches `'T1'` or
   `'t1 '`. You do not need a `_bin` collation.

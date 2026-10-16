@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- UUID columns are text (CHAR(36), or MariaDB's native UUID type), as
+  `type_name/1` maps them. `:uuid_text_storage` makes filters bind the string
+  form, so text-stored UUID tenants are readable and compare exactly. BINARY(16)
+  UUID storage is not supported on these adapters.
+- Live tests: retargets onto scope-key-confined relations (both strategies,
+  one and two hops, engine tenant and required filter, including a
+  case-variant scope).
+
+
 - UUID tenant and site columns (`:uuid`, `:binary_id`) in write predicates,
   guarded-insert re-reads, upsert targets and reference guards compare by
   their stored bytes, unconverted. That is exact for CHAR(36)/VARCHAR and

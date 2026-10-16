@@ -313,6 +313,9 @@ defmodule SelectoDBMariaDB.Adapter do
         # Tenant and site columns compare by their stored bytes, never under
         # the column's collation (Selecto.Builder.ExactCompare).
         :exact_tenant_compare,
+        # UUID columns are text or MariaDB's native UUID type, both written in
+        # the string form: filters bind the string, not the 16-byte binary.
+        :uuid_text_storage,
         # WITH ROLLUP returns no grand total on empty input; Selecto adds it
         # (Selecto.Builder.Sql.RollupTotal) as PostgreSQL returns it.
         :rollup_without_empty_total,
