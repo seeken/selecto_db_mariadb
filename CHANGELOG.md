@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- UUID tenant and site columns (`:uuid`, `:binary_id`) in write predicates,
+  guarded-insert re-reads, upsert targets and reference guards compare by
+  their stored bytes, unconverted. That is exact for CHAR(36)/VARCHAR and
+  BINARY(16) storage alike. Live tests now cover through-association scope
+  pairs (INT and VARCHAR roots, bridges and targets, declared and undeclared
+  bridges, both scope namings) and UUID tenants.
+
+
 - Upserts no longer use `ON DUPLICATE KEY UPDATE`. It fires on the primary
   key and every unique index, so an upsert whose assigned id belonged to
   another row overwrote that row. The declared conflict target must now be

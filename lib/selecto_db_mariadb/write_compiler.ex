@@ -294,14 +294,14 @@ defmodule SelectoDBMariaDB.WriteCompiler do
         texts = Enum.reverse(texts)
         column = quote_field(field, opts)
 
-        if exact_field?(field, opts) do
-          casts = Enum.map_join(texts, ", ", &utf8mb4_bytes/1)
+        if mode = exact_field?(field, opts) do
+          casts = Enum.map_join(texts, ", ", &utf8mb4_bytes(&1, mode))
 
           {:ok,
            %{
              text:
                "(#{column} IN (#{Enum.join(texts, ", ")}) AND " <>
-                 "#{utf8mb4_bytes(column)} IN (#{casts}))",
+                 "#{utf8mb4_bytes(column, mode)} IN (#{casts}))",
              params: params ++ exact_binds(params)
            }}
         else
@@ -319,14 +319,17 @@ defmodule SelectoDBMariaDB.WriteCompiler do
       operator_text = %{eq: "=", neq: "!=", gt: ">", gte: ">=", lt: "<", lte: "<="}[operator]
       column = quote_field(field, opts)
 
-      exact? =
+      mode =
         operator in [:eq, :neq] and
-          (exact_field?(field, opts) or exact_value_field?(value, opts))
+          Selecto.Builder.ExactCompare.strongest([
+            exact_field?(field, opts),
+            exact_value_field?(value, opts)
+          ])
 
-      if exact? do
+      if mode do
         exact =
           "(#{column} = #{compiled.text} AND " <>
-            "#{utf8mb4_bytes(column)} = #{utf8mb4_bytes(compiled.text)})"
+            "#{utf8mb4_bytes(column, mode)} = #{utf8mb4_bytes(compiled.text, mode)})"
 
         {:ok,
          %{
@@ -456,7 +459,8 @@ defmodule SelectoDBMariaDB.WriteCompiler do
 
       {{:ok, tenant_field}, tenant_value} when not is_nil(tenant_value) ->
         if valid_ref?(tenant_field),
-          do: {:ok, {tenant_field, tenant_value, Map.get(guard, :tenant_exact, true) != false}},
+          do:
+            {:ok, {tenant_field, tenant_value, guard_mode(Map.get(guard, :tenant_exact, true))}},
           else: :error
 
       _invalid ->
@@ -470,16 +474,17 @@ defmodule SelectoDBMariaDB.WriteCompiler do
   end
 
   # The parent's tenant column compares by its stored bytes unless the domain
-  # types it as a non-text value (`tenant_exact: false`), so a tenant 't1'
-  # guard never admits a parent of 'T1' or 't1 '.
-  defp foreign_key_guard_text(relation, target_field, value, {tenant_field, tenant, exact?}) do
+  # types it as a value that compares exactly already (`tenant_exact: false`),
+  # so a tenant 't1' guard never admits a parent of 'T1' or 't1 '. A UUID
+  # tenant (`tenant_exact: :bytes`) compares its stored bytes unconverted.
+  defp foreign_key_guard_text(relation, target_field, value, {tenant_field, tenant, mode}) do
     alias_name = quote_identifier("selecto_fk_parent")
     tenant_column = "#{alias_name}.#{quote_identifier(tenant_field)}"
 
     {tenant_text, tenant_params} =
-      if exact?,
+      if mode,
         do:
-          {"(#{tenant_column} = ? AND #{utf8mb4_bytes(tenant_column)} = CAST(? AS BINARY))",
+          {"(#{tenant_column} = ? AND #{utf8mb4_bytes(tenant_column, mode)} = CAST(? AS BINARY))",
            [tenant, exact_bind(tenant)]},
         else: {"#{tenant_column} = ?", [tenant]}
 
@@ -647,7 +652,9 @@ defmodule SelectoDBMariaDB.WriteCompiler do
   # bytes, never under the column's collation: under MariaDB's default
   # case-insensitive collations (and PAD SPACE ones) tenant 't1' would
   # otherwise update or delete rows of 'T1' and 't1 '. A column the domain
-  # types as a non-text value (integer, decimal, UUID) keeps the plain form.
+  # types as a value that compares exactly already (integer, decimal) keeps
+  # the plain form; a UUID column compares its stored bytes unconverted
+  # (BINARY(16) or CHAR(36) storage alike).
   defp with_field_types(opts, metadata) when is_map(metadata) do
     types = Map.get(metadata, :field_types, %{})
 
@@ -656,7 +663,9 @@ defmodule SelectoDBMariaDB.WriteCompiler do
       |> Map.get(:tenant_fields, [])
       |> List.wrap()
       |> Enum.map(&to_string/1)
-      |> Enum.filter(&Selecto.Builder.ExactCompare.text_type?(field_type(types, &1)))
+      |> Enum.map(&{&1, Selecto.Builder.ExactCompare.type_mode(field_type(types, &1))})
+      |> Enum.filter(fn {_field, mode} -> mode end)
+      |> Map.new()
 
     Keyword.put(opts, :exact_fields, exact)
   end
@@ -673,14 +682,24 @@ defmodule SelectoDBMariaDB.WriteCompiler do
 
   defp field_type(_types, _field), do: nil
 
+  # The exact mode of a field: true (convert to utf8mb4), :bytes (stored
+  # bytes as they are) or false.
   defp exact_field?(field, opts),
-    do: to_string(field_name(field)) in Keyword.get(opts, :exact_fields, [])
+    do:
+      Map.get(Map.new(Keyword.get(opts, :exact_fields, %{})), to_string(field_name(field)), false)
+
+  defp guard_mode(mode) when mode in [false, :bytes, "bytes"],
+    do: if(mode == false, do: false, else: :bytes)
+
+  defp guard_mode(_mode), do: true
 
   # The utf8mb4 bytes of a bound value (`?`, already utf8mb4) or of a column,
   # converted first: CAST(col AS BINARY) alone would compare a utf16, ucs2,
-  # utf32 or latin1 column's own charset bytes and never match.
-  defp utf8mb4_bytes("?"), do: "CAST(? AS BINARY)"
-  defp utf8mb4_bytes(column), do: "CAST(CONVERT(#{column} USING utf8mb4) AS BINARY)"
+  # utf32 or latin1 column's own charset bytes and never match. In `:bytes`
+  # mode (UUID columns) the stored bytes are taken unconverted.
+  defp utf8mb4_bytes("?", _mode), do: "CAST(? AS BINARY)"
+  defp utf8mb4_bytes(column, :bytes), do: "CAST(#{column} AS BINARY)"
+  defp utf8mb4_bytes(column, _mode), do: "CAST(CONVERT(#{column} USING utf8mb4) AS BINARY)"
 
   defp exact_value_field?({:field, field}, opts), do: exact_field?(field, opts)
   defp exact_value_field?(_value, _opts), do: false
