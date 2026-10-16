@@ -146,6 +146,29 @@ defmodule SelectoDBMariaDB.RetargetScopeKeysIntegrationTest do
     end
   end
 
+  test "a through target scope key the target does not expose is refused, never key-only" do
+    domain = retarget_domain(:v1)
+
+    through =
+      put_in(domain, [:source, :associations, :a, :through], %{
+        table: "bridges",
+        owner_key: :id,
+        related_key: :acc_id,
+        source_scope_key: :tenant_key,
+        through_scope_key: :org_key,
+        target_scope_key: :org_key
+      })
+      |> update_in([:schemas, :acc, :fields], &List.delete(&1, :org_key))
+
+    assert_raise ArgumentError, ~r/target scope field :org_key is not declared/, fn ->
+      Selecto.configure(
+        through,
+        Selecto.Runtime.Context.new(SelectoDBMariaDB.Adapter, :compile_only),
+        validate: false
+      )
+    end
+  end
+
   defp connection_options do
     [
       hostname: System.get_env("SELECTO_MARIADB_HOST", "127.0.0.1"),

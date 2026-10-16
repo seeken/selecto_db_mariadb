@@ -425,7 +425,11 @@ defmodule SelectoDBMariaDB.AdapterTest do
     assert {:ok, %Preview{statements: [%{text: untyped}]}} =
              SelectoDBMariaDB.Adapter.preview_write(:unused, update.(%{}), [])
 
-    assert untyped == sql
+    # An undeclared type is server-decided: text by its bytes, a 'binary'
+    # collation (numeric, temporal) plainly.
+    assert untyped =~
+             "(`tenant_id` = ? AND (COLLATION(`tenant_id`) = 'binary' OR " <>
+               "CAST(CONVERT(`tenant_id` USING utf8mb4) AS BINARY) = CAST(? AS BINARY)))"
 
     assert {:ok, %Preview{statements: [%{text: plain, params: plain_params} = statement]}} =
              SelectoDBMariaDB.Adapter.preview_write(:unused, update.(%{tenant_id: :integer}), [])

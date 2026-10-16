@@ -236,7 +236,7 @@ defmodule SelectoDBMariaDB.TenantExactCompareIntegrationTest do
   describe "host-installed predicates" do
     # A host scope decides tenant identity even on a domain without
     # tenant_field (org_key) and for a site pin beside an integer tenant.
-    test "required filters, host filters and trusted-context filters compare exactly" do
+    test "required filters and trusted-context filters compare exactly at any depth" do
       with_database(fn conn ->
         ddl!(conn, "CREATE TABLE hs (id INT PRIMARY KEY, org_key VARCHAR(16), name VARCHAR(20))")
 
@@ -294,24 +294,199 @@ defmodule SelectoDBMariaDB.TenantExactCompareIntegrationTest do
             domain |> Selecto.configure(conn, adapter: Adapter, validate: false) |> bind.()
           end
 
-          for {label, query} <- [
+          # Any depth of the host predicate tree: =, <>, IN, NOT IN under
+          # AND/OR/NOT.
+          shapes = [
+            {column, value},
+            {:or, [{column, value}, {column, "zz"}]},
+            {:and, [{"id", {:gte, 0}}, {:or, [{column, value}, {column, "zz"}]}]},
+            {:or, [{column, value}, {"id", {:lt, 0}}]},
+            {:not, {column, {"!=", value}}},
+            {:not, {column, {:not_in, [value]}}}
+          ]
+
+          for shape <- shapes,
+              {label, query} <- [
                 {"domain required_filters",
-                 configure.(Map.put(domain, :required_filters, [{column, value}]))},
+                 configure.(Map.put(domain, :required_filters, [shape]))},
                 {"require_tenant_filter",
-                 configure.(domain) |> Selecto.Tenant.require_tenant_filter(column, value)},
-                {"host filter", configure.(domain) |> Selecto.filter([{column, value}])},
+                 configure.(domain) |> Selecto.Tenant.require_tenant_filter(shape)},
                 {"trusted context",
                  domain
                  |> Selecto.configure(conn, adapter: Adapter, validate: false)
                  |> Selecto.with_tenant(
                    if(column == "site",
-                     do: %{tenant_id: 1, required_filters: [{column, value}]},
-                     else: %{required_filters: [{column, value}]}
+                     do: %{tenant_id: 1, required_filters: [shape]},
+                     else: %{required_filters: [shape]}
                    )
                  )}
               ] do
-            assert ids(Selecto.select(query, ["id"])) == [1], "#{column} #{label}"
+            assert ids(Selecto.select(query, ["id"])) == [1],
+                   "#{column} #{label} #{inspect(shape)}"
           end
+        end
+      end)
+    end
+  end
+
+  describe "host predicates on non-text columns" do
+    # Declared temporal columns keep the plain comparison, as on PostgreSQL:
+    # their text form ('...10:00:00.000') differs from the bound value.
+    test "eq, <> and NOT IN on TIME(6), TIMESTAMP(3) and DATE match PostgreSQL" do
+      with_database(fn conn ->
+        ddl!(
+          conn,
+          "CREATE TABLE tq (id INT PRIMARY KEY, at TIMESTAMP(3) NULL, d DATE NULL, " <>
+            "tu TIME(6) NULL, name VARCHAR(20))"
+        )
+
+        ddl!(
+          conn,
+          "INSERT INTO tq VALUES (1, '2024-01-01 10:00:00', '2024-01-01', '10:00:00', 'a'), " <>
+            "(2, '2024-01-01 10:00:00', '2024-01-01', '10:00:00', 'b'), " <>
+            "(3, '2024-01-01 10:00:00.5', '2024-01-02', '10:00:00.5', 'c')"
+        )
+
+        domain = %{
+          name: "TQ",
+          source: %{
+            source_table: "tq",
+            primary_key: :id,
+            fields: [:id, :at, :d, :tu, :name],
+            redact_fields: [],
+            columns: %{
+              id: %{type: :integer},
+              at: %{type: :naive_datetime},
+              d: %{type: :date},
+              tu: %{type: :time_usec},
+              name: %{type: :string}
+            },
+            associations: %{}
+          },
+          schemas: %{},
+          joins: %{}
+        }
+
+        for {filter, expected} <- [
+              {{"tu", ~T[10:00:00]}, [1, 2]},
+              {{"tu", "10:00:00"}, [1, 2]},
+              {{"d", ~D[2024-01-01]}, [1, 2]},
+              {{"d", {"!=", ~D[2024-01-01]}}, [3]},
+              {{"d", {:not_in, [~D[2024-01-01]]}}, [3]},
+              {{"at", ~N[2024-01-01 10:00:00]}, [1, 2]},
+              {{"at", {"!=", ~N[2024-01-01 10:00:00]}}, [3]},
+              {{"at", {:not_in, [~N[2024-01-01 10:00:00]]}}, [3]}
+            ] do
+          query =
+            domain
+            |> Map.put(:required_filters, [filter])
+            |> Selecto.configure(conn, adapter: Adapter, validate: false)
+            |> Selecto.select(["id"])
+
+          {sql, _params} = Selecto.to_sql(query)
+          refute sql =~ "BINARY", inspect(filter)
+          assert ids(query) == expected, inspect(filter)
+        end
+      end)
+    end
+  end
+
+  describe "type classification" do
+    defp classified_ids(conn, table, columns, filter) do
+      %{
+        name: "C",
+        source: %{
+          source_table: table,
+          primary_key: :id,
+          fields: Keyword.keys(columns),
+          redact_fields: [],
+          # Selecto requires a :type key; an undeclared column carries nil.
+          columns:
+            Map.new(columns, fn
+              {name, :undeclared} -> {name, %{type: nil}}
+              {name, type} -> {name, %{type: type}}
+            end),
+          associations: %{}
+        },
+        schemas: %{},
+        joins: %{},
+        required_filters: [filter]
+      }
+      |> Selecto.configure(conn, adapter: Adapter, validate: false)
+      |> Selecto.select(["id"])
+      |> ids()
+    end
+
+    test "undeclared DATETIME(3) and DECIMAL columns are server-decided, as on PostgreSQL" do
+      with_database(fn conn ->
+        ddl!(
+          conn,
+          "CREATE TABLE ud (id INT PRIMARY KEY, at DATETIME(3), amt DECIMAL(10,2), org_key VARCHAR(16))"
+        )
+
+        ddl!(
+          conn,
+          "INSERT INTO ud VALUES (1, '2024-01-01 10:00:00', 10.00, 't1'), " <>
+            "(2, '2024-01-01 10:00:00', 10.00, 'T1'), (3, '2024-01-01 10:00:00.5', 10.50, 't1 ')"
+        )
+
+        columns = [id: :integer, at: :undeclared, amt: :undeclared, org_key: :undeclared]
+
+        for {filter, expected} <- [
+              {{"at", "2024-01-01 10:00:00"}, [1, 2]},
+              {{"at", {"!=", "2024-01-01 10:00:00"}}, [3]},
+              {{"at", {:not_in, ["2024-01-01 10:00:00"]}}, [3]},
+              {{"amt", "10"}, [1, 2]},
+              {{"amt", {"!=", "10"}}, [3]},
+              {{"amt", {:not_in, ["10"]}}, [3]},
+              {{"org_key", "t1"}, [1]},
+              {{"org_key", {"!=", "t1"}}, [2, 3]}
+            ] do
+          assert classified_ids(conn, "ud", columns, filter) == expected, inspect(filter)
+        end
+
+        # A write whose command carries no field types is server-decided too.
+        for {predicate, expected} <- [
+              {{:neq, {:field, "amt"}, {:literal, "10"}}, [3]},
+              {{:not, {:in, {:field, "at"}, [{:literal, "2024-01-01 10:00:00"}]}}, [3]},
+              {{:eq, {:field, "org_key"}, {:literal, "t1"}}, [1]}
+            ] do
+          ddl!(conn, "UPDATE ud SET amt = amt")
+
+          update = %Command{
+            operation: :update,
+            relation: "ud",
+            assignments: [%{field: "org_key", value: {:field, "org_key"}}],
+            predicate: predicate,
+            returning: :none,
+            expected_cardinality: :many,
+            metadata: %{tenant_fields: ["amt", "at", "org_key"]}
+          }
+
+          assert {:ok, %{affected_rows: count}} = Adapter.execute_write_unsafe(conn, update, [])
+          assert count == length(expected), inspect(predicate)
+        end
+      end)
+    end
+
+    test "parameterised, synonym and custom text types compare exactly" do
+      with_database(fn conn ->
+        ddl!(conn, "CREATE TABLE tt (id INT PRIMARY KEY, org_key VARCHAR(16))")
+        ddl!(conn, "INSERT INTO tt VALUES (1, 't1'), (2, 'T1'), (3, 't1 ')")
+
+        for type <- [
+              "varchar(255)",
+              "VARCHAR(16)",
+              "char(16)",
+              "character varying",
+              "citext",
+              "varchar(16) character set utf8mb4 collate utf8mb4_0900_ai_ci",
+              :"Elixir.MyApp.TenantKey",
+              {:parameterized, {Ecto.Enum, %{}}}
+            ] do
+          assert classified_ids(conn, "tt", [id: :integer, org_key: type], {"org_key", "t1"}) ==
+                   [1],
+                 inspect(type)
         end
       end)
     end
@@ -341,10 +516,11 @@ defmodule SelectoDBMariaDB.TenantExactCompareIntegrationTest do
             field_types: %{"tenant_id" => :uuid}
           )
 
-        # The stored bytes compare unconverted: no CONVERT on a UUID column.
+        # A UUID column is server-decided: text storage by its bytes.
         {:ok, %{text: text}} = SelectoDBMariaDB.WriteCompiler.compile(update, [])
-        assert text =~ "CAST(`tenant_id` AS BINARY) = CAST(? AS BINARY)"
-        refute text =~ "CONVERT"
+
+        assert text =~
+                 "(COLLATION(`tenant_id`) = 'binary' OR CAST(CONVERT(`tenant_id` USING utf8mb4) AS BINARY) = CAST(? AS BINARY))"
 
         assert {:ok, %{affected_rows: 2}} = Adapter.execute_write_unsafe(conn, update, [])
         assert column(conn, "SELECT id FROM orders WHERE total = 9 ORDER BY id") == [1, 4]
@@ -384,8 +560,10 @@ defmodule SelectoDBMariaDB.TenantExactCompareIntegrationTest do
           |> Selecto.select(["id"])
 
         {sql, params} = Selecto.to_sql(query)
-        assert sql =~ "CAST(selecto_root.tenant_id AS BINARY) = CAST(? AS BINARY)"
-        refute sql =~ "CONVERT"
+
+        assert sql =~
+                 "(COLLATION(selecto_root.tenant_id) = 'binary' OR CAST(CONVERT(selecto_root.tenant_id USING utf8mb4) AS BINARY) = CAST(? AS BINARY))"
+
         assert params == [@uuid, @uuid]
         assert ids(query) == [1, 4]
       end)

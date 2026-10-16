@@ -301,7 +301,7 @@ defmodule SelectoDBMariaDB.WriteCompiler do
            %{
              text:
                "(#{column} IN (#{Enum.join(texts, ", ")}) AND " <>
-                 "#{utf8mb4_bytes(column, mode)} IN (#{casts}))",
+                 "#{server_binary(column, mode)}#{utf8mb4_bytes(column, mode)} IN (#{casts})#{server_close(mode)})",
              params: params ++ exact_binds(params)
            }}
         else
@@ -329,7 +329,8 @@ defmodule SelectoDBMariaDB.WriteCompiler do
       if mode do
         exact =
           "(#{column} = #{compiled.text} AND " <>
-            "#{utf8mb4_bytes(column, mode)} = #{utf8mb4_bytes(compiled.text, mode)})"
+            "#{server_binary(column, mode, compiled.text)}#{utf8mb4_bytes(column, mode)} = " <>
+            "#{utf8mb4_bytes(compiled.text, mode)}#{server_close(mode)})"
 
         {:ok,
          %{
@@ -484,7 +485,8 @@ defmodule SelectoDBMariaDB.WriteCompiler do
     {tenant_text, tenant_params} =
       if mode,
         do:
-          {"(#{tenant_column} = ? AND #{utf8mb4_bytes(tenant_column, mode)} = CAST(? AS BINARY))",
+          {"(#{tenant_column} = ? AND #{server_binary(tenant_column, mode)}" <>
+             "#{utf8mb4_bytes(tenant_column, mode)} = CAST(? AS BINARY)#{server_close(mode)})",
            [tenant, exact_bind(tenant)]},
         else: {"#{tenant_column} = ?", [tenant]}
 
@@ -691,12 +693,27 @@ defmodule SelectoDBMariaDB.WriteCompiler do
   defp guard_mode(mode) when mode in [false, :bytes, "bytes"],
     do: if(mode == false, do: false, else: :bytes)
 
+  defp guard_mode(mode) when mode in [:server, "server"], do: :server
+
   defp guard_mode(_mode), do: true
 
   # The utf8mb4 bytes of a bound value (`?`, already utf8mb4) or of a column,
   # converted first: CAST(col AS BINARY) alone would compare a utf16, ucs2,
   # utf32 or latin1 column's own charset bytes and never match. In `:bytes`
   # mode (UUID columns) the stored bytes are taken unconverted.
+  # An undeclared column (`:server`): a 'binary' collation (numeric,
+  # temporal, binary types) compares plainly, text by its utf8mb4 bytes.
+  # A column pair is plain only when both sides have a 'binary' collation.
+  defp server_binary(column, mode, other \\ "?")
+  defp server_binary(column, :server, "?"), do: "(COLLATION(#{column}) = 'binary' OR "
+
+  defp server_binary(column, :server, other),
+    do: "((COLLATION(#{column}) = 'binary' AND COLLATION(#{other}) = 'binary') OR "
+
+  defp server_binary(_column, _mode, _other), do: ""
+  defp server_close(:server), do: ")"
+  defp server_close(_mode), do: ""
+
   defp utf8mb4_bytes("?", _mode), do: "CAST(? AS BINARY)"
   defp utf8mb4_bytes(column, :bytes), do: "CAST(#{column} AS BINARY)"
   defp utf8mb4_bytes(column, _mode), do: "CAST(CONVERT(#{column} USING utf8mb4) AS BINARY)"
