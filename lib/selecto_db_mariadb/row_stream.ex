@@ -33,11 +33,27 @@ defmodule SelectoDBMariaDB.RowStream do
           DBConnection.run(
             conn,
             fn checked_out ->
-              checked_out
-              |> MyXQL.stream(statement, params, max_rows: max_rows, timeout: stream_timeout)
-              |> Enum.each(fn %MyXQL.Result{rows: rows, columns: columns} ->
-                send_chunk.(rows || [], columns || [])
-              end)
+              # The session check runs on the connection the cursor then uses.
+              case SelectoDBMariaDB.Session.verify(checked_out) do
+                :ok ->
+                  checked_out
+                  |> MyXQL.stream(statement, params, max_rows: max_rows, timeout: stream_timeout)
+                  |> Enum.reduce_while(:ok, fn %MyXQL.Result{rows: rows, columns: columns}, :ok ->
+                    # A stored value outside the supported range ends the
+                    # stream with a typed error (SelectoDBMariaDB.StoredValues).
+                    case SelectoDBMariaDB.StoredValues.check(rows) do
+                      :ok ->
+                        send_chunk.(rows || [], columns || [])
+                        {:cont, :ok}
+
+                      {:error, error} ->
+                        {:halt, {:producer_failed, error}}
+                    end
+                  end)
+
+                {:error, error} ->
+                  {:producer_failed, error}
+              end
             end,
             timeout: stream_timeout
           )

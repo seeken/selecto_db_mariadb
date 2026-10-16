@@ -295,12 +295,15 @@ defmodule SelectoDBMariaDB.AdapterTest do
   end
 
   test "a tenant foreign-key guard binds the referenced row's tenant behind an alias" do
+    # The domain types tenant_id as an integer (`tenant_exact: false`), so the
+    # tenant compares plainly.
     guard = %{
       field: :project_id,
       relation: :projects,
       target_field: :id,
       tenant_field: :tenant_id,
-      tenant_value: 7
+      tenant_value: 7,
+      tenant_exact: false
     }
 
     insert =
@@ -332,7 +335,7 @@ defmodule SelectoDBMariaDB.AdapterTest do
              "WHERE `id` = ? AND EXISTS (SELECT 1 FROM `projects` AS `selecto_fk_parent` " <>
                "WHERE `selecto_fk_parent`.`id` = ? AND `selecto_fk_parent`.`tenant_id` = ?)"
 
-    base = Map.drop(guard, [:tenant_field, :tenant_value])
+    base = Map.drop(guard, [:tenant_field, :tenant_value, :tenant_exact])
 
     for invalid <- [
           Map.put(base, :tenant_field, :tenant_id),
@@ -346,6 +349,81 @@ defmodule SelectoDBMariaDB.AdapterTest do
       assert {:error, %Error{type: :invalid_foreign_key_guard}} =
                SelectoDBMariaDB.Adapter.preview_write(:unused, command, [])
     end
+  end
+
+  test "a text or untyped tenant guard compares the parent's tenant by its stored bytes" do
+    guard = %{
+      field: :project_id,
+      relation: :projects,
+      target_field: :id,
+      tenant_field: :tenant_id,
+      tenant_value: "t1"
+    }
+
+    insert =
+      command!(:insert,
+        relation: :tasks,
+        assignments: [%{field: :project_id, value: {:literal, 80}}],
+        metadata: %{foreign_key_guards: [guard]}
+      )
+
+    assert {:ok, %Preview{statements: [%{text: sql, params: [80, 80, "t1", "t1"]}]}} =
+             SelectoDBMariaDB.Adapter.preview_write(:unused, insert, [])
+
+    assert sql ==
+             "INSERT INTO `tasks` (`project_id`) SELECT ? WHERE EXISTS " <>
+               "(SELECT 1 FROM `projects` AS `selecto_fk_parent` " <>
+               "WHERE `selecto_fk_parent`.`id` = ? AND (`selecto_fk_parent`.`tenant_id` = ? AND " <>
+               "CAST(CONVERT(`selecto_fk_parent`.`tenant_id` USING utf8mb4) AS BINARY) = " <>
+               "CAST(? AS BINARY)))"
+  end
+
+  test "tenant predicates compare by stored bytes unless the domain types them non-text" do
+    update = fn types ->
+      command!(:update,
+        relation: :tasks,
+        assignments: [%{field: :name, value: {:literal, "n"}}],
+        predicate:
+          {:and,
+           [
+             {:eq, {:field, :tenant_id}, {:literal, "t1"}},
+             {:in, {:field, :tenant_id}, [{:literal, "t1"}, {:literal, "t2"}]},
+             {:neq, {:field, :tenant_id}, {:literal, "x"}},
+             {:eq, {:field, :name}, {:literal, "a"}}
+           ]},
+        metadata: %{tenant_fields: ["tenant_id"], field_types: types}
+      )
+    end
+
+    assert {:ok, %Preview{statements: [%{text: sql, params: params}]}} =
+             SelectoDBMariaDB.Adapter.preview_write(
+               :unused,
+               update.(%{"tenant_id" => :string}),
+               []
+             )
+
+    assert sql ==
+             "UPDATE `tasks` SET `name` = ? WHERE ((`tenant_id` = ? AND " <>
+               "CAST(CONVERT(`tenant_id` USING utf8mb4) AS BINARY) = CAST(? AS BINARY)) AND " <>
+               "(`tenant_id` IN (?, ?) AND CAST(CONVERT(`tenant_id` USING utf8mb4) AS BINARY) IN " <>
+               "(CAST(? AS BINARY), CAST(? AS BINARY))) AND NOT (`tenant_id` = ? AND " <>
+               "CAST(CONVERT(`tenant_id` USING utf8mb4) AS BINARY) = CAST(? AS BINARY)) AND `name` = ?)"
+
+    assert params == ["n", "t1", "t1", "t1", "t2", "t1", "t2", "x", "x", "a"]
+
+    assert {:ok, %Preview{statements: [%{text: untyped}]}} =
+             SelectoDBMariaDB.Adapter.preview_write(:unused, update.(%{}), [])
+
+    assert untyped == sql
+
+    assert {:ok, %Preview{statements: [%{text: plain, params: plain_params}]}} =
+             SelectoDBMariaDB.Adapter.preview_write(:unused, update.(%{tenant_id: :integer}), [])
+
+    assert plain ==
+             "UPDATE `tasks` SET `name` = ? WHERE (`tenant_id` = ? AND " <>
+               "`tenant_id` IN (?, ?) AND `tenant_id` != ? AND `name` = ?)"
+
+    assert plain_params == ["n", "t1", "t1", "t2", "x", "a"]
   end
 
   test "refuses upserts under any write scope because ON DUPLICATE KEY ignores the target" do

@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+- Tenant and site columns compare exactly (`:exact_tenant_compare`). Reads
+  are covered by Selecto. Write predicates on `metadata.tenant_fields`, the
+  guarded-insert re-read and reference-guard tenants compare the column's
+  utf8mb4 bytes as well, so tenant `'t1'` never updates, deletes, admits or
+  references a `'T1'` or `'t1 '` row. The same holds for utf16 and latin1
+  columns. A column typed as a non-text value keeps the plain comparison.
+- Every read, stream and write first checks the session on the connection it
+  uses, once per call. The time zone must be UTC (`UTC`, `+00:00`, `Etc/UTC`,
+  or `SYSTEM` on a UTC server, never `GMT`). The client, connection and
+  results character sets must be utf8mb4. sql_mode must be strict. Otherwise
+  the call is refused before any statement runs: reads and streams get a
+  `:connection_error` with category `:invalid_session`, writes get
+  `:invalid_connection`. Only the failing setting is named.
+- Server errors 1264, 1265, 1292, 1366, 1367, 1406 and 1690 are category
+  `:data_violation`, 1213 is `:deadlock_detected` and 1205 is
+  `:lock_timeout`. All were `:database_error` before. A deadlock victim keeps
+  its category inside a host transaction.
+- A read or stream that returns a zero date, a zero month or day, or year 0
+  (storable outside strict mode) fails with category `:data_violation` and
+  code `:value_out_of_range`, instead of handing back an invalid date.
+- An empty input to a rollup returns PostgreSQL's grand-total row
+  (`:rollup_without_empty_total`).
+
+
 - Guarded inserts (a captured query predicate or tenant scope) are admitted
   on storage semantics (`typed_insert_admission`, `typed_insert_precision`):
   after the portable candidate check, the INSERT runs in the write

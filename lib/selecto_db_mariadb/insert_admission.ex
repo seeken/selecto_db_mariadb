@@ -92,8 +92,13 @@ defmodule SelectoDBMariaDB.InsertAdmission do
          {:ok, schema, table} <- relation(command.relation),
          {:ok, column} <- key_column(connection, schema, table, key, execute, opts),
          {:ok, key_value} <- key_value(command, key, column, insert_result),
+         # Tenant and site columns of the guard compare by their stored bytes
+         # (WriteCompiler.predicate_opts/2).
          {:ok, guard} <-
-           WriteCompiler.compile_predicate(predicate, context: Keyword.get(opts, :context, %{})),
+           WriteCompiler.compile_predicate(
+             predicate,
+             WriteCompiler.predicate_opts(command, context: Keyword.get(opts, :context, %{}))
+           ),
          from = "SELECT COUNT(*) FROM " <> quote_relation(command.relation),
          by_key = " WHERE " <> quote_id(key) <> " = ?",
          {:ok, %{rows: [[1]]}} <- execute.(connection, from <> by_key, [key_value], opts),
