@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Write predicates, re-reads and reference guards follow Selecto's
+  three-way type classification. Columns that are undeclared, of unknown
+  type or untyped (a command without field types) use the guarded form
+  `(col = ? AND (COLLATION(col) = 'binary' OR <bytes>))`, so a host `<>` on
+  an undeclared DATETIME or DECIMAL column keeps PostgreSQL's semantics.
+  Live tests cover host predicates of every shape, temporal and undeclared
+  columns, parameterised and custom text types, and a refused through scope
+  key.
+
+
 - Every statement the adapter sends (reads, streams, writes, re-reads,
   probes, the session check) runs as `SET STATEMENT
   optimizer_switch='subquery_cache=off' FOR ...`. MariaDB's subquery cache
