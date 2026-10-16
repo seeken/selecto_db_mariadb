@@ -469,6 +469,60 @@ defmodule SelectoDBMariaDB.TenantExactCompareIntegrationTest do
       end)
     end
 
+    test "custom names that merely contain char or text are guarded, as on PostgreSQL" do
+      with_database(fn conn ->
+        ddl!(
+          conn,
+          "CREATE TABLE cn (id INT PRIMARY KEY, amt DECIMAL(10,2), ts DATETIME(3), name VARCHAR(8))"
+        )
+
+        ddl!(
+          conn,
+          "INSERT INTO cn VALUES (1, 10.00, '2024-01-01 10:00:00', 'a'), " <>
+            "(2, 10.00, '2024-01-01 10:00:00', 'b'), (3, 10.50, '2024-01-01 10:00:00.5', 'c')"
+        )
+
+        columns = [id: :integer, amt: "charge_amount", ts: "context_ts", name: :string]
+
+        for {filter, expected} <- [
+              {{"amt", "10"}, [1, 2]},
+              {{"amt", {"!=", "10"}}, [3]},
+              {{"amt", {:not_in, ["10"]}}, [3]},
+              {{"ts", "2024-01-01 10:00:00"}, [1, 2]},
+              {{"ts", {"!=", "2024-01-01 10:00:00"}}, [3]},
+              {{"ts", {:not_in, ["2024-01-01 10:00:00"]}}, [3]}
+            ] do
+          assert classified_ids(conn, "cn", columns, filter) == expected, inspect(filter)
+        end
+
+        for {predicate, expected} <- [
+              {{:eq, {:field, "amt"}, {:literal, "10"}}, 2},
+              {{:neq, {:field, "amt"}, {:literal, "10"}}, 1},
+              {{:not, {:in, {:field, "amt"}, [{:literal, "10"}]}}, 1},
+              {{:eq, {:field, "ts"}, {:literal, "2024-01-01 10:00:00"}}, 2},
+              {{:neq, {:field, "ts"}, {:literal, "2024-01-01 10:00:00"}}, 1},
+              {{:not, {:in, {:field, "ts"}, [{:literal, "2024-01-01 10:00:00"}]}}, 1}
+            ] do
+          update = %Command{
+            operation: :update,
+            relation: "cn",
+            assignments: [%{field: "name", value: {:field, "name"}}],
+            predicate: predicate,
+            returning: :none,
+            expected_cardinality: :many,
+            metadata: %{
+              tenant_fields: ["amt", "ts"],
+              field_types: %{"amt" => "charge_amount", "ts" => "context_ts"}
+            }
+          }
+
+          assert {:ok, %{affected_rows: ^expected}} =
+                   Adapter.execute_write_unsafe(conn, update, []),
+                 inspect(predicate)
+        end
+      end)
+    end
+
     test "parameterised, synonym and custom text types compare exactly" do
       with_database(fn conn ->
         ddl!(conn, "CREATE TABLE tt (id INT PRIMARY KEY, org_key VARCHAR(16))")
@@ -479,6 +533,8 @@ defmodule SelectoDBMariaDB.TenantExactCompareIntegrationTest do
               "VARCHAR(16)",
               "char(16)",
               "character varying",
+              "char varying",
+              "national varchar",
               "citext",
               "varchar(16) character set utf8mb4 collate utf8mb4_0900_ai_ci",
               :"Elixir.MyApp.TenantKey",

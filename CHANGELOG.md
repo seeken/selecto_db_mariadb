@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Live test: DECIMAL and DATETIME(3) columns declared with custom type
+  names that contain "char" or "text" (`charge_amount`, `context_ts`) stay
+  guarded in reads and writes. `char varying` and `national varchar` stay
+  exact.
+
+
 - Write predicates, re-reads and reference guards follow Selecto's
   three-way type classification. Columns that are undeclared, of unknown
   type or untyped (a command without field types) use the guarded form
