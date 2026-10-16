@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Every statement the adapter sends (reads, streams, writes, re-reads,
+  probes, the session check) runs as `SET STATEMENT
+  optimizer_switch='subquery_cache=off' FOR ...`. MariaDB's subquery cache
+  keys a correlated subquery's outer references under the column's
+  collation, so an outer `'T7'` (or `'t7 '`) reused the result for `'t7'`
+  whatever exact comparison the SQL used. This leaked through-association
+  joins on the default optimizer and scope-key retargets with semijoin=off.
+  The setting applies per statement and never changes the host's session.
+  Savepoint statements cannot carry it and hold no subquery.
+
+
 - UUID columns are text (CHAR(36), or MariaDB's native UUID type), as
   `type_name/1` maps them. `:uuid_text_storage` makes filters bind the string
   form, so text-stored UUID tenants are readable and compare exactly. BINARY(16)

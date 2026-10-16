@@ -44,7 +44,12 @@ defmodule SelectoDBMariaDB.Session do
 
   @doc false
   def verify(conn, opts \\ []) do
-    case MyXQL.query(conn, @query, [], [query_type: :text] ++ Keyword.take(opts, [:timeout])) do
+    case MyXQL.query(
+           conn,
+           SelectoDBMariaDB.Adapter.statement(@query),
+           [],
+           [query_type: :text] ++ Keyword.take(opts, [:timeout])
+         ) do
       {:ok, %MyXQL.Result{rows: [row]}} -> check(row)
       {:ok, _result} -> refuse(:session)
       {:error, reason} -> {:error, SelectoDBMariaDB.Adapter.sanitize_error(reason)}

@@ -143,10 +143,10 @@ defmodule SelectoDBMariaDB.Adapter do
         {:error, @missing_dependency}
 
       is_pid(connection) and Process.alive?(connection) ->
-        SelectoDBMariaDB.RowStream.open(connection, normalize_query(query), params, opts)
+        SelectoDBMariaDB.RowStream.open(connection, statement(query), params, opts)
 
       is_atom(connection) and not is_nil(connection) and is_pid(Process.whereis(connection)) ->
-        SelectoDBMariaDB.RowStream.open(connection, normalize_query(query), params, opts)
+        SelectoDBMariaDB.RowStream.open(connection, statement(query), params, opts)
 
       true ->
         {:error, {:invalid_connection, connection}}
@@ -193,7 +193,7 @@ defmodule SelectoDBMariaDB.Adapter do
   # A statement on a connection whose session this call already verified.
   def execute_unchecked(connection, query, params, opts) do
     with :ok <- require_binary_protocol(opts) do
-      case MyXQL.query(resolve_connection(connection), normalize_query(query), params, opts) do
+      case MyXQL.query(resolve_connection(connection), statement(query), params, opts) do
         {:ok, result} ->
           # A stored value outside the supported range is a typed error
           # (SelectoDBMariaDB.StoredValues).
@@ -746,6 +746,24 @@ defmodule SelectoDBMariaDB.Adapter do
   defp normalize_relation_source_kind("table"), do: :table
   defp normalize_relation_source_kind("view"), do: :view
   defp normalize_relation_source_kind(other), do: other
+
+  @no_subquery_cache "SET STATEMENT optimizer_switch='subquery_cache=off' FOR "
+
+  @doc false
+  # Every statement this adapter sends runs with MariaDB's subquery cache off.
+  # The cache keys a correlated subquery's outer references under the
+  # column's collation, so a row holding 'T7' (or 't7 ' under PAD SPACE)
+  # reused the result computed for 't7' whatever exact comparison the SQL
+  # used. SET STATEMENT applies to the one statement only, never to the
+  # host's session. (Savepoint statements cannot carry it and hold no
+  # subquery.)
+  def statement(query) do
+    query = normalize_query(query)
+
+    if String.starts_with?(query, @no_subquery_cache),
+      do: query,
+      else: @no_subquery_cache <> query
+  end
 
   defp normalize_query(query) when is_binary(query), do: query
   defp normalize_query(query), do: IO.iodata_to_binary(query)
