@@ -233,6 +233,81 @@ defmodule SelectoDBMariaDB.TenantExactCompareIntegrationTest do
     end
   end
 
+  describe "UUID tenant columns" do
+    @uuid "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"
+
+    test "stored as text (VARCHAR), writes touch only the exact UUID's rows" do
+      with_database(fn conn ->
+        ddl!(
+          conn,
+          "CREATE TABLE orders (id INT PRIMARY KEY, tenant_id VARCHAR(40) NOT NULL, total INT) ENGINE=InnoDB"
+        )
+
+        ddl!(
+          conn,
+          "INSERT INTO orders VALUES (1, '#{@uuid}', 1), (2, '#{String.upcase(@uuid)}', 1), " <>
+            "(3, '#{@uuid} ', 1), (4, '#{@uuid}', 1)"
+        )
+
+        update =
+          command(:update,
+            assignments: [%{field: "total", value: {:literal, 9}}],
+            predicate: {:eq, {:field, "tenant_id"}, {:literal, @uuid}},
+            expected_cardinality: :many,
+            field_types: %{"tenant_id" => :uuid}
+          )
+
+        # The stored bytes compare unconverted: no CONVERT on a UUID column.
+        {:ok, %{text: text}} = SelectoDBMariaDB.WriteCompiler.compile(update, [])
+        assert text =~ "CAST(`tenant_id` AS BINARY) = CAST(? AS BINARY)"
+        refute text =~ "CONVERT"
+
+        assert {:ok, %{affected_rows: 2}} = Adapter.execute_write_unsafe(conn, update, [])
+        assert column(conn, "SELECT id FROM orders WHERE total = 9 ORDER BY id") == [1, 4]
+
+        delete =
+          command(:delete,
+            predicate: {:eq, {:field, "tenant_id"}, {:literal, @uuid}},
+            expected_cardinality: :many,
+            field_types: %{"tenant_id" => :uuid}
+          )
+
+        assert {:ok, %{affected_rows: 2}} = Adapter.execute_write_unsafe(conn, delete, [])
+        assert column(conn, "SELECT id FROM orders ORDER BY id") == [2, 3]
+      end)
+    end
+
+    test "stored as BINARY(16), reads match the exact UUID without CONVERT" do
+      with_database(fn conn ->
+        ddl!(
+          conn,
+          "CREATE TABLE orders (id INT PRIMARY KEY, tenant_id BINARY(16) NOT NULL, customer_id INT, bin_id INT, total INT) ENGINE=InnoDB"
+        )
+
+        other = "b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"
+
+        for {id, uuid} <- [{1, @uuid}, {2, other}, {3, @uuid}] do
+          MyXQL.query!(conn, "INSERT INTO orders VALUES (?, ?, NULL, NULL, 1)", [
+            id,
+            UUID.string_to_binary!(uuid)
+          ])
+        end
+
+        domain = put_in(domain(), [:source, :columns, :tenant_id], %{type: :uuid})
+
+        query =
+          Selecto.configure(domain, conn, adapter: Adapter, validate: false)
+          |> Selecto.with_tenant(@uuid)
+          |> Selecto.select(["id"])
+
+        {sql, _params} = Selecto.to_sql(query)
+        assert sql =~ "CAST(selecto_root.tenant_id AS BINARY) = CAST(? AS BINARY)"
+        refute sql =~ "CONVERT"
+        assert ids(query) == [1, 3]
+      end)
+    end
+  end
+
   describe "integer tenant columns" do
     test "keep the plain comparison in reads and writes" do
       domain = put_in(domain(), [:source, :columns, :tenant_id], %{type: :integer})
