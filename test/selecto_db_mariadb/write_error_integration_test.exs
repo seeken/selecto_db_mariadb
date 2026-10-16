@@ -56,10 +56,10 @@ defmodule SelectoDBMariaDB.WriteErrorIntegrationTest do
         assert {:error, %Selecto.Error{details: details}} =
                  Adapter.execute(conn, "SELECT d, dt FROM days WHERE id = ?", [id], [])
 
-        assert details.category == :data_violation
-        assert details.code == :value_out_of_range
+        assert details.category == :datetime_field_overflow
+        assert details.sqlstate == "22008"
 
-        assert {:error, %Selecto.Error{details: %{category: :data_violation}}} =
+        assert {:error, %Selecto.Error{details: %{category: :datetime_field_overflow}}} =
                  Adapter.stream(conn, "SELECT d, dt FROM days WHERE id = ?", [id], [])
       end
 

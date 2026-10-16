@@ -52,6 +52,44 @@ defmodule SelectoDBMariaDB.RollupTotalIntegrationTest do
     end)
   end
 
+  test "explicit directions place NULL keys as PostgreSQL does, also on a page" do
+    with_database(fn conn ->
+      MyXQL.query!(conn, "INSERT INTO orders VALUES (4, NULL, 3, 4)", [], query_type: :text)
+
+      query = fn order ->
+        conn
+        |> configure()
+        |> Selecto.select(["state", {:count, "*"}])
+        |> Selecto.group_by([{:rollup, ["state"]}])
+        |> Selecto.order_by(order)
+      end
+
+      # Groups: a 1, b 2, NULL 1 (a real NULL state) and the grand total 4.
+      # PostgreSQL: explicit ASC puts NULLs last, DESC and a bare term first.
+      assert rows(query.([{"state", :asc}, {{:count, "*"}, :asc}])) ==
+               [["a", 1], ["b", 2], [nil, 1], [nil, 4]]
+
+      assert rows(query.([{"state", :desc}, {{:count, "*"}, :asc}])) ==
+               [[nil, 1], [nil, 4], ["b", 2], ["a", 1]]
+
+      assert rows(query.([{"state", :asc_nulls_first}, {{:count, "*"}, :asc}])) ==
+               [[nil, 1], [nil, 4], ["a", 1], ["b", 2]]
+
+      assert rows(query.([{"state", :desc_nulls_last}, {{:count, "*"}, :asc}])) ==
+               [["b", 2], ["a", 1], [nil, 1], [nil, 4]]
+
+      assert rows(query.(["state", {{:count, "*"}, :asc}])) ==
+               [[nil, 1], [nil, 4], ["a", 1], ["b", 2]]
+
+      page =
+        query.([{"state", :asc}, {{:count, "*"}, :asc}])
+        |> Selecto.limit(2)
+        |> Selecto.offset(1)
+
+      assert rows(page) == [["b", 2], [nil, 1]]
+    end)
+  end
+
   defp rows(query) do
     {:ok, {rows, _columns, _aliases}} = Selecto.execute(query)
     rows

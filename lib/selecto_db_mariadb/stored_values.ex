@@ -6,7 +6,8 @@ defmodule SelectoDBMariaDB.StoredValues do
   # months or days ('2024-00-10', returned as invalid Date structs) and year 0,
   # all stored while sql_mode was not strict. Such a value would crash any
   # later formatting or encoding, so a read that returns one fails as a typed
-  # out-of-range data error instead (like SQLSTATE 22003), naming no value.
+  # query error instead (SQLSTATE 22008, category datetime_field_overflow),
+  # naming no value.
 
   @doc false
   def check(rows) when is_list(rows) do
@@ -40,8 +41,8 @@ defmodule SelectoDBMariaDB.StoredValues do
        [],
        %{
          adapter: :mariadb,
-         category: :data_violation,
-         code: :value_out_of_range
+         category: :datetime_field_overflow,
+         sqlstate: "22008"
        }
      )}
   end
