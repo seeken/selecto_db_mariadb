@@ -233,6 +233,90 @@ defmodule SelectoDBMariaDB.TenantExactCompareIntegrationTest do
     end
   end
 
+  describe "host-installed predicates" do
+    # A host scope decides tenant identity even on a domain without
+    # tenant_field (org_key) and for a site pin beside an integer tenant.
+    test "required filters, host filters and trusted-context filters compare exactly" do
+      with_database(fn conn ->
+        ddl!(conn, "CREATE TABLE hs (id INT PRIMARY KEY, org_key VARCHAR(16), name VARCHAR(20))")
+
+        ddl!(
+          conn,
+          "INSERT INTO hs VALUES (1, 't1', 'a'), (2, 'T1', 'b'), (3, 't1 ', 'c'), (4, 'tı', 'd')"
+        )
+
+        ddl!(
+          conn,
+          "CREATE TABLE hs_site (id INT PRIMARY KEY, tenant_id INT NOT NULL, site VARCHAR(16), name VARCHAR(20))"
+        )
+
+        ddl!(
+          conn,
+          "INSERT INTO hs_site VALUES (1, 1, 's1', 'a'), (2, 1, 'S1', 'b'), (3, 1, 's1 ', 'c')"
+        )
+
+        relation = fn table, columns, tenant ->
+          %{
+            source_table: table,
+            primary_key: :id,
+            fields: Keyword.keys(columns),
+            redact_fields: [],
+            columns: Map.new(columns, fn {name, type} -> {name, %{type: type}} end),
+            associations: %{}
+          }
+          |> then(&if(tenant, do: Map.put(&1, :tenant_field, tenant), else: &1))
+        end
+
+        hs = %{
+          name: "HS",
+          source: relation.("hs", [id: :integer, org_key: :string, name: :string], nil),
+          schemas: %{},
+          joins: %{}
+        }
+
+        site = %{
+          name: "Site",
+          source:
+            relation.(
+              "hs_site",
+              [id: :integer, tenant_id: :integer, site: :string, name: :string],
+              :tenant_id
+            ),
+          schemas: %{},
+          joins: %{}
+        }
+
+        for {domain, column, value, bind} <- [
+              {hs, "org_key", "t1", & &1},
+              {site, "site", "s1", &Selecto.with_tenant(&1, 1)}
+            ] do
+          configure = fn domain ->
+            domain |> Selecto.configure(conn, adapter: Adapter, validate: false) |> bind.()
+          end
+
+          for {label, query} <- [
+                {"domain required_filters",
+                 configure.(Map.put(domain, :required_filters, [{column, value}]))},
+                {"require_tenant_filter",
+                 configure.(domain) |> Selecto.Tenant.require_tenant_filter(column, value)},
+                {"host filter", configure.(domain) |> Selecto.filter([{column, value}])},
+                {"trusted context",
+                 domain
+                 |> Selecto.configure(conn, adapter: Adapter, validate: false)
+                 |> Selecto.with_tenant(
+                   if(column == "site",
+                     do: %{tenant_id: 1, required_filters: [{column, value}]},
+                     else: %{required_filters: [{column, value}]}
+                   )
+                 )}
+              ] do
+            assert ids(Selecto.select(query, ["id"])) == [1], "#{column} #{label}"
+          end
+        end
+      end)
+    end
+  end
+
   describe "UUID tenant columns" do
     @uuid "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"
 
