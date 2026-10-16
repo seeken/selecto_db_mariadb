@@ -6,23 +6,66 @@ defmodule SelectoDBMariaDB.WriteCompiler do
   @spec preview(Command.t() | Batch.t(), keyword()) ::
           {:ok, Preview.t()} | {:error, Error.t()}
   def preview(%Batch{commands: commands}, opts) do
-    with {:ok, statements} <- map_commands(commands, &compile(&1, opts)) do
+    with {:ok, statements} <- map_commands(commands, &compile_tagged(&1, opts)) do
+      statements = Enum.map(statements, &preview_statement/1)
+
       {:ok, %Preview{statements: statements, metadata: %{dialect: :mariadb, atomic?: true}}}
     end
   end
 
   def preview(%Command{} = command, opts) do
-    with {:ok, statement} <- compile(command, opts) do
-      {:ok, %Preview{statements: [statement], metadata: %{dialect: :mariadb}}}
+    with {:ok, statement} <- compile_tagged(command, opts) do
+      {:ok, %Preview{statements: [preview_statement(statement)], metadata: %{dialect: :mariadb}}}
     end
   end
 
   @spec compile(Command.t(), keyword()) ::
           {:ok, %{text: String.t(), params: [term()]}} | {:error, Error.t()}
-  def compile(%Command{operation: :insert} = command, opts), do: compile_insert(command, opts)
-  def compile(%Command{operation: :upsert} = command, opts), do: compile_upsert(command, opts)
-  def compile(%Command{operation: :update} = command, opts), do: compile_update(command, opts)
-  def compile(%Command{operation: :delete} = command, opts), do: compile_delete(command, opts)
+  def compile(%Command{} = command, opts) do
+    with {:ok, statement} <- compile_tagged(command, opts) do
+      {:ok, %{statement | params: bind_params(statement.params)}}
+    end
+  end
+
+  defp compile_tagged(%Command{operation: :insert} = command, opts),
+    do: compile_insert(command, opts)
+
+  defp compile_tagged(%Command{operation: :upsert} = command, opts),
+    do: compile_upsert(command, opts)
+
+  defp compile_tagged(%Command{operation: :update} = command, opts),
+    do: compile_update(command, opts)
+
+  defp compile_tagged(%Command{operation: :delete} = command, opts),
+    do: compile_delete(command, opts)
+
+  # An exact tenant compare binds its value twice (once for the indexable
+  # collation compare, once for the byte compare). The second bind is tagged
+  # while compiling: the statement executes every bind, and a preview reports
+  # the logical parameters, each value once, with the executable binds in
+  # `bind_params`.
+  @exact_bind :"$selecto_exact_bind"
+
+  defp exact_bind(value), do: {@exact_bind, value}
+  defp exact_binds(params), do: Enum.map(params, &exact_bind/1)
+
+  @doc false
+  # The values bound to the statement's placeholders, in order.
+  def bind_params(params), do: Enum.map(params, &untag/1)
+
+  defp untag({@exact_bind, value}), do: value
+  defp untag(value), do: value
+
+  defp logical_params(params), do: Enum.reject(params, &match?({@exact_bind, _}, &1))
+
+  defp preview_statement(statement) do
+    binds = bind_params(statement.params)
+    logical = logical_params(statement.params)
+
+    if binds == logical,
+      do: %{statement | params: binds},
+      else: statement |> Map.put(:params, logical) |> Map.put(:bind_params, binds)
+  end
 
   defp compile_insert(command, opts) do
     opts = with_field_types(opts, command.metadata)
@@ -168,7 +211,7 @@ defmodule SelectoDBMariaDB.WriteCompiler do
              text:
                "(#{column} IN (#{Enum.join(texts, ", ")}) AND " <>
                  "#{utf8mb4_bytes(column)} IN (#{casts}))",
-             params: params ++ params
+             params: params ++ exact_binds(params)
            }}
         else
           {:ok, %{text: "#{column} IN (#{Enum.join(texts, ", ")})", params: params}}
@@ -197,7 +240,7 @@ defmodule SelectoDBMariaDB.WriteCompiler do
         {:ok,
          %{
            text: if(operator == :eq, do: exact, else: "NOT " <> exact),
-           params: compiled.params ++ compiled.params
+           params: compiled.params ++ exact_binds(compiled.params)
          }}
       else
         {:ok, %{text: "#{column} #{operator_text} #{compiled.text}", params: compiled.params}}
@@ -346,7 +389,7 @@ defmodule SelectoDBMariaDB.WriteCompiler do
       if exact?,
         do:
           {"(#{tenant_column} = ? AND #{utf8mb4_bytes(tenant_column)} = CAST(? AS BINARY))",
-           [tenant, tenant]},
+           [tenant, exact_bind(tenant)]},
         else: {"#{tenant_column} = ?", [tenant]}
 
     {"EXISTS (SELECT 1 FROM #{quote_relation(relation)} AS #{alias_name} " <>
