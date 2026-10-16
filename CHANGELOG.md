@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- A write preview reports its logical parameters, each value once, as
+  `params`. The exact tenant compare binds its value a second time. When that
+  happens, the statement's placeholders in order are in `bind_params`.
+  Execution always binds every placeholder.
+
+
 - Tenant and site columns compare exactly (`:exact_tenant_compare`). Reads
   are covered by Selecto. Write predicates on `metadata.tenant_fields`, the
   guarded-insert re-read and reference-guard tenants compare the column's

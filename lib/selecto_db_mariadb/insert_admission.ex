@@ -106,7 +106,7 @@ defmodule SelectoDBMariaDB.InsertAdmission do
            execute.(
              connection,
              from <> by_key <> " AND (" <> guard.text <> ")",
-             [key_value | guard.params],
+             [key_value | WriteCompiler.bind_params(guard.params)],
              opts
            ) do
       if count == 1, do: :ok, else: denied(:query_rule_violation)

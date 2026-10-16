@@ -367,7 +367,12 @@ defmodule SelectoDBMariaDB.AdapterTest do
         metadata: %{foreign_key_guards: [guard]}
       )
 
-    assert {:ok, %Preview{statements: [%{text: sql, params: [80, 80, "t1", "t1"]}]}} =
+    assert {:ok,
+            %Preview{
+              statements: [
+                %{text: sql, params: [80, 80, "t1"], bind_params: [80, 80, "t1", "t1"]}
+              ]
+            }} =
              SelectoDBMariaDB.Adapter.preview_write(:unused, insert, [])
 
     assert sql ==
@@ -395,7 +400,9 @@ defmodule SelectoDBMariaDB.AdapterTest do
       )
     end
 
-    assert {:ok, %Preview{statements: [%{text: sql, params: params}]}} =
+    # A preview reports each logical parameter once; `bind_params` are the
+    # statement's placeholders in order, with the exact compare's second bind.
+    assert {:ok, %Preview{statements: [%{text: sql, params: params, bind_params: binds}]}} =
              SelectoDBMariaDB.Adapter.preview_write(
                :unused,
                update.(%{"tenant_id" => :string}),
@@ -409,14 +416,15 @@ defmodule SelectoDBMariaDB.AdapterTest do
                "(CAST(? AS BINARY), CAST(? AS BINARY))) AND NOT (`tenant_id` = ? AND " <>
                "CAST(CONVERT(`tenant_id` USING utf8mb4) AS BINARY) = CAST(? AS BINARY)) AND `name` = ?)"
 
-    assert params == ["n", "t1", "t1", "t1", "t2", "t1", "t2", "x", "x", "a"]
+    assert params == ["n", "t1", "t1", "t2", "x", "a"]
+    assert binds == ["n", "t1", "t1", "t1", "t2", "t1", "t2", "x", "x", "a"]
 
     assert {:ok, %Preview{statements: [%{text: untyped}]}} =
              SelectoDBMariaDB.Adapter.preview_write(:unused, update.(%{}), [])
 
     assert untyped == sql
 
-    assert {:ok, %Preview{statements: [%{text: plain, params: plain_params}]}} =
+    assert {:ok, %Preview{statements: [%{text: plain, params: plain_params} = statement]}} =
              SelectoDBMariaDB.Adapter.preview_write(:unused, update.(%{tenant_id: :integer}), [])
 
     assert plain ==
@@ -424,6 +432,7 @@ defmodule SelectoDBMariaDB.AdapterTest do
                "`tenant_id` IN (?, ?) AND `tenant_id` != ? AND `name` = ?)"
 
     assert plain_params == ["n", "t1", "t1", "t2", "x", "a"]
+    refute Map.has_key?(statement, :bind_params)
   end
 
   test "refuses upserts under any write scope because ON DUPLICATE KEY ignores the target" do
