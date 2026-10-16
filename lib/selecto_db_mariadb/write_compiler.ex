@@ -113,6 +113,8 @@ defmodule SelectoDBMariaDB.WriteCompiler do
     do: {:error, Error.new(:missing_predicate, "delete requires a portable predicate")}
 
   defp compile_delete(command, opts) do
+    opts = with_field_types(opts, command.metadata)
+
     with {:ok, predicate} <- compile_predicate(command.predicate, opts, 0),
          {:ok, returning} <- compile_returning(command.returning) do
       {:ok,
@@ -155,11 +157,22 @@ defmodule SelectoDBMariaDB.WriteCompiler do
     end)
     |> case do
       {:ok, texts, params, _next} ->
-        {:ok,
-         %{
-           text: "#{quote_field(field, opts)} IN (#{texts |> Enum.reverse() |> Enum.join(", ")})",
-           params: params
-         }}
+        texts = Enum.reverse(texts)
+        column = quote_field(field, opts)
+
+        if exact_field?(field, opts) do
+          casts = Enum.map_join(texts, ", ", &utf8mb4_bytes/1)
+
+          {:ok,
+           %{
+             text:
+               "(#{column} IN (#{Enum.join(texts, ", ")}) AND " <>
+                 "#{utf8mb4_bytes(column)} IN (#{casts}))",
+             params: params ++ params
+           }}
+        else
+          {:ok, %{text: "#{column} IN (#{Enum.join(texts, ", ")})", params: params}}
+        end
 
       error ->
         error
@@ -170,12 +183,25 @@ defmodule SelectoDBMariaDB.WriteCompiler do
       when operator in [:eq, :neq, :gt, :gte, :lt, :lte] do
     with {:ok, compiled} <- compile_value(value, opts, offset) do
       operator_text = %{eq: "=", neq: "!=", gt: ">", gte: ">=", lt: "<", lte: "<="}[operator]
+      column = quote_field(field, opts)
 
-      {:ok,
-       %{
-         text: "#{quote_field(field, opts)} #{operator_text} #{compiled.text}",
-         params: compiled.params
-       }}
+      exact? =
+        operator in [:eq, :neq] and
+          (exact_field?(field, opts) or exact_value_field?(value, opts))
+
+      if exact? do
+        exact =
+          "(#{column} = #{compiled.text} AND " <>
+            "#{utf8mb4_bytes(column)} = #{utf8mb4_bytes(compiled.text)})"
+
+        {:ok,
+         %{
+           text: if(operator == :eq, do: exact, else: "NOT " <> exact),
+           params: compiled.params ++ compiled.params
+         }}
+      else
+        {:ok, %{text: "#{column} #{operator_text} #{compiled.text}", params: compiled.params}}
+      end
     end
   end
 
@@ -295,7 +321,9 @@ defmodule SelectoDBMariaDB.WriteCompiler do
         {:ok, nil}
 
       {{:ok, tenant_field}, tenant_value} when not is_nil(tenant_value) ->
-        if valid_ref?(tenant_field), do: {:ok, {tenant_field, tenant_value}}, else: :error
+        if valid_ref?(tenant_field),
+          do: {:ok, {tenant_field, tenant_value, Map.get(guard, :tenant_exact, true) != false}},
+          else: :error
 
       _invalid ->
         :error
@@ -307,12 +335,23 @@ defmodule SelectoDBMariaDB.WriteCompiler do
        "#{quote_identifier(target_field)} = ?)", [value]}
   end
 
-  defp foreign_key_guard_text(relation, target_field, value, {tenant_field, tenant}) do
+  # The parent's tenant column compares by its stored bytes unless the domain
+  # types it as a non-text value (`tenant_exact: false`), so a tenant 't1'
+  # guard never admits a parent of 'T1' or 't1 '.
+  defp foreign_key_guard_text(relation, target_field, value, {tenant_field, tenant, exact?}) do
     alias_name = quote_identifier("selecto_fk_parent")
+    tenant_column = "#{alias_name}.#{quote_identifier(tenant_field)}"
+
+    {tenant_text, tenant_params} =
+      if exact?,
+        do:
+          {"(#{tenant_column} = ? AND #{utf8mb4_bytes(tenant_column)} = CAST(? AS BINARY))",
+           [tenant, tenant]},
+        else: {"#{tenant_column} = ?", [tenant]}
 
     {"EXISTS (SELECT 1 FROM #{quote_relation(relation)} AS #{alias_name} " <>
        "WHERE #{alias_name}.#{quote_identifier(target_field)} = ? " <>
-       "AND #{alias_name}.#{quote_identifier(tenant_field)} = ?)", [value, tenant]}
+       "AND #{tenant_text})", [value | tenant_params]}
   end
 
   defp compile_predicate_list([], _separator, _opts, _offset),
@@ -478,7 +517,50 @@ defmodule SelectoDBMariaDB.WriteCompiler do
   defp assignment_parameter_count(assignments),
     do: assignments |> Enum.flat_map(& &1.params) |> length()
 
+  # Tenant and site columns (`metadata.tenant_fields`) compare by their stored
+  # bytes, never under the column's collation: under MariaDB's default
+  # case-insensitive collations (and PAD SPACE ones) tenant 't1' would
+  # otherwise update or delete rows of 'T1' and 't1 '. A column the domain
+  # types as a non-text value (integer, decimal, UUID) keeps the plain form.
+  defp with_field_types(opts, metadata) when is_map(metadata) do
+    types = Map.get(metadata, :field_types, %{})
+
+    exact =
+      metadata
+      |> Map.get(:tenant_fields, [])
+      |> List.wrap()
+      |> Enum.map(&to_string/1)
+      |> Enum.filter(&Selecto.Builder.ExactCompare.text_type?(field_type(types, &1)))
+
+    Keyword.put(opts, :exact_fields, exact)
+  end
+
   defp with_field_types(opts, _metadata), do: opts
+
+  @doc false
+  # The predicate options a compiled command uses, for re-reads of its row.
+  def predicate_opts(%Command{metadata: metadata}, opts), do: with_field_types(opts, metadata)
+
+  defp field_type(types, field) when is_map(types) do
+    Enum.find_value(types, fn {key, type} -> if to_string(key) == field, do: type end)
+  end
+
+  defp field_type(_types, _field), do: nil
+
+  defp exact_field?(field, opts),
+    do: to_string(field_name(field)) in Keyword.get(opts, :exact_fields, [])
+
+  # The utf8mb4 bytes of a bound value (`?`, already utf8mb4) or of a column,
+  # converted first: CAST(col AS BINARY) alone would compare a utf16, ucs2,
+  # utf32 or latin1 column's own charset bytes and never match.
+  defp utf8mb4_bytes("?"), do: "CAST(? AS BINARY)"
+  defp utf8mb4_bytes(column), do: "CAST(CONVERT(#{column} USING utf8mb4) AS BINARY)"
+
+  defp exact_value_field?({:field, field}, opts), do: exact_field?(field, opts)
+  defp exact_value_field?(_value, _opts), do: false
+
+  defp field_name({:field, field}), do: field
+  defp field_name(field), do: field
   defp cast_assignment(text, _field, _opts), do: text
 
   defp parameter(value, _offset), do: {:ok, %{text: "?", params: [value]}}

@@ -49,6 +49,23 @@ any statement runs, leaving every row unchanged. `execute_write_unsafe/3` skips
 that check; it exists for trusted tooling and this package's own tests, never
 for application code.
 
+## Session and tenant semantics
+
+- Each read, stream and write first checks its connection's session. The
+  time zone must be UTC (`UTC`, `+00:00`, `Etc/UTC`, or `SYSTEM` on a UTC
+  server; never `GMT`). The client, connection and results character sets
+  must be utf8mb4, and sql_mode must include `STRICT_TRANS_TABLES` or
+  `STRICT_ALL_TABLES`. If any check fails, the call is refused before any
+  statement runs. Set these with MyXQL's `after_connect` if the server
+  defaults differ.
+- Tenant and site columns compare by their utf8mb4 bytes, whatever their
+  collation or character set, so tenant `'t1'` never reaches `'T1'` or
+  `'t1 '`. You do not need a `_bin` collation.
+- Strict-mode value errors are `:data_violation`. Deadlocks and lock wait
+  timeouts are `:deadlock_detected` and `:lock_timeout`, and the caller may
+  retry them. Zero or out-of-range stored dates fail the read with
+  `:value_out_of_range`.
+
 ## Local Workspace Development
 
 For local multi-repo development against vendored ecosystem packages, set:

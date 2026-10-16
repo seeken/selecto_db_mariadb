@@ -13,7 +13,7 @@ defmodule SelectoDBMariaDB.Adapter do
   @behaviour Selecto.DB.WriteAdapter
 
   alias Selecto.Write.{Batch, Command, Error, Graph, Result}
-  alias SelectoDBMariaDB.{InsertAdmission, WriteCompiler}
+  alias SelectoDBMariaDB.{InsertAdmission, Session, StoredValues, WriteCompiler}
 
   @missing_dependency {:adapter_dependency_missing, :myxql}
 
@@ -175,16 +175,33 @@ defmodule SelectoDBMariaDB.Adapter do
     :exit, reason -> {:error, reason}
   end
 
+  # Each call first verifies the session (SelectoDBMariaDB.Session) on the
+  # connection that then runs the statement.
   defp execute_direct(connection, query, params, opts) do
     if dependency_available?() do
       with :ok <- require_binary_protocol(opts) do
-        case MyXQL.query(connection, normalize_query(query), params, opts) do
-          {:ok, result} -> {:ok, normalize_result(result)}
-          {:error, reason} -> {:error, sanitize_error(reason)}
-        end
+        Session.run(connection, &execute_unchecked(&1, query, params, opts), opts)
       end
     else
       {:error, @missing_dependency}
+    end
+  rescue
+    error in DBConnection.ConnectionError -> {:error, sanitize_error(error)}
+  end
+
+  @doc false
+  # A statement on a connection whose session this call already verified.
+  def execute_unchecked(connection, query, params, opts) do
+    with :ok <- require_binary_protocol(opts) do
+      case MyXQL.query(resolve_connection(connection), normalize_query(query), params, opts) do
+        {:ok, result} ->
+          # A stored value outside the supported range is a typed error
+          # (SelectoDBMariaDB.StoredValues).
+          with :ok <- StoredValues.check(result.rows), do: {:ok, normalize_result(result)}
+
+        {:error, reason} ->
+          {:error, sanitize_error(reason)}
+      end
     end
   end
 
@@ -210,6 +227,14 @@ defmodule SelectoDBMariaDB.Adapter do
   @foreign_key_violation_codes [1216, 1217, 1451, 1452]
   @not_null_violation_codes [1048, 1364]
   @check_violation_codes [3819, 4025]
+  # Strict-mode value errors: out of range (1264, 1690), truncated (1265,
+  # 1406), incorrect value (1292, 1366, 1367). The value does not fit its
+  # column; nothing about the value leaves the adapter.
+  @data_violation_codes [1264, 1265, 1292, 1366, 1367, 1406, 1690]
+  # The server rolled the whole transaction back (1213) or gave up waiting for
+  # a lock (1205); the caller may retry.
+  @deadlock_codes [1213]
+  @lock_timeout_codes [1205]
 
   # Driver errors carry the server's message (which can quote row values) and
   # the statement text. Only a stable category and the numeric server code
@@ -243,6 +268,9 @@ defmodule SelectoDBMariaDB.Adapter do
   defp error_category(code) when code in @foreign_key_violation_codes, do: :foreign_key_violation
   defp error_category(code) when code in @not_null_violation_codes, do: :not_null_violation
   defp error_category(code) when code in @check_violation_codes, do: :check_violation
+  defp error_category(code) when code in @data_violation_codes, do: :data_violation
+  defp error_category(code) when code in @deadlock_codes, do: :deadlock_detected
+  defp error_category(code) when code in @lock_timeout_codes, do: :lock_timeout
   defp error_category(_code), do: :database_error
 
   @impl true
@@ -282,6 +310,12 @@ defmodule SelectoDBMariaDB.Adapter do
         :json_agg_limit,
         :json_table_rowset,
         :postgresql_null_order,
+        # Tenant and site columns compare by their stored bytes, never under
+        # the column's collation (Selecto.Builder.ExactCompare).
+        :exact_tenant_compare,
+        # WITH ROLLUP returns no grand total on empty input; Selecto adds it
+        # (Selecto.Builder.Sql.RollupTotal) as PostgreSQL returns it.
+        :rollup_without_empty_total,
         :text_search,
         :fulltext_search,
         :cte,
@@ -350,19 +384,23 @@ defmodule SelectoDBMariaDB.Adapter do
   @impl Selecto.DB.WriteAdapter
   def execute_write_unsafe(connection, %Command{} = command, opts) do
     with :ok <- Command.validate(command) do
-      with_write_transaction(connection, fn tx -> execute_write_command(tx, command, opts) end)
+      with_write_transaction(connection, fn tx ->
+        with :ok <- verify_write_session(tx), do: execute_write_command(tx, command, opts)
+      end)
     end
   end
 
   def execute_write_unsafe(connection, %Batch{} = batch, opts) do
     with :ok <- Batch.validate(batch) do
       with_write_transaction(connection, fn tx ->
-        Enum.reduce_while(batch.commands, {:ok, []}, fn command, {:ok, results} ->
-          case execute_write_command(tx, command, opts) do
-            {:ok, result} -> {:cont, {:ok, results ++ [result]}}
-            {:error, _} = error -> {:halt, error}
-          end
-        end)
+        with :ok <- verify_write_session(tx) do
+          Enum.reduce_while(batch.commands, {:ok, []}, fn command, {:ok, results} ->
+            case execute_write_command(tx, command, opts) do
+              {:ok, result} -> {:cont, {:ok, results ++ [result]}}
+              {:error, _} = error -> {:halt, error}
+            end
+          end)
+        end
       end)
     end
   end
@@ -370,16 +408,45 @@ defmodule SelectoDBMariaDB.Adapter do
   def execute_write_unsafe(_connection, %Graph{} = graph, _opts), do: unsupported_graph(graph)
   def execute_write_unsafe(_connection, write, _opts), do: invalid_write_input(write)
 
+  # The write's own transaction connection carries the session check
+  # (SelectoDBMariaDB.Session) before any statement of the write runs.
+  defp verify_write_session(tx) do
+    case Session.verify(tx) do
+      :ok ->
+        :ok
+
+      {:error, %Selecto.Error{details: %{category: :invalid_session, setting: setting}}} ->
+        {:error,
+         Error.new(:invalid_connection, "MariaDB session settings are not safe for Selecto",
+           details: %{adapter: :mariadb, code: :invalid_session, setting: setting}
+         )}
+
+      {:error, %Selecto.Error{details: %{category: category}}} ->
+        execution_failed(category)
+
+      {:error, reason} ->
+        {:error, write_error(:execution_failed, reason)}
+    end
+  end
+
   defp execute_write_command(connection, command, opts) do
-    with :ok <- InsertAdmission.before_insert(connection, command, &execute/4, opts),
+    with :ok <-
+           InsertAdmission.before_insert(connection, command, &execute_unchecked/4, opts),
          {:ok, statement} <- WriteCompiler.compile(command, opts),
          {:ok, query_result} <-
            InsertAdmission.storage_error(
              command,
-             execute(connection, statement.text, statement.params, opts)
+             execute_unchecked(connection, statement.text, statement.params, opts)
            ),
          {:ok, affected_rows} <- enforce_cardinality(command, query_result),
-         :ok <- InsertAdmission.after_insert(connection, command, query_result, &execute/4, opts) do
+         :ok <-
+           InsertAdmission.after_insert(
+             connection,
+             command,
+             query_result,
+             &execute_unchecked/4,
+             opts
+           ) do
       {:ok,
        %Result{
          operation: command.operation,
