@@ -91,7 +91,10 @@ defmodule SelectoDBMariaDB.AdapterTest do
     assert {:ok, %Preview{statements: [%{text: upsert_sql, params: [7, "updated"]}]}} =
              SelectoDBMariaDB.Adapter.preview_write(:unused, upsert, [])
 
-    assert upsert_sql =~ "ON DUPLICATE KEY UPDATE `name` = VALUES(`name`)"
+    # The preview is the upsert's INSERT branch: ON DUPLICATE KEY UPDATE would
+    # fire on any unique key, so the adapter emulates the target instead.
+    assert upsert_sql == "INSERT INTO `items` (`id`, `name`) VALUES (?, ?)"
+    refute upsert_sql =~ "DUPLICATE"
 
     ambiguous = put_in(upsert.metadata.declared_conflict_targets, [[:id], [:external_id]])
 

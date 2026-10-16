@@ -33,9 +33,9 @@ selecto =
 - Identifier quoting uses backticks.
 - Streaming is not currently supported.
 - Portable flat writes and atomic batches are supported, including governed
-  predicates, reference guards, and `ON DUPLICATE KEY UPDATE`. Upsert requires
-  exactly one domain-declared conflict target because MariaDB cannot name a
-  particular unique constraint in that statement.
+  predicates, reference guards and upserts. An upsert needs exactly one
+  domain-declared conflict target, and that target must be one whole-column
+  unique index of an InnoDB table. It never uses `ON DUPLICATE KEY UPDATE`.
 - Arbitrary DML returning and generated-key graphs are not advertised by this
   release; requests requiring them fail before adapter dispatch.
 
@@ -63,8 +63,17 @@ for application code.
   `'t1 '`. You do not need a `_bin` collation.
 - Strict-mode value errors are `:data_violation`. Deadlocks and lock wait
   timeouts are `:deadlock_detected` and `:lock_timeout`, and the caller may
-  retry them. Zero or out-of-range stored dates fail the read with
-  `:value_out_of_range`.
+  retry them. Zero or out-of-range stored dates fail the read as a query
+  error with SQLSTATE `22008` (category `:datetime_field_overflow`).
+
+## Write previews
+
+A write preview's `params` are the logical parameters: each value once, as
+the command states it. An exact tenant/site compare binds its value a second
+time. When it does, `bind_params` holds the statement's placeholder binds in
+order. Run the preview's text with `bind_params` when it is present. An
+upsert preview shows only the INSERT branch. The adapter probes, locks and
+updates by the declared target around it (see the changelog).
 
 ## Local Workspace Development
 

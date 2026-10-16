@@ -109,15 +109,106 @@ defmodule SelectoDBMariaDB.WriteCompiler do
           do: "SELECT #{Enum.join(values, ", ")} WHERE #{guards.text}",
           else: "VALUES (#{Enum.join(values, ", ")})"
 
+      # No ON DUPLICATE KEY UPDATE: it fires on the primary key and every
+      # unique index, not only the declared target, so it can update another
+      # row. The compiled upsert is its INSERT branch; upsert_plan/2 adds the
+      # target probe and update that the adapter runs around it.
+      _ = update_assignments
+
       {:ok,
        %{
          text:
            "INSERT INTO #{quote_relation(command.relation)} (#{Enum.join(columns, ", ")}) " <>
-             values_clause <>
-             " ON DUPLICATE KEY UPDATE #{compile_conflict_action(update_assignments, command.metadata)}" <>
-             returning,
+             values_clause <> returning,
          params: params ++ guards.params
        }}
+    end
+  end
+
+  @doc false
+  # The statements of an emulated upsert (SelectoDBMariaDB.Upsert): the
+  # INSERT branch, the predicate selecting the declared target's row (tenant
+  # and site columns exact), and the UPDATE of the domain's update fields by
+  # that predicate (nil when there are none). Params are placeholder binds.
+  def upsert_plan(%Command{operation: :upsert} = command, opts) do
+    opts = with_field_types(opts, command.metadata)
+
+    with {:ok, insert} <- compile_upsert(command, opts),
+         {:ok, target} <- conflict_values(command),
+         predicate = target_predicate(target),
+         {:ok, where} <- compile_predicate(predicate, opts, 0),
+         {:ok, update} <- upsert_update(command, predicate, opts) do
+      {:ok,
+       %{
+         target: Enum.map(target, &elem(&1, 0)),
+         null_target?: Enum.any?(target, fn {_field, value} -> is_nil(value) end),
+         insert: %{insert | params: bind_params(insert.params)},
+         where: %{where | params: bind_params(where.params)},
+         update: update
+       }}
+    end
+  end
+
+  defp conflict_values(%Command{assignments: assignments, metadata: metadata}) do
+    metadata
+    |> Map.fetch!(:conflict_target)
+    |> Enum.reduce_while({:ok, []}, fn field, {:ok, values} ->
+      case Enum.find(assignments, &(to_string(field_name(&1.field)) == to_string(field))) do
+        %{value: {:literal, value}} when not is_tuple(value) ->
+          {:cont, {:ok, values ++ [{to_string(field), value}]}}
+
+        %{value: value} when not is_tuple(value) ->
+          {:cont, {:ok, values ++ [{to_string(field), value}]}}
+
+        _ ->
+          {:halt,
+           {:error,
+            Error.new(
+              :write_capability_missing,
+              "upsert conflict target values must be assigned literals",
+              details: %{code: :unsupported_upsert_conflict_target, field: to_string(field)}
+            )}}
+      end
+    end)
+  end
+
+  defp target_predicate([{field, value}]), do: {:eq, {:field, field}, {:literal, value}}
+
+  defp target_predicate(target),
+    do:
+      {:and, Enum.map(target, fn {field, value} -> {:eq, {:field, field}, {:literal, value}} end)}
+
+  defp upsert_update(%Command{metadata: metadata} = command, predicate, opts) do
+    fields = metadata |> Map.get(:upsert_update_fields, []) |> Enum.map(&to_string/1)
+
+    case Enum.filter(command.assignments, &(to_string(field_name(&1.field)) in fields)) do
+      [] ->
+        {:ok, nil}
+
+      assignments ->
+        assigned = MapSet.new(assignments, &to_string(field_name(&1.field)))
+
+        guards =
+          metadata
+          |> Map.get(:foreign_key_guards, [])
+          |> Enum.filter(&MapSet.member?(assigned, to_string(Map.get(&1, :field))))
+
+        update_metadata =
+          metadata
+          |> Map.drop([:conflict_target, :declared_conflict_targets, :upsert_update_fields])
+          |> Map.put(:foreign_key_guards, guards)
+
+        update = %{
+          command
+          | operation: :update,
+            assignments: assignments,
+            predicate: predicate,
+            metadata: update_metadata
+        }
+
+        with {:ok, statement} <- compile_update(update, opts) do
+          {:ok, %{statement | params: bind_params(statement.params)}}
+        end
     end
   end
 
@@ -538,14 +629,6 @@ defmodule SelectoDBMariaDB.WriteCompiler do
        Error.new(:invalid_command, "invalid domain-governed upsert update field list",
          details: %{fields: fields, reason: reason}
        )}
-
-  defp compile_conflict_action([], metadata) do
-    field = metadata |> Map.fetch!(:conflict_target) |> hd() |> quote_identifier()
-    "#{field} = #{field}"
-  end
-
-  defp compile_conflict_action(assignments, _metadata),
-    do: Enum.map_join(assignments, ", ", &"#{&1.column} = VALUES(#{&1.column})")
 
   defp require_assignments([], operation),
     do: {:error, Error.new(:invalid_command, "#{operation} requires at least one assignment")}
