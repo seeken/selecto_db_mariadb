@@ -13,7 +13,7 @@ defmodule SelectoDBMariaDB.Adapter do
   @behaviour Selecto.DB.WriteAdapter
 
   alias Selecto.Write.{Batch, Command, Error, Graph, Result}
-  alias SelectoDBMariaDB.{InsertAdmission, Session, StoredValues, WriteCompiler}
+  alias SelectoDBMariaDB.{InsertAdmission, Session, StoredValues, Upsert, WriteCompiler}
 
   @missing_dependency {:adapter_dependency_missing, :myxql}
 
@@ -429,6 +429,34 @@ defmodule SelectoDBMariaDB.Adapter do
     end
   end
 
+  # Upserts run the target-exact emulation (SelectoDBMariaDB.Upsert), never
+  # ON DUPLICATE KEY UPDATE.
+  defp execute_write_command(connection, %Command{operation: :upsert} = command, opts) do
+    with {:ok, plan} <- WriteCompiler.upsert_plan(command, opts),
+         {:ok, affected} <-
+           Upsert.execute(
+             connection,
+             command,
+             plan,
+             &execute_unchecked/4,
+             &control_statement/2,
+             opts
+           ),
+         {:ok, affected} <- check_cardinality(affected, command.expected_cardinality) do
+      {:ok,
+       %Result{
+         operation: :upsert,
+         affected_rows: affected,
+         rows: [],
+         metadata: %{dialect: :mariadb}
+       }}
+    else
+      {:error, %Error{} = error} -> {:error, error}
+      {:error, %Selecto.Error{details: %{category: category}}} -> execution_failed(category)
+      {:error, reason} -> {:error, write_error(:execution_failed, reason)}
+    end
+  end
+
   defp execute_write_command(connection, command, opts) do
     with :ok <-
            InsertAdmission.before_insert(connection, command, &execute_unchecked/4, opts),
@@ -463,13 +491,12 @@ defmodule SelectoDBMariaDB.Adapter do
 
   defp execution_failed(category), do: {:error, write_error(:execution_failed, category)}
 
-  defp enforce_cardinality(%Command{operation: :upsert, expected_cardinality: expected}, result) do
-    # CLIENT_FOUND_ROWS makes a matched no-op report 1. A zero therefore means
-    # the guarded INSERT SELECT produced no row and must remain a cardinality
-    # failure rather than being normalized into false success.
-    physical = Map.get(result, :num_rows, 0)
-    logical = logical_affected_rows(:upsert, physical)
-    check_cardinality(logical, expected)
+  # Savepoint statements of a write (text protocol; fixed statement text).
+  defp control_statement(connection, sql) do
+    case MyXQL.query(connection, sql, [], query_type: :text) do
+      {:ok, _result} -> :ok
+      {:error, reason} -> {:error, sanitize_error(reason)}
+    end
   end
 
   defp enforce_cardinality(%Command{expected_cardinality: expected}, result),

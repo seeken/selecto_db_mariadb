@@ -2,8 +2,22 @@
 
 ## Unreleased
 
+- Upserts no longer use `ON DUPLICATE KEY UPDATE`. It fires on the primary
+  key and every unique index, so an upsert whose assigned id belonged to
+  another row overwrote that row. The declared conflict target must now be
+  exactly one whole-column unique index of an InnoDB table, or the upsert is
+  refused (`:write_capability_missing`, code
+  `:unsupported_upsert_conflict_target`). In the write's transaction the
+  adapter probes the target. If the row exists, it is locked with FOR UPDATE
+  and updated by the target. If not, the row is inserted inside a savepoint.
+  On a duplicate, the savepoint is rolled back and the target's row is locked
+  and updated. If no such row exists, the typed unique violation stands
+  (`SelectoDBMariaDB.Upsert`). A failed savepoint rollback never replaces the original error, a
+  deadlock included. Tenant and site columns of the target compare exactly.
+  The upsert preview shows the INSERT branch.
+
 - A write preview reports its logical parameters, each value once, as
-  `params`. The exact tenant compare binds its value a second time. When that
+  `params` (see the README's "Write previews"). The exact tenant compare binds its value a second time. When that
   happens, the statement's placeholders in order are in `bind_params`.
   Execution always binds every placeholder.
 
@@ -26,8 +40,9 @@
   `:lock_timeout`. All were `:database_error` before. A deadlock victim keeps
   its category inside a host transaction.
 - A read or stream that returns a zero date, a zero month or day, or year 0
-  (storable outside strict mode) fails with category `:data_violation` and
-  code `:value_out_of_range`, instead of handing back an invalid date.
+  (storable outside strict mode) fails as a query error with SQLSTATE
+  `22008` and category `:datetime_field_overflow`, instead of handing back an
+  invalid date.
 - An empty input to a rollup returns PostgreSQL's grand-total row
   (`:rollup_without_empty_total`).
 
