@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Live test: a host predicate on a computed value's CASE conditions (eq, IN,
+  nested computed predicate) and on a joined schema's computed predicate
+  compares exactly.
+
 - Live test: a required filter on a computed predicate compares its body
   exactly, and association `where` policies confine joins, collections,
   through bridges and retargets exactly ('S1' and 's1 ' never match a

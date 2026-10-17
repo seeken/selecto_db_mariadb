@@ -121,6 +121,113 @@ defmodule SelectoDBMariaDB.ComputedPolicyExactIntegrationTest do
     end)
   end
 
+  test "a host predicate on a computed value or a joined computed predicate compares exactly" do
+    with_database(fn conn ->
+      ddl!(
+        conn,
+        "CREATE TABLE cb_root (id INT PRIMARY KEY, org_key VARCHAR(16), acc_id INT, name VARCHAR(10))"
+      )
+
+      ddl!(conn, "CREATE TABLE cb_acc (id INT PRIMARY KEY, site VARCHAR(16), label VARCHAR(20))")
+
+      ddl!(
+        conn,
+        "INSERT INTO cb_root VALUES (1,'t1',1,'a'),(2,'T1',2,'b'),(3,'t1 ',3,'c'),(4,'zz',1,'d')"
+      )
+
+      ddl!(
+        conn,
+        "INSERT INTO cb_acc VALUES (1,'s1','mine'),(2,'S1','SECRET-S1'),(3,'s1 ','SECRET-pad')"
+      )
+
+      for field <- ["flag", "flag_in", "flag_nested"] do
+        query =
+          cb_domain([{field, "y"}])
+          |> Selecto.configure(conn, adapter: Adapter, validate: false)
+          |> Selecto.select(["id"])
+
+        assert ids(query) == [1], field
+      end
+
+      joined =
+        cb_domain([{"a.is_s1", true}])
+        |> Selecto.configure(conn, adapter: Adapter, validate: false)
+        |> Selecto.select(["id", "a.label"])
+
+      assert rows(joined) == [[1, "mine"], [4, "mine"]]
+    end)
+  end
+
+  defp cb_domain(required) do
+    case_of = fn condition ->
+      ["case", [condition, ["literal", "y"]], ["else", ["literal", "n"]]]
+    end
+
+    %{
+      name: "CB",
+      source: %{
+        source_table: "cb_root",
+        primary_key: :id,
+        fields: [:id, :org_key, :acc_id, :name, :is_t1, :flag, :flag_in, :flag_nested],
+        redact_fields: [],
+        columns: %{
+          id: %{type: :integer},
+          org_key: %{type: :string},
+          acc_id: %{type: :integer},
+          name: %{type: :string},
+          is_t1: %{
+            type: :boolean,
+            computed: %{kind: :predicate, expression: ["eq", "org_key", "t1"]}
+          },
+          flag: %{
+            type: :string,
+            computed: %{kind: :expression, expression: case_of.(["eq", "org_key", "t1"])}
+          },
+          flag_in: %{
+            type: :string,
+            computed: %{kind: :expression, expression: case_of.(["in", "org_key", ["t1", "q"]])}
+          },
+          flag_nested: %{
+            type: :string,
+            computed: %{
+              kind: :expression,
+              expression: ["coalesce", case_of.(["eq", "is_t1", true]), ["literal", "n"]]
+            }
+          }
+        },
+        associations: %{
+          a: %{
+            queryable: :acc,
+            field: :a,
+            owner_key: :acc_id,
+            related_key: :id,
+            cardinality: :one
+          }
+        }
+      },
+      schemas: %{
+        acc: %{
+          source_table: "cb_acc",
+          primary_key: :id,
+          fields: [:id, :site, :label, :is_s1],
+          redact_fields: [],
+          columns: %{
+            id: %{type: :integer},
+            site: %{type: :string},
+            label: %{type: :string},
+            is_s1: %{
+              type: :boolean,
+              computed: %{kind: :predicate, expression: ["eq", "site", "s1"]}
+            }
+          },
+          associations: %{}
+        }
+      },
+      joins: %{a: %{type: :left, name: "a"}},
+      required_filters: required
+    }
+  end
+
   defp wp_domain(site_type) do
     %{
       name: "WP",
