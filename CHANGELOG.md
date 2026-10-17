@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Live test: a required filter on a computed predicate compares its body
+  exactly, and association `where` policies confine joins, collections,
+  through bridges and retargets exactly ('S1' and 's1 ' never match a
+  's1' pin; a retarget onto a where-confined association returns only the
+  policy's rows), with text and unrecognised policy column types.
+
 - Live test: DECIMAL and DATETIME(3) columns declared with custom type
   names that contain "char" or "text" (`charge_amount`, `context_ts`) stay
   guarded in reads and writes. `char varying` and `national varchar` stay
