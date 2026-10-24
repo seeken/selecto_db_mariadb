@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- A write on a connection inside the caller's transaction runs under its own
+  savepoint: a refusal after its DML (a post-image violation) rolls that DML
+  back even when the caller ignores the error and commits, and the caller's
+  transaction stays usable (w3exrev16 item 18).
+
 - Guarded inserts, updates and upserts take a shared metadata lock on the
   table (`SELECT 1 FROM t LIMIT 0` in the write's transaction) before any
   engine or trigger catalog read, so a concurrent CREATE TRIGGER waits for
