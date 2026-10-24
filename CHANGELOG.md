@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- TW-09 post-image: a guarded UPDATE locks its rows' keys (FOR UPDATE) and
+  re-reads them after the statement under the scope (host-exact); a row that
+  left it rolls the write back with `query_rule_violation`. The key must be
+  the table's whole single-column primary key and the table InnoDB (views
+  and non-unique keys are refused). A guarded INSERT no longer refuses
+  tables with INSERT triggers: the stored-row re-read decides, and a row a
+  trigger rewrote outside the guard is `query_rule_not_evaluable`
+  (typed_insert_admission TA005). Every column the scope compares is
+  compared by its stored bytes in these re-reads. Live tests.
+
 - `column_catalog/2`: information_schema `COLUMN_TYPE` with ` collate
   <COLLATION_NAME>`, the verified metadata for SelectoUpdato's in-process
   candidate check (query_enforced_scalar v2). Live test.

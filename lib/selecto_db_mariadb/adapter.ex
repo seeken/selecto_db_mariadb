@@ -493,6 +493,8 @@ defmodule SelectoDBMariaDB.Adapter do
   defp execute_write_command(connection, command, opts) do
     with :ok <-
            InsertAdmission.before_insert(connection, command, &execute_unchecked/4, opts),
+         {:ok, locked} <-
+           InsertAdmission.before_update(connection, command, &execute_unchecked/4, opts),
          {:ok, statement} <- WriteCompiler.compile(command, opts),
          {:ok, query_result} <-
            InsertAdmission.storage_error(
@@ -507,7 +509,9 @@ defmodule SelectoDBMariaDB.Adapter do
              query_result,
              &execute_unchecked/4,
              opts
-           ) do
+           ),
+         :ok <-
+           InsertAdmission.after_update(connection, command, locked, &execute_unchecked/4, opts) do
       {:ok,
        %Result{
          operation: command.operation,
