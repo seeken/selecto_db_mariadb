@@ -37,8 +37,17 @@ defmodule SelectoDBMariaDB.InsertAdmissionTest do
 
   defp code({:error, %{details: %{code: code}}}), do: code
 
+  defp flush_sql do
+    receive do
+      {:sql, _, _} -> flush_sql()
+    after
+      0 -> :ok
+    end
+  end
+
   @strict {"sql_mode", {:ok, %{rows: [["STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION"]]}}}
   @innodb {"ENGINE", {:ok, %{rows: [["InnoDB"]]}}}
+  @mdl {"LIMIT 0", {:ok, %{rows: []}}}
 
   defp key(type, extra), do: {"COLUMN_KEY", {:ok, %{rows: [["id", type, extra]]}}}
 
@@ -46,19 +55,25 @@ defmodule SelectoDBMariaDB.InsertAdmissionTest do
     command = command([assigned(:id, 1), assigned(:subject, "10.5")])
     refused = :query_rule_not_evaluable
 
-    loose = executor([{"sql_mode", {:ok, %{rows: [["NO_ENGINE_SUBSTITUTION"]]}}}])
+    # Without the table's metadata lock nothing is evaluable.
+    assert code(InsertAdmission.before_insert(:conn, command, executor([]), [])) == refused
+
+    loose = executor([@mdl, {"sql_mode", {:ok, %{rows: [["NO_ENGINE_SUBSTITUTION"]]}}}])
     assert code(InsertAdmission.before_insert(:conn, command, loose, [])) == refused
 
-    myisam = executor([@strict, {"ENGINE", {:ok, %{rows: [["MyISAM"]]}}}])
+    myisam = executor([@mdl, @strict, {"ENGINE", {:ok, %{rows: [["MyISAM"]]}}}])
     assert code(InsertAdmission.before_insert(:conn, command, myisam, [])) == refused
 
     # A BEFORE INSERT trigger can rewrite the row and its key: refused.
-    triggered = executor([@strict, @innodb, {"TRIGGERS", {:ok, %{rows: [[1]]}}}])
+    triggered = executor([@mdl, @strict, @innodb, {"TRIGGERS", {:ok, %{rows: [[1]]}}}])
+    flush_sql()
     assert code(InsertAdmission.before_insert(:conn, command, triggered, [])) == refused
+    # The metadata lock comes before every catalog read.
+    assert {:sql, "SELECT 1 FROM `items` LIMIT 0", []} = receive(do: (message -> message))
     assert_received {:sql, "SELECT COUNT(*) FROM information_schema.TRIGGERS" <> sql, _}
     assert sql =~ "ACTION_TIMING = 'BEFORE'"
 
-    clean = executor([@strict, @innodb, {"TRIGGERS", {:ok, %{rows: [[0]]}}}])
+    clean = executor([@mdl, @strict, @innodb, {"TRIGGERS", {:ok, %{rows: [[0]]}}}])
     assert :ok = InsertAdmission.before_insert(:conn, command, clean, [])
   end
 
