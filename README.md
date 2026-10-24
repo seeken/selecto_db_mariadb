@@ -59,10 +59,11 @@ rolls the write back (`query_rule_violation`); what the check cannot see
 through is refused (`query_rule_not_evaluable`): non-InnoDB tables, views,
 keys that are not the whole single-column primary key, guarded inserts on a
 table with a BEFORE INSERT trigger, and scoped upserts on a table with any
-INSERT or UPDATE trigger. Any write that could still be refused after its
-statement (an expected row count, an upsert, a command of a multi-command
-batch) needs an InnoDB table and is refused up front otherwise: MEMORY,
-MyISAM and Aria cannot roll it back.
+INSERT or UPDATE trigger. Every governed write needs an InnoDB table and is
+refused up front otherwise: MEMORY, MyISAM and Aria cannot roll back a
+refused or failing write. A TEMPORARY table shadowing the target is refused
+for every write: information_schema does not list it, so no engine, key or
+trigger check could see it.
 
 **Row-level triggers that modify other rows are allowed, and their effects
 on those rows are the schema owner's responsibility.** The check proves the

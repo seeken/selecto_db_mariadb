@@ -48,6 +48,7 @@ defmodule SelectoDBMariaDB.InsertAdmissionTest do
   @strict {"sql_mode", {:ok, %{rows: [["STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION"]]}}}
   @innodb {"ENGINE", {:ok, %{rows: [["InnoDB"]]}}}
   @mdl {"LIMIT 0", {:ok, %{rows: []}}}
+  @show {"SHOW CREATE TABLE", {:ok, %{rows: [["items", "CREATE TABLE `items` (`id` int)"]]}}}
 
   defp key(type, extra), do: {"COLUMN_KEY", {:ok, %{rows: [["id", type, extra]]}}}
 
@@ -58,22 +59,36 @@ defmodule SelectoDBMariaDB.InsertAdmissionTest do
     # Without the table's metadata lock nothing is evaluable.
     assert code(InsertAdmission.before_insert(:conn, command, executor([]), [])) == refused
 
-    loose = executor([@mdl, {"sql_mode", {:ok, %{rows: [["NO_ENGINE_SUBSTITUTION"]]}}}])
+    loose = executor([@mdl, @show, {"sql_mode", {:ok, %{rows: [["NO_ENGINE_SUBSTITUTION"]]}}}])
     assert code(InsertAdmission.before_insert(:conn, command, loose, [])) == refused
 
-    myisam = executor([@mdl, @strict, {"ENGINE", {:ok, %{rows: [["MyISAM"]]}}}])
+    myisam = executor([@mdl, @show, @strict, {"ENGINE", {:ok, %{rows: [["MyISAM"]]}}}])
     assert code(InsertAdmission.before_insert(:conn, command, myisam, [])) == refused
 
     # A BEFORE INSERT trigger can rewrite the row and its key: refused.
-    triggered = executor([@mdl, @strict, @innodb, {"TRIGGERS", {:ok, %{rows: [[1]]}}}])
+    triggered = executor([@mdl, @show, @strict, @innodb, {"TRIGGERS", {:ok, %{rows: [[1]]}}}])
     flush_sql()
     assert code(InsertAdmission.before_insert(:conn, command, triggered, [])) == refused
-    # The metadata lock comes before every catalog read.
+    # The metadata lock, then the TEMPORARY-shadow check, come before every
+    # catalog read.
     assert {:sql, "SELECT 1 FROM `items` LIMIT 0", []} = receive(do: (message -> message))
+    assert {:sql, "SHOW CREATE TABLE `items`", []} = receive(do: (message -> message))
+
+    temporary =
+      executor([
+        @mdl,
+        {"SHOW CREATE TABLE",
+         {:ok, %{rows: [["items", "CREATE TEMPORARY TABLE `items` (`id` int)"]]}}},
+        @strict,
+        @innodb,
+        {"TRIGGERS", {:ok, %{rows: [[0]]}}}
+      ])
+
+    assert code(InsertAdmission.before_insert(:conn, command, temporary, [])) == refused
     assert_received {:sql, "SELECT COUNT(*) FROM information_schema.TRIGGERS" <> sql, _}
     assert sql =~ "ACTION_TIMING = 'BEFORE'"
 
-    clean = executor([@mdl, @strict, @innodb, {"TRIGGERS", {:ok, %{rows: [[0]]}}}])
+    clean = executor([@mdl, @show, @strict, @innodb, {"TRIGGERS", {:ok, %{rows: [[0]]}}}])
     assert :ok = InsertAdmission.before_insert(:conn, command, clean, [])
   end
 

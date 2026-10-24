@@ -33,49 +33,50 @@ defmodule SelectoDBMariaDB.InsertAdmission do
   @identifier ~r/\A[A-Za-z_][A-Za-z0-9_$]{0,63}\z/
 
   @doc false
-  # A write that can still be refused after its statement (an expected row
-  # count, a guard, an upsert's emulation, any command of a multi-command
-  # batch) must be rolled back by the transaction; MEMORY, MyISAM and Aria
-  # tables keep the change. After the metadata lock such a write is refused
-  # up front unless the table is InnoDB (w3exrev17 item 26a).
+  # Every governed write takes the table's metadata lock (refusing a
+  # TEMPORARY shadow) and needs InnoDB: MEMORY, MyISAM and Aria tables keep a
+  # change the transaction cannot roll back (w3exrev17 item 26a, w3exrev18
+  # items 27 and 32).
   def require_transactional(connection, %Command{} = command, execute, opts) do
-    if may_refuse_after_statement?(command, opts) do
-      with {:ok, schema, table} <- relation(command.relation),
-           :ok <- lock_metadata(connection, command, execute, opts),
-           {:ok, %{rows: rows}} <-
-             execute.(
-               connection,
-               "SELECT ENGINE FROM information_schema.TABLES WHERE TABLE_SCHEMA = " <>
-                 schema_sql(schema) <> " AND TABLE_NAME = ?",
-               schema_params(schema) ++ [table],
-               opts
-             ) do
-        case rows do
-          [[engine]] when is_binary(engine) ->
-            if String.downcase(engine) == "innodb", do: :ok, else: non_transactional(engine)
-
-          _ ->
-            non_transactional(nil)
-        end
-      else
-        other -> retryable_or_denied(other)
-      end
+    with :ok <- lock_metadata(connection, command, execute, opts) do
+      if engine_checked_here?(command),
+        do: transactional_engine(connection, command, execute, opts),
+        else: :ok
     else
-      :ok
+      other -> retryable_or_denied(other)
     end
   end
 
-  # Guarded inserts, updates and upserts check the engine themselves
-  # (before_insert/2, before_update/4, before_upsert/4) and refuse as not
-  # evaluable.
-  defp may_refuse_after_statement?(%Command{} = command, opts) do
-    guarded? =
-      Enum.any?([:post_image, :insert_admission], &Map.has_key?(command.metadata || %{}, &1))
+  defp transactional_engine(connection, %Command{} = command, execute, opts) do
+    with {:ok, schema, table} <- relation(command.relation),
+         {:ok, %{rows: rows}} <-
+           execute.(
+             connection,
+             "SELECT ENGINE FROM information_schema.TABLES WHERE TABLE_SCHEMA = " <>
+               schema_sql(schema) <> " AND TABLE_NAME = ?",
+             schema_params(schema) ++ [table],
+             opts
+           ) do
+      case rows do
+        [[engine]] when is_binary(engine) ->
+          if String.downcase(engine) == "innodb", do: :ok, else: non_transactional(engine)
 
-    not guarded? and
-      (Keyword.get(opts, :batch_commands, 1) > 1 or command.operation == :upsert or
-         command.expected_cardinality not in [nil, :many, {:at_least, 0}])
+        _ ->
+          non_transactional(nil)
+      end
+    else
+      other -> retryable_or_denied(other)
+    end
   end
+
+  # Every governed write needs InnoDB (w3exrev18 item 32): a non-
+  # transactional table keeps a partial change when a row trigger SIGNALs
+  # or a count, guard or later batch command refuses. Guarded inserts,
+  # updates and upserts check the engine themselves (before_insert/4,
+  # before_update/4, before_upsert/4) and refuse as not evaluable.
+  defp engine_checked_here?(%Command{} = command),
+    do:
+      not Enum.any?([:post_image, :insert_admission], &Map.has_key?(command.metadata || %{}, &1))
 
   defp non_transactional(engine),
     do:
@@ -467,18 +468,38 @@ defmodule SelectoDBMariaDB.InsertAdmission do
   # until it ends, taken before any engine or trigger catalog read: a
   # concurrent CREATE/DROP TRIGGER (or ALTER) then waits for the commit
   # instead of slipping in between the check and the write (w3exrev16).
+  #
+  # A TEMPORARY table of the same name shadows the base table for this
+  # session and is invisible to information_schema, so every engine, key and
+  # trigger check would read the wrong table (w3exrev18 item 27): it is
+  # refused, detected through SHOW CREATE TABLE after the lock.
   defp lock_metadata(connection, command, execute, opts) do
-    case execute.(
-           connection,
-           "SELECT 1 FROM " <> quote_relation(command.relation) <> " LIMIT 0",
-           [],
-           opts
-         ) do
-      {:ok, _} -> :ok
+    relation = quote_relation(command.relation)
+
+    with {:ok, _} <- execute.(connection, "SELECT 1 FROM " <> relation <> " LIMIT 0", [], opts),
+         {:ok, %{rows: [[_name, create | _]]}} when is_binary(create) <-
+           execute.(connection, "SHOW CREATE TABLE " <> relation, [], opts) do
+      if Regex.match?(~r/\A\s*CREATE\s+TEMPORARY\s+TABLE/i, create),
+        do: temporary_shadow(),
+        else: :ok
+    else
       {:error, _} = error -> error
       _ -> :error
     end
   end
+
+  defp temporary_shadow,
+    do:
+      {:error,
+       Error.new(
+         :query_enforcement,
+         "MariaDB write target is shadowed by a TEMPORARY table",
+         details: %{
+           code: :query_rule_not_evaluable,
+           reason: :temporary_table_shadow,
+           adapter: :mariadb
+         }
+       )}
 
   # A deadlock (1213) or lock wait timeout (1205) while taking a lock or
   # reading the catalog is the canonical retryable write failure, not a
@@ -488,6 +509,7 @@ defmodule SelectoDBMariaDB.InsertAdmission do
        when category in [:deadlock_detected, :lock_timeout],
        do: error
 
+  defp retryable_or_denied({:error, %Error{}} = error), do: error
   defp retryable_or_denied(_other), do: denied(:query_rule_not_evaluable)
 
   defp quote_relation(relation) do
