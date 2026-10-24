@@ -42,7 +42,7 @@ defmodule SelectoDBMariaDB.InsertAdmissionTest do
 
   defp key(type, extra), do: {"COLUMN_KEY", {:ok, %{rows: [["id", type, extra]]}}}
 
-  test "a non-strict session, a non-transactional engine or an INSERT trigger is not evaluable" do
+  test "a non-strict session or a non-transactional engine is not evaluable; triggers are re-read" do
     command = command([assigned(:id, 1), assigned(:subject, "10.5")])
     refused = :query_rule_not_evaluable
 
@@ -52,11 +52,11 @@ defmodule SelectoDBMariaDB.InsertAdmissionTest do
     myisam = executor([@strict, {"ENGINE", {:ok, %{rows: [["MyISAM"]]}}}])
     assert code(InsertAdmission.before_insert(:conn, command, myisam, [])) == refused
 
-    triggered = executor([@strict, @innodb, {"TRIGGERS", {:ok, %{rows: [[1]]}}}])
-    assert code(InsertAdmission.before_insert(:conn, command, triggered, [])) == refused
-
-    clean = executor([@strict, @innodb, {"TRIGGERS", {:ok, %{rows: [[0]]}}}])
+    # A row trigger no longer refuses the insert: the re-read after the
+    # statement decides on what it stored (TW-09).
+    clean = executor([@strict, @innodb])
     assert :ok = InsertAdmission.before_insert(:conn, command, clean, [])
+    refute_received {:sql, "SELECT COUNT(*) FROM information_schema.TRIGGERS" <> _, _}
   end
 
   test "the stored row is re-read by its typed key, alone and under the predicate" do
@@ -66,12 +66,25 @@ defmodule SelectoDBMariaDB.InsertAdmissionTest do
     rounded =
       executor([
         key("int", ""),
+        {"TRIGGERS", {:ok, %{rows: [[0]]}}},
         {guarded, {:ok, %{rows: [[0]]}}},
         {"WHERE `id` = ?", {:ok, %{rows: [[1]]}}}
       ])
 
     assert code(InsertAdmission.after_insert(:conn, command, %{}, rounded, [])) ==
              :query_rule_violation
+
+    # A row trigger rewrote the stored row: the candidate is not evaluable.
+    triggered =
+      executor([
+        key("int", ""),
+        {"TRIGGERS", {:ok, %{rows: [[1]]}}},
+        {guarded, {:ok, %{rows: [[0]]}}},
+        {"WHERE `id` = ?", {:ok, %{rows: [[1]]}}}
+      ])
+
+    assert code(InsertAdmission.after_insert(:conn, command, %{}, triggered, [])) ==
+             :query_rule_not_evaluable
 
     assert_received {:sql, "SELECT COUNT(*) FROM `items` WHERE `id` = ?", [7]}
     assert_received {:sql, "SELECT COUNT(*) FROM `items` " <> ^guarded, [7, "16"]}

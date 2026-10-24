@@ -6,11 +6,10 @@ defmodule SelectoDBMariaDB.InsertAdmission do
   # this then decides on what MariaDB actually stored, inside the write's own
   # transaction:
   #
-  # - before the INSERT, a session without strict sql_mode, a table that is not
-  #   InnoDB (a non-transactional engine keeps a violating row after the
-  #   rollback), or a table with an INSERT trigger is refused
-  #   (`query_rule_not_evaluable`): a trigger can rewrite the row or write
-  #   elsewhere after any check;
+  # - before the INSERT, a session without strict sql_mode or a table that is
+  #   not InnoDB (a non-transactional engine keeps a violating row after the
+  #   rollback; a view has no engine) is refused (`query_rule_not_evaluable`);
+  #   a row trigger that rewrites the row is seen by the re-read below;
   # - after the INSERT, the row is re-read by its primary key together with
   #   the predicate, so column types, DECIMAL rounding, collations and
   #   defaults decide. No matching row is `query_rule_violation`; the caller's
@@ -55,17 +54,11 @@ defmodule SelectoDBMariaDB.InsertAdmission do
              schema_params(schema) ++ [table],
              opts
            ),
-         true <- is_binary(engine) and String.downcase(engine) == "innodb",
-         {:ok, %{rows: [[count]]}} <-
-           execute.(
-             connection,
-             "SELECT COUNT(*) FROM information_schema.TRIGGERS WHERE EVENT_OBJECT_SCHEMA = " <>
-               schema_sql(schema) <>
-               " AND EVENT_OBJECT_TABLE = ? AND EVENT_MANIPULATION = 'INSERT'",
-             schema_params(schema) ++ [table],
-             opts
-           ) do
-      if count == 0, do: :ok, else: denied(:query_rule_not_evaluable)
+         true <- is_binary(engine) and String.downcase(engine) == "innodb" do
+      # Row triggers may rewrite the row (BEFORE INSERT); the re-read after
+      # the statement sees what they stored. MariaDB triggers are row-level and
+      # cannot modify the table they fire on, so no other row can change.
+      :ok
     else
       _ -> denied(:query_rule_not_evaluable)
     end
@@ -97,7 +90,10 @@ defmodule SelectoDBMariaDB.InsertAdmission do
          {:ok, guard} <-
            WriteCompiler.compile_predicate(
              predicate,
-             WriteCompiler.predicate_opts(command, context: Keyword.get(opts, :context, %{}))
+             WriteCompiler.predicate_opts(
+               scope_exact(command, predicate),
+               context: Keyword.get(opts, :context, %{})
+             )
            ),
          from = "SELECT COUNT(*) FROM " <> quote_relation(command.relation),
          by_key = " WHERE " <> quote_id(key) <> " = ?",
@@ -109,7 +105,18 @@ defmodule SelectoDBMariaDB.InsertAdmission do
              [key_value | WriteCompiler.bind_params(guard.params)],
              opts
            ) do
-      if count == 1, do: :ok, else: denied(:query_rule_violation)
+      cond do
+        count == 1 ->
+          :ok
+
+        # A row trigger rewrote the candidate: what the host sent cannot be
+        # decided against the guard (typed_insert_admission TA005).
+        insert_triggers?(connection, schema, table, execute, opts) ->
+          denied(:query_rule_not_evaluable)
+
+        true ->
+          denied(:query_rule_violation)
+      end
     else
       {:error, %Error{type: :query_enforcement}} = error -> error
       _ -> denied(:query_rule_not_evaluable)
@@ -117,6 +124,134 @@ defmodule SelectoDBMariaDB.InsertAdmission do
   end
 
   def after_insert(_connection, _command, _result, _execute, _opts), do: :ok
+
+  defp insert_triggers?(connection, schema, table, execute, opts) do
+    case execute.(
+           connection,
+           "SELECT COUNT(*) FROM information_schema.TRIGGERS WHERE EVENT_OBJECT_SCHEMA = " <>
+             schema_sql(schema) <> " AND EVENT_OBJECT_TABLE = ? AND EVENT_MANIPULATION = 'INSERT'",
+           schema_params(schema) ++ [table],
+           opts
+         ) do
+      {:ok, %{rows: [[count]]}} when is_integer(count) -> count > 0
+      _ -> true
+    end
+  end
+
+  # TW-09 post-image of a guarded UPDATE (`metadata.post_image`: the engine
+  # tenant and the trusted and host scope). Before the UPDATE the rows its
+  # predicate selects are locked and their keys read (FOR UPDATE, host-exact
+  # predicate); after it they are re-read by those keys under the scope, so
+  # an update that assigns a scoped column, a BEFORE UPDATE trigger and a
+  # generated column all decide on what MariaDB stored. Every locked row must
+  # still match, else `query_rule_violation` and the transaction rolls back.
+  # The key must be the table's whole single-column primary key (an enforced
+  # NOT NULL unique key: a decoy row cannot share it); the table must be
+  # InnoDB (a view or a non-transactional engine is refused).
+  def before_update(
+        connection,
+        %Command{operation: :update, metadata: %{post_image: %{key: [key]}}} = command,
+        execute,
+        opts
+      ) do
+    with true <- Regex.match?(@identifier, key),
+         {:ok, schema, table} <- relation(command.relation),
+         {:ok, %{rows: [[engine]]}} <-
+           execute.(
+             connection,
+             "SELECT ENGINE FROM information_schema.TABLES WHERE TABLE_SCHEMA = " <>
+               schema_sql(schema) <> " AND TABLE_NAME = ?",
+             schema_params(schema) ++ [table],
+             opts
+           ),
+         true <- is_binary(engine) and String.downcase(engine) == "innodb",
+         {:ok, column} <- key_column(connection, schema, table, key, execute, opts),
+         {:ok, predicate} <-
+           WriteCompiler.compile_predicate(
+             command.predicate,
+             WriteCompiler.predicate_opts(command, context: Keyword.get(opts, :context, %{}))
+           ),
+         {:ok, %{rows: rows}} <-
+           execute.(
+             connection,
+             "SELECT " <>
+               quote_id(key) <>
+               " FROM " <>
+               quote_relation(command.relation) <>
+               " WHERE " <> predicate.text <> " FOR UPDATE",
+             WriteCompiler.bind_params(predicate.params),
+             opts
+           ),
+         keys = Enum.map(rows, &hd/1),
+         true <- Enum.all?(keys, &match?({:ok, _}, typed_key(&1, column.type))) do
+      {:ok, keys}
+    else
+      _ -> denied(:query_rule_not_evaluable)
+    end
+  end
+
+  def before_update(
+        _connection,
+        %Command{operation: :update, metadata: %{post_image: _}},
+        _e,
+        _o
+      ),
+      do: denied(:query_rule_not_evaluable)
+
+  def before_update(_connection, _command, _execute, _opts), do: {:ok, nil}
+
+  def after_update(_connection, _command, nil, _execute, _opts), do: :ok
+  def after_update(_connection, _command, [], _execute, _opts), do: :ok
+
+  def after_update(
+        connection,
+        %Command{metadata: %{post_image: %{predicate: predicate, key: [key]}}} = command,
+        keys,
+        execute,
+        opts
+      ) do
+    with {:ok, scope} <-
+           WriteCompiler.compile_predicate(
+             predicate,
+             WriteCompiler.predicate_opts(
+               scope_exact(command, predicate),
+               context: Keyword.get(opts, :context, %{})
+             )
+           ),
+         markers = Enum.map_join(keys, ", ", fn _ -> "?" end),
+         {:ok, %{rows: [[count]]}} <-
+           execute.(
+             connection,
+             "SELECT COUNT(*) FROM " <>
+               quote_relation(command.relation) <>
+               " WHERE " <> quote_id(key) <> " IN (" <> markers <> ") AND (" <> scope.text <> ")",
+             keys ++ WriteCompiler.bind_params(scope.params),
+             opts
+           ) do
+      if count == length(keys), do: :ok, else: denied(:query_rule_violation)
+    else
+      {:error, %Error{type: :query_enforcement}} = error -> error
+      _ -> denied(:query_rule_not_evaluable)
+    end
+  end
+
+  # Every column the scope (or insert guard) compares is identity: it
+  # compares by its stored bytes by declared type, whether or not the
+  # command listed it among its tenant fields.
+  defp scope_exact(%Command{metadata: metadata} = command, predicate) do
+    fields =
+      Enum.uniq(List.wrap(Map.get(metadata, :tenant_fields, [])) ++ predicate_fields(predicate))
+
+    %{command | metadata: Map.put(metadata, :tenant_fields, fields)}
+  end
+
+  defp predicate_fields({:field, field}), do: [to_string(field)]
+
+  defp predicate_fields(tuple) when is_tuple(tuple),
+    do: tuple |> Tuple.to_list() |> Enum.flat_map(&predicate_fields/1)
+
+  defp predicate_fields(list) when is_list(list), do: Enum.flat_map(list, &predicate_fields/1)
+  defp predicate_fields(_value), do: []
 
   # Strict-mode conversion failures (1264 out of range, 1265 truncated, 1292
   # and 1366 incorrect value) mean the candidate has no stored form the guard
@@ -226,7 +361,7 @@ defmodule SelectoDBMariaDB.InsertAdmission do
   defp denied(code),
     do:
       {:error,
-       Error.new(:query_enforcement, "MariaDB insert cannot satisfy the captured query guard",
+       Error.new(:query_enforcement, "MariaDB write cannot satisfy the captured query guard",
          details: %{code: code, adapter: :mariadb}
        )}
 end
