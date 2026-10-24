@@ -427,6 +427,8 @@ defmodule SelectoDBMariaDB.Adapter do
     with :ok <- Batch.validate(batch) do
       with_write_transaction(connection, fn tx ->
         with :ok <- verify_write_session(tx) do
+          opts = Keyword.put(opts, :batch_commands, length(batch.commands))
+
           Enum.reduce_while(batch.commands, {:ok, []}, fn command, {:ok, results} ->
             case execute_write_command(tx, command, opts) do
               {:ok, result} -> {:cont, {:ok, results ++ [result]}}
@@ -465,7 +467,9 @@ defmodule SelectoDBMariaDB.Adapter do
   # Upserts run the target-exact emulation (SelectoDBMariaDB.Upsert), never
   # ON DUPLICATE KEY UPDATE.
   defp execute_write_command(connection, %Command{operation: :upsert} = command, opts) do
-    with :ok <- InsertAdmission.before_upsert(connection, command, &execute_unchecked/4, opts),
+    with :ok <-
+           InsertAdmission.require_transactional(connection, command, &execute_unchecked/4, opts),
+         :ok <- InsertAdmission.before_upsert(connection, command, &execute_unchecked/4, opts),
          {:ok, plan} <- WriteCompiler.upsert_plan(command, opts),
          {:ok, affected} <-
            Upsert.execute(
@@ -493,6 +497,8 @@ defmodule SelectoDBMariaDB.Adapter do
 
   defp execute_write_command(connection, command, opts) do
     with :ok <-
+           InsertAdmission.require_transactional(connection, command, &execute_unchecked/4, opts),
+         :ok <-
            InsertAdmission.before_insert(connection, command, &execute_unchecked/4, opts),
          {:ok, locked} <-
            InsertAdmission.before_update(connection, command, &execute_unchecked/4, opts),

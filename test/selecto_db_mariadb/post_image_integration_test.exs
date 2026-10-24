@@ -339,6 +339,61 @@ defmodule SelectoDBMariaDB.PostImageIntegrationTest do
     end)
   end
 
+  test "a write that could be refused after its statement needs InnoDB" do
+    # w3exrev17 item 26a: on a non-transactional table a cardinality or
+    # batch refusal cannot roll the statement back, so such writes are
+    # refused up front; a plain :many write still applies.
+    with_database(fn conn ->
+      for engine <- ["MEMORY", "MyISAM", "Aria"] do
+        ddl!(conn, "DROP TABLE IF EXISTS nt")
+
+        ddl!(
+          conn,
+          "CREATE TABLE nt (id INT PRIMARY KEY, org_key VARCHAR(16), name VARCHAR(16)) ENGINE=#{engine}"
+        )
+
+        ddl!(conn, "INSERT INTO nt VALUES (1, 'T1', 'a'), (2, 'T1', 'a')")
+
+        rows = fn ->
+          MyXQL.query!(conn, "SELECT id, name FROM nt ORDER BY id", [], query_type: :text).rows
+        end
+
+        command = fn operation, cardinality ->
+          %Command{
+            operation: operation,
+            relation: "nt",
+            assignments:
+              if(operation == :update, do: [%{field: "name", value: {:literal, "u"}}], else: []),
+            predicate: {:eq, {:field, "name"}, {:literal, "a"}},
+            returning: :none,
+            expected_cardinality: cardinality,
+            metadata: %{}
+          }
+        end
+
+        for operation <- [:delete, :update] do
+          assert {:error, %Error{details: %{code: :non_transactional_engine}}} =
+                   Adapter.execute_write_unsafe(conn, command.(operation, {:exactly, 1}), []),
+                 "#{engine} #{operation}"
+
+          assert rows.() == [[1, "a"], [2, "a"]], "#{engine} #{operation}"
+        end
+
+        batch = %Selecto.Write.Batch{
+          commands: [command.(:update, :many), command.(:delete, :many)]
+        }
+
+        assert {:error, %Error{details: %{code: :non_transactional_engine}}} =
+                 Adapter.execute_write_unsafe(conn, batch, [])
+
+        assert rows.() == [[1, "a"], [2, "a"]]
+
+        assert {:ok, %{affected_rows: 2}} =
+                 Adapter.execute_write_unsafe(conn, command.(:delete, :many), [])
+      end
+    end)
+  end
+
   test "ordinary triggers keep working under a scope" do
     with_database(fn conn ->
       table!(conn)

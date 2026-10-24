@@ -59,7 +59,10 @@ rolls the write back (`query_rule_violation`); what the check cannot see
 through is refused (`query_rule_not_evaluable`): non-InnoDB tables, views,
 keys that are not the whole single-column primary key, guarded inserts on a
 table with a BEFORE INSERT trigger, and scoped upserts on a table with any
-INSERT or UPDATE trigger.
+INSERT or UPDATE trigger. Any write that could still be refused after its
+statement (an expected row count, an upsert, a command of a multi-command
+batch) needs an InnoDB table and is refused up front otherwise: MEMORY,
+MyISAM and Aria cannot roll it back.
 
 **Row-level triggers that modify other rows are allowed, and their effects
 on those rows are the schema owner's responsibility.** The check proves the
