@@ -599,18 +599,32 @@ defmodule SelectoDBMariaDB.Adapter do
             end
 
           {:error, %Error{}} = error ->
-            _ = query.("ROLLBACK TO SAVEPOINT #{name}")
-            _ = query.("RELEASE SAVEPOINT #{name}")
+            rollback_to_savepoint(connection, query, name)
             error
 
           {:error, reason} ->
-            _ = query.("ROLLBACK TO SAVEPOINT #{name}")
-            _ = query.("RELEASE SAVEPOINT #{name}")
+            rollback_to_savepoint(connection, query, name)
             {:error, write_error(:transaction_failed, reason)}
         end
 
       {:error, reason} ->
         {:error, write_error(:transaction_failed, reason)}
+    end
+  end
+
+  # A deadlock (or another error InnoDB answers by rolling back the whole
+  # transaction) leaves no savepoint to return to: the caller's transaction
+  # is then marked failed, as a nested rollback would, so it cannot commit
+  # as if its earlier statements had survived.
+  defp rollback_to_savepoint(connection, query, name) do
+    case query.("ROLLBACK TO SAVEPOINT #{name}") do
+      {:ok, _} ->
+        _ = query.("RELEASE SAVEPOINT #{name}")
+        :ok
+
+      {:error, _} ->
+        _ = MyXQL.transaction(connection, &MyXQL.rollback(&1, :write_rolled_back))
+        :ok
     end
   end
 
