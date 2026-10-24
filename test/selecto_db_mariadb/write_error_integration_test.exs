@@ -118,6 +118,58 @@ defmodule SelectoDBMariaDB.WriteErrorIntegrationTest do
     end)
   end
 
+  test "a deadlock while a guarded update locks its keys keeps its retryable category" do
+    # w3exrev17 MEDIUM: the post-image key lock (SELECT ... FOR UPDATE) is
+    # where this update waits; its deadlock was query_rule_not_evaluable.
+    with_database(fn conn ->
+      {:ok, other} = Adapter.connect(Keyword.put(connection_options(), :database, database(conn)))
+
+      try do
+        parent = self()
+
+        # The other session modifies more rows, so InnoDB picks the host
+        # transaction (fewer changes) as the victim.
+        blocker =
+          Task.async(fn ->
+            MyXQL.transaction(other, fn tx ->
+              MyXQL.query!(tx, "UPDATE items SET code = 'o' WHERE id >= 2", [])
+              send(parent, :other_locked)
+
+              receive do
+                :go -> MyXQL.query(tx, "UPDATE items SET code = 'o' WHERE id = 1", [])
+              end
+            end)
+          end)
+
+        result =
+          MyXQL.transaction(conn, fn tx ->
+            MyXQL.query!(tx, "UPDATE items SET code = 'h' WHERE id = 1", [])
+            assert_receive :other_locked, 5_000
+            send(blocker.pid, :go)
+            # Let the other session queue on row 1 before closing the cycle.
+            Process.sleep(300)
+
+            written = Adapter.execute_write_unsafe(tx, guarded_update(2, "x"), [])
+            send(parent, {:written, written})
+            written
+          end)
+
+        assert_received {:written, written}
+
+        assert {:error, %Error{type: :execution_failed, details: details} = error} = written
+        assert details.reason == :deadlock_detected
+        refute inspect(error) =~ "UPDATE"
+
+        # The host transaction cannot commit, and the other session finished.
+        assert {:error, _} = result
+        assert {:ok, {:ok, _}} = Task.await(blocker, 10_000)
+        assert column(conn, "SELECT code FROM items WHERE id = 1") == ["o"]
+      after
+        Adapter.disconnect(other)
+      end
+    end)
+  end
+
   defp insert(values, omit \\ []) do
     base = %{"id" => 5, "code" => "ok", "small" => 1, "day" => "2024-02-01", "name" => "n"}
     row = base |> Map.merge(values) |> Map.drop(omit)
@@ -143,6 +195,13 @@ defmodule SelectoDBMariaDB.WriteErrorIntegrationTest do
       returning: :none,
       expected_cardinality: {:exactly, 1},
       metadata: %{}
+    }
+  end
+
+  defp guarded_update(id, code) do
+    %{
+      update(id, code)
+      | metadata: %{post_image: %{predicate: {:not_null, {:field, "code"}}, key: ["id"]}}
     }
   end
 

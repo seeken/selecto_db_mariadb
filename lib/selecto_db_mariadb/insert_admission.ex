@@ -32,6 +32,60 @@ defmodule SelectoDBMariaDB.InsertAdmission do
 
   @identifier ~r/\A[A-Za-z_][A-Za-z0-9_$]{0,63}\z/
 
+  @doc false
+  # A write that can still be refused after its statement (an expected row
+  # count, a guard, an upsert's emulation, any command of a multi-command
+  # batch) must be rolled back by the transaction; MEMORY, MyISAM and Aria
+  # tables keep the change. After the metadata lock such a write is refused
+  # up front unless the table is InnoDB (w3exrev17 item 26a).
+  def require_transactional(connection, %Command{} = command, execute, opts) do
+    if may_refuse_after_statement?(command, opts) do
+      with {:ok, schema, table} <- relation(command.relation),
+           :ok <- lock_metadata(connection, command, execute, opts),
+           {:ok, %{rows: rows}} <-
+             execute.(
+               connection,
+               "SELECT ENGINE FROM information_schema.TABLES WHERE TABLE_SCHEMA = " <>
+                 schema_sql(schema) <> " AND TABLE_NAME = ?",
+               schema_params(schema) ++ [table],
+               opts
+             ) do
+        case rows do
+          [[engine]] when is_binary(engine) ->
+            if String.downcase(engine) == "innodb", do: :ok, else: non_transactional(engine)
+
+          _ ->
+            non_transactional(nil)
+        end
+      else
+        other -> retryable_or_denied(other)
+      end
+    else
+      :ok
+    end
+  end
+
+  # Guarded inserts, updates and upserts check the engine themselves
+  # (before_insert/2, before_update/4, before_upsert/4) and refuse as not
+  # evaluable.
+  defp may_refuse_after_statement?(%Command{} = command, opts) do
+    guarded? =
+      Enum.any?([:post_image, :insert_admission], &Map.has_key?(command.metadata || %{}, &1))
+
+    not guarded? and
+      (Keyword.get(opts, :batch_commands, 1) > 1 or command.operation == :upsert or
+         command.expected_cardinality not in [nil, :many, {:at_least, 0}])
+  end
+
+  defp non_transactional(engine),
+    do:
+      {:error,
+       Error.new(
+         :transaction_unsupported,
+         "MariaDB cannot roll back this write: the table is not InnoDB",
+         details: %{code: :non_transactional_engine, engine: engine, adapter: :mariadb}
+       )}
+
   def before_insert(
         connection,
         %Command{operation: :insert, metadata: %{insert_admission: admission}} = command,
@@ -71,7 +125,7 @@ defmodule SelectoDBMariaDB.InsertAdmission do
            ) do
       :ok
     else
-      _ -> denied(:query_rule_not_evaluable)
+      other -> retryable_or_denied(other)
     end
   end
 
@@ -110,7 +164,7 @@ defmodule SelectoDBMariaDB.InsertAdmission do
            ) do
       :ok
     else
-      _ -> denied(:query_rule_not_evaluable)
+      other -> retryable_or_denied(other)
     end
   end
 
@@ -119,7 +173,7 @@ defmodule SelectoDBMariaDB.InsertAdmission do
   def before_upsert(connection, %Command{operation: :upsert} = command, execute, opts) do
     case lock_metadata(connection, command, execute, opts) do
       :ok -> :ok
-      _ -> denied(:query_rule_not_evaluable)
+      other -> retryable_or_denied(other)
     end
   end
 
@@ -178,7 +232,7 @@ defmodule SelectoDBMariaDB.InsertAdmission do
       end
     else
       {:error, %Error{type: :query_enforcement}} = error -> error
-      _ -> denied(:query_rule_not_evaluable)
+      other -> retryable_or_denied(other)
     end
   end
 
@@ -246,7 +300,7 @@ defmodule SelectoDBMariaDB.InsertAdmission do
          true <- Enum.all?(keys, &match?({:ok, _}, typed_key(&1, column.type))) do
       {:ok, keys}
     else
-      _ -> denied(:query_rule_not_evaluable)
+      other -> retryable_or_denied(other)
     end
   end
 
@@ -291,7 +345,7 @@ defmodule SelectoDBMariaDB.InsertAdmission do
       if count == length(keys), do: :ok, else: denied(:query_rule_violation)
     else
       {:error, %Error{type: :query_enforcement}} = error -> error
-      _ -> denied(:query_rule_not_evaluable)
+      other -> retryable_or_denied(other)
     end
   end
 
@@ -421,9 +475,20 @@ defmodule SelectoDBMariaDB.InsertAdmission do
            opts
          ) do
       {:ok, _} -> :ok
+      {:error, _} = error -> error
       _ -> :error
     end
   end
+
+  # A deadlock (1213) or lock wait timeout (1205) while taking a lock or
+  # reading the catalog is the canonical retryable write failure, not a
+  # property of the scope (w3exrev17 MEDIUM): it keeps its category so the
+  # caller may retry. Anything else stays not evaluable.
+  defp retryable_or_denied({:error, %Selecto.Error{details: %{category: category}}} = error)
+       when category in [:deadlock_detected, :lock_timeout],
+       do: error
+
+  defp retryable_or_denied(_other), do: denied(:query_rule_not_evaluable)
 
   defp quote_relation(relation) do
     relation

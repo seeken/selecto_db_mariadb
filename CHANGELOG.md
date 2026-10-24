@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- A deadlock (1213) or lock wait timeout (1205) while a guarded write takes
+  its metadata or key lock or reads the catalog keeps its retryable
+  `deadlock_detected` / `lock_timeout` category instead of becoming
+  `query_rule_not_evaluable` (w3exrev17 MEDIUM).
+- On MEMORY, MyISAM, Aria and other non-InnoDB tables, a write that could
+  still be refused after its statement (an expected row count, an upsert,
+  any command of a multi-command batch) is refused up front after the
+  metadata lock (`transaction_unsupported`, `non_transactional_engine`): the
+  rollback could not undo it (w3exrev17 item 26a). Plain `:many` writes
+  still apply.
+
 - Write and upsert savepoint names carry a random nonce instead of a
   counter: MariaDB replaces a same-named savepoint, so a host savepoint named
   like the counter could be replaced and then released by the write
