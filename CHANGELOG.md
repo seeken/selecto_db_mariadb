@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- README: documents the post-image check's limits, including that row-level
+  triggers modifying other rows are outside the guarantee.
+
 - A write on a connection inside the caller's transaction runs under its own
   savepoint: a refusal after its DML (a post-image violation) rolls that DML
   back even when the caller ignores the error and commits, and the caller's
