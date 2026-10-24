@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Every governed write, `:many` included, takes the table's metadata lock
+  and is refused unless the table is InnoDB (`non_transactional_engine`): a
+  row trigger SIGNAL left partial changes on MyISAM, MEMORY and Aria
+  (w3exrev18 item 32).
+- A TEMPORARY table shadowing the target (invisible to information_schema,
+  so every engine, key and trigger check read the base table) is refused for
+  every write, detected through SHOW CREATE TABLE after the metadata lock
+  (`query_rule_not_evaluable`, reason `temporary_table_shadow`; w3exrev18
+  item 27).
+
 - A deadlock (1213) or lock wait timeout (1205) while a guarded write takes
   its metadata or key lock or reads the catalog keeps its retryable
   `deadlock_detected` / `lock_timeout` category instead of becoming
