@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Write and upsert savepoint names carry a random nonce instead of a
+  counter: MariaDB replaces a same-named savepoint, so a host savepoint named
+  like the counter could be replaced and then released by the write
+  (w3exp5 item 20). README: row-level triggers that modify other rows are
+  allowed and are the schema owner's responsibility.
+
 - README: documents the post-image check's limits, including that row-level
   triggers modifying other rows are outside the guarantee.
 
