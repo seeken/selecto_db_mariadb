@@ -565,7 +565,56 @@ defmodule SelectoDBMariaDB.Adapter do
     Enum.map(rows, fn row -> Map.new(Enum.zip(columns, row)) end)
   end
 
-  defp with_write_transaction(connection, fun) do
+  # Inside the caller's transaction the write runs under its own savepoint,
+  # so a refusal after its DML (a post-image violation) undoes that DML even
+  # when the caller ignores the error and commits (w3exrev16 item 18).
+  defp with_write_transaction(%DBConnection{} = connection, fun) do
+    if DBConnection.status(connection) == :transaction do
+      with_savepoint(connection, fun)
+    else
+      with_managed_transaction(connection, fun)
+    end
+  end
+
+  defp with_write_transaction(connection, fun), do: with_managed_transaction(connection, fun)
+
+  defp with_savepoint(connection, fun) do
+    name = "selecto_write_#{System.unique_integer([:positive])}"
+    query = &MyXQL.query(connection, &1, [], query_type: :text)
+
+    case query.("SAVEPOINT #{name}") do
+      {:ok, _} ->
+        result =
+          try do
+            fun.(connection)
+          rescue
+            exception -> {:error, write_error(:transaction_failed, exception)}
+          end
+
+        case result do
+          {:ok, _} = ok ->
+            case query.("RELEASE SAVEPOINT #{name}") do
+              {:ok, _} -> ok
+              {:error, reason} -> {:error, write_error(:transaction_failed, reason)}
+            end
+
+          {:error, %Error{}} = error ->
+            _ = query.("ROLLBACK TO SAVEPOINT #{name}")
+            _ = query.("RELEASE SAVEPOINT #{name}")
+            error
+
+          {:error, reason} ->
+            _ = query.("ROLLBACK TO SAVEPOINT #{name}")
+            _ = query.("RELEASE SAVEPOINT #{name}")
+            {:error, write_error(:transaction_failed, reason)}
+        end
+
+      {:error, reason} ->
+        {:error, write_error(:transaction_failed, reason)}
+    end
+  end
+
+  defp with_managed_transaction(connection, fun) do
     case transaction(connection, fun, []) do
       {:ok, result} ->
         {:ok, result}

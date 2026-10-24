@@ -273,6 +273,28 @@ defmodule SelectoDBMariaDB.PostImageIntegrationTest do
     end)
   end
 
+  test "inside the caller's transaction a refused write undoes its own DML" do
+    # w3exrev16 item 18: the caller ignores the refusal and commits.
+    with_database(fn conn ->
+      table!(conn)
+
+      assert {:ok, {refused, applied}} =
+               MyXQL.transaction(conn, fn tx ->
+                 refused =
+                   Adapter.execute_write_unsafe(tx, update([{"site", "S9"}], site("S1")), [])
+
+                 applied =
+                   Adapter.execute_write_unsafe(tx, update([{"name", "u"}], site("S1")), [])
+
+                 {refused, applied}
+               end)
+
+      assert {:error, %Error{details: %{code: :query_rule_violation}}} = refused
+      assert {:ok, %{affected_rows: 1}} = applied
+      assert stored(conn) == [[1, "T1", "S1", "u"]]
+    end)
+  end
+
   test "ordinary triggers keep working under a scope" do
     with_database(fn conn ->
       table!(conn)
