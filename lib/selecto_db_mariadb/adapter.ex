@@ -330,6 +330,36 @@ defmodule SelectoDBMariaDB.Adapter do
         :json
       ]
 
+  @column_catalog_sql """
+  SELECT COLUMN_NAME, COLUMN_TYPE, COLLATION_NAME FROM information_schema.COLUMNS
+  WHERE TABLE_SCHEMA = COALESCE(?, DATABASE()) AND TABLE_NAME = ?
+  """
+
+  @impl Selecto.DB.WriteAdapter
+  # information_schema COLUMN_TYPE (length, precision, scale, fractional
+  # seconds) with ` collate <COLLATION_NAME>` (query_enforced_scalar v2
+  # verified metadata; the collation name decides determinism).
+  def column_catalog(connection, table) when is_binary(table) do
+    {schema, name} =
+      case String.split(table, ".", parts: 2) do
+        [schema, name] -> {schema, name}
+        [name] -> {nil, name}
+      end
+
+    case execute(connection, @column_catalog_sql, [schema, name], []) do
+      {:ok, %{rows: rows}} ->
+        {:ok,
+         Map.new(rows, fn [column, type, collation] ->
+           type = String.downcase(to_string(type))
+           type = if is_binary(collation), do: "#{type} collate #{collation}", else: type
+           {to_string(column), %{type: type, deterministic: nil}}
+         end)}
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
   @impl Selecto.DB.WriteAdapter
   def write_capabilities(connection) do
     %{
