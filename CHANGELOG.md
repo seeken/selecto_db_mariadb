@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- `column_catalog/2`: information_schema `COLUMN_TYPE` with ` collate
+  <COLLATION_NAME>`, the verified metadata for SelectoUpdato's in-process
+  candidate check (query_enforced_scalar v2). Live test.
+
 - Live test: a host predicate on a computed value's CASE conditions (eq, IN,
   nested computed predicate) and on a joined schema's computed predicate
   compares exactly.
