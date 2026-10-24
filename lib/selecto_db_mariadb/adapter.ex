@@ -465,7 +465,8 @@ defmodule SelectoDBMariaDB.Adapter do
   # Upserts run the target-exact emulation (SelectoDBMariaDB.Upsert), never
   # ON DUPLICATE KEY UPDATE.
   defp execute_write_command(connection, %Command{operation: :upsert} = command, opts) do
-    with {:ok, plan} <- WriteCompiler.upsert_plan(command, opts),
+    with :ok <- InsertAdmission.before_upsert(connection, command, &execute_unchecked/4, opts),
+         {:ok, plan} <- WriteCompiler.upsert_plan(command, opts),
          {:ok, affected} <-
            Upsert.execute(
              connection,
