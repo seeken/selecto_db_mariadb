@@ -41,6 +41,7 @@ defmodule SelectoDBMariaDB.InsertAdmission do
     with %{predicate: _predicate, primary_key: key} <- admission,
          true <- is_binary(key) and Regex.match?(@identifier, key),
          {:ok, schema, table} <- relation(command.relation),
+         :ok <- lock_metadata(connection, command, execute, opts),
          # Without strict mode MariaDB stores a converted value with only a
          # warning (`'0x10'` becomes 0), which the re-read would then admit.
          {:ok, %{rows: [[sql_mode]]}} <-
@@ -88,6 +89,7 @@ defmodule SelectoDBMariaDB.InsertAdmission do
         opts
       ) do
     with {:ok, schema, table} <- relation(command.relation),
+         :ok <- lock_metadata(connection, command, execute, opts),
          {:ok, %{rows: [[engine]]}} <-
            execute.(
              connection,
@@ -108,6 +110,15 @@ defmodule SelectoDBMariaDB.InsertAdmission do
            ) do
       :ok
     else
+      _ -> denied(:query_rule_not_evaluable)
+    end
+  end
+
+  # Every upsert's emulation reads the engine and unique indexes; hold the
+  # metadata lock before that too.
+  def before_upsert(connection, %Command{operation: :upsert} = command, execute, opts) do
+    case lock_metadata(connection, command, execute, opts) do
+      :ok -> :ok
       _ -> denied(:query_rule_not_evaluable)
     end
   end
@@ -204,6 +215,7 @@ defmodule SelectoDBMariaDB.InsertAdmission do
       ) do
     with true <- Regex.match?(@identifier, key),
          {:ok, schema, table} <- relation(command.relation),
+         :ok <- lock_metadata(connection, command, execute, opts),
          {:ok, %{rows: [[engine]]}} <-
            execute.(
              connection,
@@ -396,6 +408,22 @@ defmodule SelectoDBMariaDB.InsertAdmission do
   defp schema_sql(_schema), do: "?"
   defp schema_params(nil), do: []
   defp schema_params(schema), do: [schema]
+
+  # A shared metadata lock on the table, held by the write's transaction
+  # until it ends, taken before any engine or trigger catalog read: a
+  # concurrent CREATE/DROP TRIGGER (or ALTER) then waits for the commit
+  # instead of slipping in between the check and the write (w3exrev16).
+  defp lock_metadata(connection, command, execute, opts) do
+    case execute.(
+           connection,
+           "SELECT 1 FROM " <> quote_relation(command.relation) <> " LIMIT 0",
+           [],
+           opts
+         ) do
+      {:ok, _} -> :ok
+      _ -> :error
+    end
+  end
 
   defp quote_relation(relation) do
     relation
