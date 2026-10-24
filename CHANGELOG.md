@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Guarded inserts, updates and upserts take a shared metadata lock on the
+  table (`SELECT 1 FROM t LIMIT 0` in the write's transaction) before any
+  engine or trigger catalog read, so a concurrent CREATE TRIGGER waits for
+  the commit instead of slipping in between the check and the write
+  (w3exrev16; three-connection race test).
+
 - TW-09 post-image: a guarded UPDATE locks its rows' keys (FOR UPDATE) and
   re-reads them after the statement under the scope (host-exact); a row that
   left it rolls the write back with `query_rule_violation`. The key must be
