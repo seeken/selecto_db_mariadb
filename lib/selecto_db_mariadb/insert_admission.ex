@@ -54,10 +54,20 @@ defmodule SelectoDBMariaDB.InsertAdmission do
              schema_params(schema) ++ [table],
              opts
            ),
-         true <- is_binary(engine) and String.downcase(engine) == "innodb" do
-      # Row triggers may rewrite the row (BEFORE INSERT); the re-read after
-      # the statement sees what they stored. MariaDB triggers are row-level and
-      # cannot modify the table they fire on, so no other row can change.
+         true <- is_binary(engine) and String.downcase(engine) == "innodb",
+         # A BEFORE INSERT trigger can rewrite NEW, the key included, so the
+         # re-read by the assigned key could find an older in-scope row while
+         # the rewritten one commits: such a table is refused. AFTER INSERT
+         # triggers cannot modify the row (or the table they fire on).
+         {:ok, %{rows: [[0]]}} <-
+           execute.(
+             connection,
+             "SELECT COUNT(*) FROM information_schema.TRIGGERS WHERE EVENT_OBJECT_SCHEMA = " <>
+               schema_sql(schema) <>
+               " AND EVENT_OBJECT_TABLE = ? AND EVENT_MANIPULATION = 'INSERT' AND ACTION_TIMING = 'BEFORE'",
+             schema_params(schema) ++ [table],
+             opts
+           ) do
       :ok
     else
       _ -> denied(:query_rule_not_evaluable)
@@ -65,6 +75,44 @@ defmodule SelectoDBMariaDB.InsertAdmission do
   end
 
   def before_insert(_connection, _command, _execute, _opts), do: :ok
+
+  @doc false
+  # A scoped upsert (`metadata.post_image`) runs the emulation's INSERT or
+  # UPDATE branch; a row trigger on either could move the stored row out of
+  # the scope (or rewrite the key the branch was chosen by), so a table with
+  # any INSERT or UPDATE trigger, or one that is not InnoDB, is refused.
+  def before_upsert(
+        connection,
+        %Command{operation: :upsert, metadata: %{post_image: _}} = command,
+        execute,
+        opts
+      ) do
+    with {:ok, schema, table} <- relation(command.relation),
+         {:ok, %{rows: [[engine]]}} <-
+           execute.(
+             connection,
+             "SELECT ENGINE FROM information_schema.TABLES WHERE TABLE_SCHEMA = " <>
+               schema_sql(schema) <> " AND TABLE_NAME = ?",
+             schema_params(schema) ++ [table],
+             opts
+           ),
+         true <- is_binary(engine) and String.downcase(engine) == "innodb",
+         {:ok, %{rows: [[0]]}} <-
+           execute.(
+             connection,
+             "SELECT COUNT(*) FROM information_schema.TRIGGERS WHERE EVENT_OBJECT_SCHEMA = " <>
+               schema_sql(schema) <>
+               " AND EVENT_OBJECT_TABLE = ? AND EVENT_MANIPULATION IN ('INSERT', 'UPDATE')",
+             schema_params(schema) ++ [table],
+             opts
+           ) do
+      :ok
+    else
+      _ -> denied(:query_rule_not_evaluable)
+    end
+  end
+
+  def before_upsert(_connection, _command, _execute, _opts), do: :ok
 
   defp strict?(sql_mode) when is_binary(sql_mode) do
     modes = String.split(sql_mode, ",")

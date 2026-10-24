@@ -6,10 +6,13 @@
   re-reads them after the statement under the scope (host-exact); a row that
   left it rolls the write back with `query_rule_violation`. The key must be
   the table's whole single-column primary key and the table InnoDB (views
-  and non-unique keys are refused). A guarded INSERT no longer refuses
-  tables with INSERT triggers: the stored-row re-read decides, and a row a
-  trigger rewrote outside the guard is `query_rule_not_evaluable`
-  (typed_insert_admission TA005). Every column the scope compares is
+  and non-unique keys are refused). A guarded INSERT on a table with a
+  BEFORE INSERT trigger is refused (`query_rule_not_evaluable`): such a
+  trigger can rewrite the key the re-read looks the row up by. AFTER INSERT
+  triggers keep working; a row one rewrote outside the guard is
+  `query_rule_not_evaluable` (typed_insert_admission TA005). A tenant upsert
+  carrying a post-image needs an InnoDB table without INSERT or UPDATE
+  triggers, else it is refused. Every column the scope compares is
   compared by its stored bytes in these re-reads. Live tests.
 
 - `column_catalog/2`: information_schema `COLUMN_TYPE` with ` collate

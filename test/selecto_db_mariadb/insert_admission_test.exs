@@ -52,11 +52,14 @@ defmodule SelectoDBMariaDB.InsertAdmissionTest do
     myisam = executor([@strict, {"ENGINE", {:ok, %{rows: [["MyISAM"]]}}}])
     assert code(InsertAdmission.before_insert(:conn, command, myisam, [])) == refused
 
-    # A row trigger no longer refuses the insert: the re-read after the
-    # statement decides on what it stored (TW-09).
-    clean = executor([@strict, @innodb])
+    # A BEFORE INSERT trigger can rewrite the row and its key: refused.
+    triggered = executor([@strict, @innodb, {"TRIGGERS", {:ok, %{rows: [[1]]}}}])
+    assert code(InsertAdmission.before_insert(:conn, command, triggered, [])) == refused
+    assert_received {:sql, "SELECT COUNT(*) FROM information_schema.TRIGGERS" <> sql, _}
+    assert sql =~ "ACTION_TIMING = 'BEFORE'"
+
+    clean = executor([@strict, @innodb, {"TRIGGERS", {:ok, %{rows: [[0]]}}}])
     assert :ok = InsertAdmission.before_insert(:conn, command, clean, [])
-    refute_received {:sql, "SELECT COUNT(*) FROM information_schema.TRIGGERS" <> _, _}
   end
 
   test "the stored row is re-read by its typed key, alone and under the predicate" do
