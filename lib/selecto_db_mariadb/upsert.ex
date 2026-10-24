@@ -66,7 +66,7 @@ defmodule SelectoDBMariaDB.Upsert do
   end
 
   defp insert(conn, table, plan, execute, control, opts) do
-    savepoint = "selecto_upsert_#{System.unique_integer([:positive])}"
+    savepoint = "selecto_upsert_#{Base.encode16(:crypto.strong_rand_bytes(8), case: :lower)}"
 
     with :ok <- control.(conn, "SAVEPOINT #{savepoint}") do
       case execute.(conn, plan.insert.text, plan.insert.params, opts) do

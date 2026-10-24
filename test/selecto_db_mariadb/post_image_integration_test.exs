@@ -295,6 +295,50 @@ defmodule SelectoDBMariaDB.PostImageIntegrationTest do
     end)
   end
 
+  test "the write's savepoint never replaces or releases a host savepoint" do
+    # w3exp5 item 20: MySQL replaces a same-named savepoint, so a counter-
+    # named write savepoint could replace the host's and then release it.
+    # The host holds savepoints over the next counter values; every one must
+    # survive the writes.
+    with_database(fn conn ->
+      table!(conn)
+      base = System.unique_integer([:positive])
+      names = Enum.map(base..(base + 400), &"selecto_write_#{&1}")
+
+      assert {:ok, :ok} =
+               MyXQL.transaction(
+                 conn,
+                 fn tx ->
+                   for name <- names,
+                       do: MyXQL.query!(tx, "SAVEPOINT #{name}", [], query_type: :text)
+
+                   assert {:error, %Error{details: %{code: :query_rule_violation}}} =
+                            Adapter.execute_write_unsafe(
+                              tx,
+                              update([{"site", "S9"}], site("S1")),
+                              []
+                            )
+
+                   assert {:ok, _} =
+                            Adapter.execute_write_unsafe(
+                              tx,
+                              update([{"name", "u"}], site("S1")),
+                              []
+                            )
+
+                   for name <- Enum.reverse(names),
+                       do:
+                         MyXQL.query!(tx, "ROLLBACK TO SAVEPOINT #{name}", [], query_type: :text)
+
+                   :ok
+                 end,
+                 timeout: 120_000
+               )
+
+      assert stored(conn) == [[1, "T1", "S1", "a"]]
+    end)
+  end
+
   test "ordinary triggers keep working under a scope" do
     with_database(fn conn ->
       table!(conn)

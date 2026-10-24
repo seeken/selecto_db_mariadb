@@ -61,11 +61,12 @@ keys that are not the whole single-column primary key, guarded inserts on a
 table with a BEFORE INSERT trigger, and scoped upserts on a table with any
 INSERT or UPDATE trigger.
 
-**Triggers that modify other rows are outside the guarantee.** The check
-proves the rows the statement wrote; a row-level trigger (an AFTER DELETE,
-AFTER INSERT or AFTER UPDATE trigger) that updates or deletes *other* rows,
-another tenant's included, is not detected. Do not attach such triggers to
-tables written under a bound scope.
+**Row-level triggers that modify other rows are allowed, and their effects
+on those rows are the schema owner's responsibility.** The check proves the
+rows the statement itself wrote. A row-level trigger (AFTER INSERT, AFTER
+UPDATE or AFTER DELETE) that updates or deletes *other* rows, another
+tenant's included, runs and is not checked. MySQL has no statement-level
+triggers or rules.
 
 ## Session and tenant semantics
 

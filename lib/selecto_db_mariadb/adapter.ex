@@ -579,7 +579,7 @@ defmodule SelectoDBMariaDB.Adapter do
   defp with_write_transaction(connection, fun), do: with_managed_transaction(connection, fun)
 
   defp with_savepoint(connection, fun) do
-    name = "selecto_write_#{System.unique_integer([:positive])}"
+    name = "selecto_write_#{Base.encode16(:crypto.strong_rand_bytes(8), case: :lower)}"
     query = &MyXQL.query(connection, &1, [], query_type: :text)
 
     case query.("SAVEPOINT #{name}") do
