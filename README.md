@@ -49,6 +49,24 @@ any statement runs, leaving every row unchanged. `execute_write_unsafe/3` skips
 that check; it exists for trusted tooling and this package's own tests, never
 for application code.
 
+### Post-image check and its limits
+
+A write bound to a tenant or trusted scope (`metadata.post_image`, set by
+`SelectoUpdato`) runs in its own transaction (a savepoint inside the
+caller's), after a shared metadata lock on the table, and its written rows
+are re-read by key under the scope before it ends. A row that left the scope
+rolls the write back (`query_rule_violation`); what the check cannot see
+through is refused (`query_rule_not_evaluable`): non-InnoDB tables, views,
+keys that are not the whole single-column primary key, guarded inserts on a
+table with a BEFORE INSERT trigger, and scoped upserts on a table with any
+INSERT or UPDATE trigger.
+
+**Triggers that modify other rows are outside the guarantee.** The check
+proves the rows the statement wrote; a row-level trigger (an AFTER DELETE,
+AFTER INSERT or AFTER UPDATE trigger) that updates or deletes *other* rows,
+another tenant's included, is not detected. Do not attach such triggers to
+tables written under a bound scope.
+
 ## Session and tenant semantics
 
 - Each read, stream and write first checks its connection's session. The
