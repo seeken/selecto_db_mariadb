@@ -350,26 +350,43 @@ defmodule SelectoDBMariaDB.WriteCompiler do
     name in Keyword.get(opts, :timestamp_fields, [])
   end
 
+  # (CASE WHEN col = 0 THEN col <op> v ELSE UNIX_TIMESTAMP(col) <op> epoch END):
+  # exact on its own, so it stays exact under NOT; a zero date keeps the
+  # server's native comparison (R5).
   defp compile_epoch_comparison(operator, field, value, opts, offset) do
     operator_text = %{eq: "=", neq: "!=", gt: ">", gte: ">=", lt: "<", lte: "<="}[operator]
-    column = "UNIX_TIMESTAMP(#{quote_field(field, opts)})"
+    column = quote_field(field, opts)
 
-    case epoch_value(value, opts) do
-      {:ok, :now} ->
-        {:ok, %{text: "#{column} #{operator_text} UNIX_TIMESTAMP()", params: []}}
+    with {:ok, native} <- compile_value(value, opts, offset) do
+      case epoch_value(value, opts) do
+        {:ok, :now} ->
+          {:ok,
+           %{
+             text:
+               "(CASE WHEN #{column} = 0 THEN #{column} #{operator_text} #{native.text} " <>
+                 "ELSE UNIX_TIMESTAMP(#{column}) #{operator_text} UNIX_TIMESTAMP() END)",
+             params: native.params
+           }}
 
-      {:ok, epoch} ->
-        with {:ok, compiled} <- parameter(epoch, offset) do
-          {:ok, %{text: "#{column} #{operator_text} #{compiled.text}", params: compiled.params}}
-        end
+        {:ok, epoch} ->
+          with {:ok, compiled} <- parameter(epoch, offset + length(native.params)) do
+            {:ok,
+             %{
+               text:
+                 "(CASE WHEN #{column} = 0 THEN #{column} #{operator_text} #{native.text} " <>
+                   "ELSE UNIX_TIMESTAMP(#{column}) #{operator_text} #{compiled.text} END)",
+               params: native.params ++ compiled.params
+             }}
+          end
 
-      :error ->
-        {:error,
-         Error.new(
-           :query_enforcement,
-           "a comparison on a TIMESTAMP column needs a date or time value",
-           details: %{code: :query_rule_not_evaluable, reason: :timestamp_value}
-         )}
+        :error ->
+          {:error,
+           Error.new(
+             :query_enforcement,
+             "a comparison on a TIMESTAMP column needs a date or time value",
+             details: %{code: :query_rule_not_evaluable, reason: :timestamp_value}
+           )}
+      end
     end
   end
 

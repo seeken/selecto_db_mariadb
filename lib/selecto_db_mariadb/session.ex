@@ -113,7 +113,8 @@ defmodule SelectoDBMariaDB.Session do
   # A TEMPORARY table shadows a base table of the same name for this session
   # (a host's, or one a write's row trigger created), and MySQL lists no
   # temporary table in information_schema. A Selecto read refuses when any
-  # relation its statement names after FROM or JOIN resolves to one
+  # relation its statement names after FROM or JOIN (parenthesised joins
+  # included, R2) resolves to one
   # (SHOW CREATE TABLE answers for the temporary table first); a name that
   # does not resolve (a CTE, a derived table, a keyword) is no temporary
   # table.
@@ -140,7 +141,7 @@ defmodule SelectoDBMariaDB.Session do
 
   @doc false
   def relations(query) do
-    ~r/\b(?:from|join)\s+((?:`(?:[^`]|``)+`|[A-Za-z_][A-Za-z0-9_$]*)(?:\s*\.\s*(?:`(?:[^`]|``)+`|[A-Za-z_][A-Za-z0-9_$]*))?)/i
+    ~r/\b(?:from|join)\s*(?:\(\s*)*((?:`(?:[^`]|``)+`|[A-Za-z_][A-Za-z0-9_$]*)(?:\s*\.\s*(?:`(?:[^`]|``)+`|[A-Za-z_][A-Za-z0-9_$]*))?)/i
     |> Regex.scan(IO.iodata_to_binary(query), capture: :all_but_first)
     |> Enum.map(fn [relation] -> String.replace(relation, ~r/\s+/, "") end)
     |> Enum.uniq()
