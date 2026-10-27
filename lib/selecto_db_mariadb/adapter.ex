@@ -216,6 +216,12 @@ defmodule SelectoDBMariaDB.Adapter do
   # (Selecto.Builder.ExactCompare.zone_column?/3, item 62a). Resolved in the
   # database each relation names (the connection's current one when it
   # names none).
+  # DECIMAL carries its scale, so a scope literal can be checked for exact
+  # representation (R3 clarification 2).
+  @storage_type_sql "CASE WHEN DATA_TYPE IN ('decimal', 'numeric') THEN " <>
+                      "CONCAT(DATA_TYPE, '(', NUMERIC_PRECISION, ',', NUMERIC_SCALE, ')') " <>
+                      "ELSE DATA_TYPE END AS DATA_TYPE"
+
   def prepare_read(%{domain: domain} = selecto, connection) when is_map(domain) do
     domains = [domain | Enum.map(Selecto.Executor.set_operands(selecto), &Map.get(&1, :domain))]
 
@@ -240,12 +246,14 @@ defmodule SelectoDBMariaDB.Adapter do
         sql =
           Enum.map_join(relations, " UNION ALL ", fn
             {_name, {nil, _table}} ->
-              "SELECT ? AS selecto_relation, TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, DATA_TYPE " <>
+              "SELECT ? AS selecto_relation, TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, " <>
+                "#{@storage_type_sql} " <>
                 "FROM information_schema.COLUMNS WHERE BINARY TABLE_SCHEMA = BINARY DATABASE() " <>
                 "AND " <> name_match.("TABLE_NAME")
 
             {_name, {_schema, _table}} ->
-              "SELECT ? AS selecto_relation, TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, DATA_TYPE " <>
+              "SELECT ? AS selecto_relation, TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, " <>
+                "#{@storage_type_sql} " <>
                 "FROM information_schema.COLUMNS WHERE " <>
                 name_match.("TABLE_SCHEMA") <> " AND " <> name_match.("TABLE_NAME")
           end)

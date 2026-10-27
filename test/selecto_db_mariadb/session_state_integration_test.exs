@@ -468,6 +468,37 @@ defmodule SelectoDBMariaDB.SessionStateIntegrationTest do
     end)
   end
 
+  test "required filters on INT and DECIMAL bind only exact literals (R3 clarification 2)" do
+    with_database(fn conn ->
+      Process.put(:conn, conn)
+
+      ddl!(
+        conn,
+        "CREATE TABLE r3c (id INT PRIMARY KEY, n INT NOT NULL, d DECIMAL(10,2) NOT NULL) ENGINE=InnoDB"
+      )
+
+      ddl!(conn, "INSERT INTO r3c VALUES (1, 1, 1.01), (2, 2, 2.50)")
+
+      domain = fn filters ->
+        %{
+          name: "r3c",
+          source:
+            relation("r3c", %{id: %{type: :integer}, n: %{type: :string}, d: %{type: :string}}),
+          schemas: %{},
+          joins: %{},
+          required_filters: filters
+        }
+      end
+
+      assert rows(run_domain(domain.([{"n", "1"}]))) == [[1]]
+      assert rows(run_domain(domain.([{"d", "1.01"}]))) == [[1]]
+
+      for filter <- [{"n", "1.4"}, {"n", "1e0"}, {"d", "1.005"}] do
+        assert rows(run_domain(domain.([filter]))) == :identity_value, inspect(filter)
+      end
+    end)
+  end
+
   test "a computed value read from a TIMESTAMP scope column is refused (R15)" do
     with_database(fn conn ->
       Process.put(:conn, conn)
