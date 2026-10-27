@@ -707,6 +707,29 @@ defmodule SelectoDBMariaDB.Adapter do
     end
   end
 
+  defp scope_fields(%Command{metadata: metadata}) do
+    metadata = metadata || %{}
+
+    guards =
+      [
+        get_in(metadata, [:post_image, :predicate]),
+        get_in(metadata, [:insert_admission, :predicate])
+      ]
+
+    (List.wrap(Map.get(metadata, :tenant_fields, [])) ++
+       Enum.flat_map(guards, &predicate_fields/1))
+    |> Enum.map(&(&1 |> to_string() |> String.split(".") |> List.last() |> String.downcase()))
+    |> Enum.uniq()
+  end
+
+  defp predicate_fields({:field, field}), do: [to_string(field)]
+
+  defp predicate_fields(tuple) when is_tuple(tuple),
+    do: tuple |> Tuple.to_list() |> Enum.flat_map(&predicate_fields/1)
+
+  defp predicate_fields(list) when is_list(list), do: Enum.flat_map(list, &predicate_fields/1)
+  defp predicate_fields(_value), do: []
+
   # The columns of the written relation stored as TIMESTAMP: every
   # comparison of the write and its re-reads on one compares by epoch
   # (WriteCompiler, item 62a).
@@ -726,7 +749,16 @@ defmodule SelectoDBMariaDB.Adapter do
            opts
          ) do
       {:ok, %{rows: rows}} ->
-        fields = Enum.map(rows, fn [column] -> to_string(column) end)
+        # Only scope columns (tenant fields, the post-image and admission
+        # guards) take the epoch form; the caller's own predicates keep the
+        # server's semantics (R12).
+        scope = scope_fields(command)
+
+        fields =
+          rows
+          |> Enum.map(fn [column] -> to_string(column) end)
+          |> Enum.filter(&(String.downcase(&1) in scope))
+
         {:ok, %{command | metadata: Map.put(command.metadata, :storage_timestamp_fields, fields)}}
 
       {:error, _} = error ->

@@ -221,6 +221,139 @@ defmodule SelectoDBMariaDB.SessionStateIntegrationTest do
     end)
   end
 
+  defp scoped(table, columns, required_filters) do
+    %{
+      name: table,
+      source: %{
+        source_table: table,
+        primary_key: :id,
+        redact_fields: [],
+        fields: Map.keys(columns),
+        columns: columns,
+        associations: %{}
+      },
+      schemas: %{},
+      joins: %{},
+      required_filters: required_filters
+    }
+    |> Selecto.configure(Process.get(:conn), adapter: Adapter, validate: false)
+    |> Selecto.select(["id"])
+    |> Selecto.order_by(["id"])
+    |> Selecto.execute()
+  end
+
+  test "identity text ranges and patterns compare bytes (R3)" do
+    with_database(fn conn ->
+      Process.put(:conn, conn)
+
+      ddl!(
+        conn,
+        "CREATE TABLE idt (id INT PRIMARY KEY, org_key VARCHAR(8) NOT NULL) ENGINE=InnoDB"
+      )
+
+      ddl!(conn, "INSERT INTO idt VALUES (1,'t1'), (2,'T1'), (3,'t1 '), (4,'t2')")
+      columns = %{id: %{type: :integer}, org_key: %{type: :string}}
+
+      for {filters, expected} <- [
+            {[{"org_key", {:between, "t1", "t1"}}], [[1]]},
+            {[{"org_key", {:gte, "t1"}}, {"org_key", {:lte, "t1"}}], [[1]]},
+            {[{"org_key", {:starts_with, "t1"}}], [[1], [3]]},
+            {[{"org_key", {:like, "t1%"}}], [[1], [3]]}
+          ] do
+        assert rows(scoped("idt", columns, filters)) == expected, inspect(filters)
+      end
+    end)
+  end
+
+  test "TIMESTAMP scope: patterns and lists refuse (R4), zero dates keep native semantics (R5)" do
+    with_database(fn conn ->
+      Process.put(:conn, conn)
+      ddl!(conn, "SET SESSION sql_mode = 'STRICT_TRANS_TABLES'")
+
+      ddl!(
+        conn,
+        "CREATE TABLE tzr (id INT PRIMARY KEY, ts TIMESTAMP NULL, dt DATETIME NULL) ENGINE=InnoDB"
+      )
+
+      ddl!(
+        conn,
+        "INSERT INTO tzr VALUES (1,'2023-06-01 00:00:00','3500-01-01 00:00:00'), " <>
+          "(2,'0000-00-00 00:00:00','1950-01-01 00:00:00'), (3,'2025-01-01 00:00:00','2023-01-01 00:00:00')"
+      )
+
+      ddl!(conn, "SET SESSION sql_mode = 'STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION'")
+      columns = %{id: %{type: :integer}, ts: %{type: :utc_datetime}, dt: %{type: :naive_datetime}}
+
+      for filter <- [{"ts", {:starts_with, "2023"}}, {"ts", {:like, "2023%"}}] do
+        assert rows(scoped("tzr", columns, [filter])) == :timestamp_operator
+      end
+
+      assert rows(scoped("tzr", columns, [{"ts", {:in, ["2023-06-01 00:00:00"]}}])) == [[1]]
+
+      for {filter, where} <- [
+            {{"ts", {:lt, "1960-01-01 00:00:00"}}, "ts < '1960-01-01 00:00:00'"},
+            {{"ts", {:gt, "1960-01-01 00:00:00"}}, "ts > '1960-01-01 00:00:00'"},
+            {{:not, {"ts", {:gt, "2024-01-01 00:00:00"}}}, "NOT (ts > '2024-01-01 00:00:00')"},
+            {{"dt", {:gt, "2024-01-01 00:00:00"}}, "dt > '2024-01-01 00:00:00'"}
+          ] do
+        assert rows(scoped("tzr", columns, [filter])) ==
+                 query!(conn, "SELECT id FROM tzr WHERE #{where} ORDER BY id"),
+               where
+      end
+    end)
+  end
+
+  test "computed columns over a TIMESTAMP stay zone-independent under CASE, = false and <> (R7)" do
+    with_database(fn conn ->
+      Process.put(:conn, conn)
+      ddl!(conn, "CREATE TABLE q1 (id INT PRIMARY KEY, ts TIMESTAMP NULL) ENGINE=InnoDB")
+
+      ddl!(
+        conn,
+        "INSERT INTO q1 VALUES (1,'2024-01-01 03:00:00'), (2,'2023-12-31 20:00:00'), " <>
+          "(3,'2023-12-31 21:00:00'), (4,'2024-01-02 00:00:00')"
+      )
+
+      ddl!(
+        conn,
+        "CREATE FUNCTION q1tz(i INT) RETURNS INT NOT DETERMINISTIC NO SQL BEGIN " <>
+          "IF i = 1 THEN SET @tz0 = @@session.time_zone; SET time_zone = '+05:00'; END IF; " <>
+          "IF i = 4 THEN SET time_zone = @tz0; END IF; RETURN 1; END"
+      )
+
+      ddl!(conn, "CREATE VIEW q1v AS SELECT * FROM q1 WHERE q1tz(id) = 1")
+
+      columns = %{
+        id: %{type: :integer},
+        ts: %{type: :utc_datetime},
+        flag: %{
+          type: :string,
+          computed: %{
+            kind: :expression,
+            expression: [
+              "case",
+              [["lt", "ts", "2024-01-01 00:00:00"], ["literal", "y"]],
+              ["else", ["literal", "n"]]
+            ]
+          }
+        },
+        early: %{
+          type: :boolean,
+          computed: %{kind: :predicate, expression: ["lt", "ts", "2024-01-01 00:00:00"]}
+        }
+      }
+
+      for filter <- [
+            {"flag", "n"},
+            {"flag", {:!=, "y"}},
+            {"early", false},
+            {"early", {:!=, true}}
+          ] do
+        assert rows(scoped("q1v", columns, [filter])) == [[1], [4]], inspect(filter)
+      end
+    end)
+  end
+
   defp update(table, id, note) do
     {:ok, command} =
       Command.new(%{
