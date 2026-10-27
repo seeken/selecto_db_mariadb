@@ -411,6 +411,17 @@ defmodule SelectoDBMariaDB.InsertAdmission do
 
   defp key_value(%Command{assignments: assignments}, key, column, insert_result) do
     case Enum.find(assignments, &(to_string(field_name(&1.field)) == key)) do
+      # MySQL generates a new AUTO_INCREMENT value for every assigned value it
+      # reads as zero (0, '0', '00', ' 0', '+0', 0.0, FALSE, ...) unless
+      # NO_AUTO_VALUE_ON_ZERO is set, so a re-read by the assigned value would
+      # check another row (an existing id 0) instead of the stored one
+      # (items 44, 52). On an AUTO_INCREMENT key only a canonical positive
+      # integer names the stored row; anything else is not evaluable.
+      %{value: {:literal, value}} when not is_nil(value) and column.auto_increment ->
+        if canonical_positive_integer?(value),
+          do: typed_key(value, column.type),
+          else: :error
+
       %{value: {:literal, value}} when not is_nil(value) ->
         typed_key(value, column.type)
 
@@ -429,6 +440,13 @@ defmodule SelectoDBMariaDB.InsertAdmission do
         :error
     end
   end
+
+  defp canonical_positive_integer?(value) when is_integer(value), do: value > 0
+
+  defp canonical_positive_integer?(value) when is_binary(value),
+    do: Regex.match?(~r/\A[1-9][0-9]*\z/, value)
+
+  defp canonical_positive_integer?(_value), do: false
 
   defp typed_key(value, type) when type in @integer_types and is_integer(value), do: {:ok, value}
 
