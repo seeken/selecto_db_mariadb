@@ -499,6 +499,50 @@ defmodule SelectoDBMariaDB.SessionStateIntegrationTest do
     end)
   end
 
+  test "a view's temporal column needs a proven direct base mapping (R40)" do
+    with_database(fn conn ->
+      Process.put(:conn, conn)
+
+      ddl!(
+        conn,
+        "CREATE TABLE r40 (id INT PRIMARY KEY, ts TIMESTAMP NULL, dt DATETIME NULL) ENGINE=InnoDB"
+      )
+
+      ddl!(
+        conn,
+        "INSERT INTO r40 VALUES (1, '2023-12-31 22:00:00', '2023-12-31 22:00:00'), " <>
+          "(2, '2024-01-01 03:00:00', '2024-01-01 03:00:00')"
+      )
+
+      # Reported as DATETIME, but derived from a TIMESTAMP: zone-dependent.
+      ddl!(conn, "CREATE VIEW r40_expr AS SELECT id, ts + INTERVAL 0 SECOND AS ts FROM r40")
+      # A base DATETIME and a base TIMESTAMP taken as they are.
+      ddl!(conn, "CREATE VIEW r40_direct AS SELECT id, dt, ts FROM r40")
+
+      domain = fn table, column, type ->
+        %{
+          name: table,
+          source: relation(table, %{:id => %{type: :integer}, column => %{type: type}}),
+          schemas: %{},
+          joins: %{},
+          required_filters: [{to_string(column), {:lt, "2024-01-01 00:00:00"}}]
+        }
+      end
+
+      assert rows(run_domain(domain.("r40_expr", :ts, :naive_datetime))) == :column_unresolved
+      assert rows(run_domain(domain.("r40_direct", :dt, :naive_datetime))) == [[1]]
+      assert rows(run_domain(domain.("r40_direct", :ts, :utc_datetime))) == [[1]]
+
+      selecto =
+        domain.("r40_direct", :ts, :utc_datetime)
+        |> Selecto.configure(conn, adapter: Adapter, validate: false)
+
+      assert {:ok, prepared} = Adapter.prepare_read(selecto, conn)
+      assert prepared.set.storage_column_types["r40_direct"]["ts"] == MapSet.new(["timestamp"])
+      assert prepared.set.storage_column_types["r40_direct"]["dt"] == MapSet.new(["datetime"])
+    end)
+  end
+
   test "a computed value read from a TIMESTAMP scope column is refused (R15)" do
     with_database(fn conn ->
       Process.put(:conn, conn)
