@@ -104,7 +104,12 @@ triggers or rules.
   `lower_case_table_names = 0` the lookup compares database and table names
   by bytes (`events` and `Events` are two tables), otherwise as the server
   folds them; a domain name that matches more than one table refuses
-  (`reason: :relation_ambiguous`).
+  (`reason: :relation_ambiguous`). A temporal column of a VIEW keeps its
+  reported type only when the view definition takes it as is from a base
+  table column (a TIMESTAMP source then compares by epoch); one derived by an
+  expression (`ts + INTERVAL 0 SECOND` reports DATETIME but follows the
+  session time zone), an alias or a nested view refuses scope compares
+  (`reason: :column_unresolved`).
 - A Selecto read refuses a relation a TEMPORARY table shadows
   (`query_rule_not_evaluable`, `reason: :temporary_shadow`); a row trigger
   can create one for the rest of the session. Unrelated temporary tables

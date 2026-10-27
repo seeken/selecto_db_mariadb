@@ -296,6 +296,7 @@ defmodule SelectoDBMariaDB.Adapter do
                   end)
                 end)
 
+              types = prove_view_temporals(connection, rows, types)
               set = Map.get(selecto, :set) || %{}
 
               set =
@@ -313,6 +314,95 @@ defmodule SelectoDBMariaDB.Adapter do
   end
 
   def prepare_read(selecto, _connection), do: {:ok, selecto}
+
+  # R40: a view's temporal column keeps its reported type only when the view
+  # definition proves it is a base-table column taken as is
+  # ("`db`.`t`.`col` AS `name`" or "`t`.`col` AS `name`" as a whole select
+  # item, the base a BASE TABLE). A direct TIMESTAMP source is TIMESTAMP
+  # (epoch compares); anything else (an expression such as
+  # `ts + INTERVAL 0 SECOND`, an alias, a nested view) is unproven and a
+  # scope compare on it refuses.
+  @temporal_types ~w(datetime timestamp date time year)
+
+  defp prove_view_temporals(connection, rows, types) do
+    views =
+      rows
+      |> Enum.filter(fn [_tag, _schema, _table, _column, type] ->
+        String.downcase(to_string(type)) in @temporal_types
+      end)
+      |> Enum.map(fn [tag, schema, table, column, _type] ->
+        {to_string(tag), to_string(schema), to_string(table), to_string(column)}
+      end)
+
+    relations = views |> Enum.map(fn {_, s, t, _} -> {s, t} end) |> Enum.uniq()
+
+    with [_ | _] <- relations,
+         {:ok, %{rows: definitions}} <-
+           execute(
+             connection,
+             Enum.map_join(relations, " UNION ALL ", fn _ ->
+               "SELECT TABLE_SCHEMA, TABLE_NAME, VIEW_DEFINITION FROM information_schema.VIEWS " <>
+                 "WHERE BINARY TABLE_SCHEMA = BINARY ? AND BINARY TABLE_NAME = BINARY ?"
+             end),
+             Enum.flat_map(relations, fn {s, t} -> [s, t] end),
+             []
+           ) do
+      definitions =
+        Map.new(definitions, fn [s, t, d] ->
+          {{to_string(s), to_string(t)}, to_string(d || "")}
+        end)
+
+      Enum.reduce(views, types, fn {tag, schema, table, column}, acc ->
+        case Map.fetch(definitions, {schema, table}) do
+          :error ->
+            acc
+
+          {:ok, definition} ->
+            kind = view_column_source(connection, schema, definition, column)
+            put_in(acc, [tag, String.downcase(column)], MapSet.new([kind]))
+        end
+      end)
+    else
+      [] -> types
+      _error -> mark_unproven(views, types)
+    end
+  end
+
+  defp view_column_source(connection, schema, definition, column) do
+    ident = "`((?:[^`]|``)+)`"
+    target = Regex.escape(String.replace(column, "`", "``"))
+
+    pattern =
+      ~r/(?:\bselect\s+|,)\s*(?:#{ident}\.)?#{ident}\.#{ident}\s+AS\s+`#{target}`\s*(?:,|\s+from\b)/i
+
+    case Regex.run(pattern, definition, capture: :all_but_first) do
+      [db, base, base_column] ->
+        db = if db == "", do: schema, else: String.replace(db, "``", "`")
+
+        case execute(
+               connection,
+               "SELECT c.DATA_TYPE FROM information_schema.COLUMNS c " <>
+                 "JOIN information_schema.TABLES t ON t.TABLE_SCHEMA = c.TABLE_SCHEMA " <>
+                 "AND t.TABLE_NAME = c.TABLE_NAME AND t.TABLE_TYPE = 'BASE TABLE' " <>
+                 "WHERE BINARY c.TABLE_SCHEMA = BINARY ? AND BINARY c.TABLE_NAME = BINARY ? " <>
+                 "AND c.COLUMN_NAME = ?",
+               [db, String.replace(base, "``", "`"), String.replace(base_column, "``", "`")],
+               []
+             ) do
+          {:ok, %{rows: [[type]]}} -> String.downcase(to_string(type))
+          _ -> "selecto_unproven_temporal"
+        end
+
+      _ ->
+        "selecto_unproven_temporal"
+    end
+  end
+
+  defp mark_unproven(views, types) do
+    Enum.reduce(views, types, fn {tag, _schema, _table, column}, acc ->
+      put_in(acc, [tag, String.downcase(column)], MapSet.new(["selecto_unproven_temporal"]))
+    end)
+  end
 
   # Every relation a domain names: source and schema tables, association
   # bridges.
