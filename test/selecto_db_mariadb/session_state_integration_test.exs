@@ -568,7 +568,10 @@ defmodule SelectoDBMariaDB.SessionStateIntegrationTest do
          "SELECT r40b.id, r40b.k FROM (SELECT id, DATE_FORMAT(ts, '%Y') AS k FROM r40b) r40b"},
         # A literal that looks like a passthrough item (R40c addition).
         {"v_literal",
-         "SELECT id, CONCAT('`x`.`r40b`.`k` AS `k`', DATE_FORMAT(ts, '%Y')) AS k FROM r40b"}
+         "SELECT id, CONCAT('`x`.`r40b`.`k` AS `k`', DATE_FORMAT(ts, '%Y')) AS k FROM r40b"},
+        # A backslash-escaped quote hiding a fake item (R40d).
+        {"v_backslash",
+         "SELECT id, 'a\\', `r40b`.`k` AS `k`, \\'b' AS junk, DATE_FORMAT(ts, '%Y') AS k FROM r40b"}
       ]
 
       for {name, sql} <- views, do: ddl!(conn, "CREATE VIEW #{name} AS #{sql}")

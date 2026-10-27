@@ -331,11 +331,12 @@ defmodule SelectoDBMariaDB.Adapter do
   # on it refuses (column_unresolved), whatever type the view reports.
   defp prove_view_columns(connection, rows, types) do
     columns =
-      Enum.map(rows, fn [tag, schema, table, column, _type] ->
-        {to_string(tag), to_string(schema), to_string(table), to_string(column)}
+      Enum.map(rows, fn [tag, schema, table, column, type] ->
+        {to_string(tag), to_string(schema), to_string(table), to_string(column),
+         String.downcase(to_string(type))}
       end)
 
-    relations = columns |> Enum.map(fn {_, s, t, _} -> {s, t} end) |> Enum.uniq()
+    relations = columns |> Enum.map(fn {_, s, t, _, _} -> {s, t} end) |> Enum.uniq()
 
     with [_ | _] <- relations,
          {:ok, %{rows: definitions}} <-
@@ -353,13 +354,18 @@ defmodule SelectoDBMariaDB.Adapter do
           {{to_string(s), to_string(t)}, to_string(d || "")}
         end)
 
-      Enum.reduce(columns, types, fn {tag, schema, table, column}, acc ->
+      Enum.reduce(columns, types, fn {tag, schema, table, column, reported}, acc ->
         case Map.fetch(definitions, {schema, table}) do
           :error ->
             acc
 
           {:ok, definition} ->
-            kind = view_column_type(connection, schema, table, definition, column)
+            kind =
+              case view_column_type(connection, schema, table, definition, column) do
+                @unproven -> unproven_type(connection, schema, table, reported)
+                proven -> proven
+              end
+
             put_in(acc, [tag, String.downcase(column)], MapSet.new([kind]))
         end
       end)
@@ -371,8 +377,47 @@ defmodule SelectoDBMariaDB.Adapter do
 
   @unproven "selecto_unproven_view_column"
 
+  # R40d: without a proof, only a numeric, boolean or uuid column keeps its
+  # reported type, and only when no base table the view uses has a
+  # TIMESTAMP column; temporal and text columns, or an uncertain scan,
+  # refuse.
+  @plain_reported ~w(tinyint smallint mediumint int integer bigint float double real bit bool boolean uuid)
+
+  defp unproven_type(connection, schema, view, reported) do
+    numeric? =
+      reported in @plain_reported or String.starts_with?(reported, ["decimal", "numeric"])
+
+    if numeric? and not timestamp_reachable?(connection, schema, view),
+      do: reported,
+      else: @unproven
+  end
+
+  defp timestamp_reachable?(connection, schema, view) do
+    if @view_column_usage do
+      case execute(
+             connection,
+             "SELECT COUNT(*) FROM information_schema.VIEW_TABLE_USAGE u " <>
+               "JOIN information_schema.COLUMNS c ON BINARY c.TABLE_SCHEMA = BINARY u.TABLE_SCHEMA " <>
+               "AND BINARY c.TABLE_NAME = BINARY u.TABLE_NAME " <>
+               "WHERE BINARY u.VIEW_SCHEMA = BINARY ? AND BINARY u.VIEW_NAME = BINARY ? " <>
+               "AND c.DATA_TYPE = 'timestamp'",
+             [schema, view],
+             []
+           ) do
+        {:ok, %{rows: [[0]]}} -> false
+        _ -> true
+      end
+    else
+      # MariaDB lists no view's base tables: assume one could.
+      true
+    end
+  end
+
   defp view_column_type(connection, schema, view, definition, column) do
-    with {:ok, branches} <- view_branches(definition),
+    # R40d: a backslash anywhere in the view text (MySQL and MariaDB store
+    # \' escapes in string literals) makes the scan uncertain: no proof.
+    with false <- String.contains?(definition, "\\"),
+         {:ok, branches} <- view_branches(definition),
          sources when is_list(sources) <-
            Enum.reduce_while(branches, [], fn branch, acc ->
              case branch_source(branch, schema, column) do
@@ -401,7 +446,12 @@ defmodule SelectoDBMariaDB.Adapter do
       |> split_top(~r/\Aunion(?:\s+(?:all|distinct))?\b/i)
       |> Enum.map(&strip_parens/1)
 
-    if Enum.all?(branches, &Regex.match?(~r/\Aselect\s/i, &1)), do: {:ok, branches}, else: :error
+    # R40d: one SELECT only, with no subquery or derived table anywhere.
+    single? = match?([_], branches) and not Regex.match?(~r/\(\s*select\b/i, definition)
+
+    if single? and Enum.all?(branches, &Regex.match?(~r/\Aselect\s/i, &1)),
+      do: {:ok, branches},
+      else: :error
   end
 
   # {db, table, column} of the base column the branch's item `column` passes
@@ -574,7 +624,7 @@ defmodule SelectoDBMariaDB.Adapter do
   defp unescape(name), do: String.replace(name || "", "``", "`")
 
   defp mark_unproven(columns, types) do
-    Enum.reduce(columns, types, fn {tag, _schema, _table, column}, acc ->
+    Enum.reduce(columns, types, fn {tag, _schema, _table, column, _reported}, acc ->
       put_in(acc, [tag, String.downcase(column)], MapSet.new([@unproven]))
     end)
   end
