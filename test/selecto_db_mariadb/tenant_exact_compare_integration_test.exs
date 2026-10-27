@@ -42,7 +42,8 @@ defmodule SelectoDBMariaDB.TenantExactCompareIntegrationTest do
         end)
       end
 
-      test "a required tenant predicate and an IN list compare exactly", ctx do
+      test "a required tenant predicate compares exactly; the caller's own IN and != stay native",
+           ctx do
         with_tenant_tables(ctx.collation, fn conn ->
           required =
             conn
@@ -52,13 +53,22 @@ defmodule SelectoDBMariaDB.TenantExactCompareIntegrationTest do
 
           assert ids(required) == @t1_orders
 
+          # R12 / item 55: the caller's own filters keep the column's
+          # native semantics, = and IN as much as ranges.
+          native = fn where ->
+            conn
+            |> ddl!("SELECT id FROM orders WHERE #{where} ORDER BY id")
+            |> Map.fetch!(:rows)
+            |> Enum.map(&hd/1)
+          end
+
           listed =
             conn
             |> configure()
             |> Selecto.filter([{"tenant_id", {:in, ["t1", "t9"]}}])
             |> Selecto.select(["id"])
 
-          assert ids(listed) == @t1_orders
+          assert ids(listed) == native.("tenant_id IN ('t1', 't9')")
 
           excluded =
             conn
@@ -66,7 +76,7 @@ defmodule SelectoDBMariaDB.TenantExactCompareIntegrationTest do
             |> Selecto.filter([{"tenant_id", {"!=", "t1"}}])
             |> Selecto.select(["id"])
 
-          assert ids(excluded) == [11, 12, 13]
+          assert ids(excluded) == native.("tenant_id <> 't1'")
         end)
       end
 
