@@ -138,10 +138,10 @@ defmodule SelectoDBMariaDB.Adapter do
   def stream(connection, query, params, opts) do
     connection = resolve_connection(connection)
 
-    # A Selecto read's stream (Selecto.Executor.selecto_read?/0, captured
+    # A Selecto read's stream (Selecto.Executor.selecto_read?/1, captured
     # here: the producer runs in its own process) refuses TEMPORARY shadows.
     opts =
-      if Selecto.Executor.selecto_read?(),
+      if Selecto.Executor.selecto_read?(opts),
         do: Keyword.put(opts, :selecto_session_guard, true),
         else: opts
 
@@ -197,10 +197,10 @@ defmodule SelectoDBMariaDB.Adapter do
   end
 
   # A Selecto read (marked by Selecto's executor,
-  # Selecto.Executor.selecto_read?/0) first refuses a relation a TEMPORARY
+  # Selecto.Executor.selecto_read?/1) first refuses a relation a TEMPORARY
   # table shadows.
   defp execute_checked(connection, query, params, opts) do
-    if Selecto.Executor.selecto_read?() do
+    if Selecto.Executor.selecto_read?(opts) do
       with :ok <- Session.refuse_temporary_shadows(connection, query, opts) do
         execute_unchecked(connection, query, params, opts)
       end
@@ -219,46 +219,84 @@ defmodule SelectoDBMariaDB.Adapter do
   def prepare_read(%{domain: domain} = selecto, connection) when is_map(domain) do
     domains = [domain | Enum.map(Selecto.Executor.set_operands(selecto), &Map.get(&1, :domain))]
 
-    case domains
-         |> Enum.reduce([], &collect_relations/2)
-         |> Enum.uniq()
-         |> Enum.flat_map(&split_relation/1) do
+    names = domains |> Enum.reduce([], &collect_relations/2) |> Enum.uniq()
+
+    case Enum.flat_map(names, fn name -> Enum.map(split_relation(name), &{name, &1}) end) do
       [] ->
         {:ok, selecto}
 
       relations ->
-        conditions =
-          Enum.map_join(relations, " OR ", fn
-            {nil, _table} -> "(TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?)"
-            {_schema, _table} -> "(TABLE_SCHEMA = ? AND TABLE_NAME = ?)"
+        # One query per relation, tagged with the domain's own name for it,
+        # so the types are keyed by the exact (database, table) the server
+        # resolves for that name, then column (R18, R31). Names are never
+        # case-folded: with lower_case_table_names = 0 the database and
+        # table match by BINARY comparison (`rv_v` and `rv_V` are two
+        # tables); otherwise the server folds them and so does the match.
+        # A name that matches more than one table refuses (fail closed).
+        name_match = fn column ->
+          "(BINARY #{column} = BINARY ? OR (@@lower_case_table_names <> 0 AND #{column} = ?))"
+        end
+
+        sql =
+          Enum.map_join(relations, " UNION ALL ", fn
+            {_name, {nil, _table}} ->
+              "SELECT ? AS selecto_relation, TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, DATA_TYPE " <>
+                "FROM information_schema.COLUMNS WHERE BINARY TABLE_SCHEMA = BINARY DATABASE() " <>
+                "AND " <> name_match.("TABLE_NAME")
+
+            {_name, {_schema, _table}} ->
+              "SELECT ? AS selecto_relation, TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, DATA_TYPE " <>
+                "FROM information_schema.COLUMNS WHERE " <>
+                name_match.("TABLE_SCHEMA") <> " AND " <> name_match.("TABLE_NAME")
           end)
 
         params =
           Enum.flat_map(relations, fn
-            {nil, table} -> [table]
-            {schema, table} -> [schema, table]
+            {name, {nil, table}} -> [name, table, table]
+            {name, {schema, table}} -> [name, schema, schema, table, table]
           end)
-
-        sql =
-          "SELECT COLUMN_NAME, DATA_TYPE FROM information_schema.COLUMNS WHERE " <> conditions
 
         case execute(connection, sql, params, []) do
           {:ok, %{rows: rows}} ->
-            types =
-              Enum.reduce(rows, %{}, fn [column, type], acc ->
-                key = column |> to_string() |> String.downcase()
-                type = type |> to_string() |> String.downcase()
-                Map.update(acc, key, MapSet.new([type]), &MapSet.put(&1, type))
-              end)
+            ambiguous =
+              rows
+              |> Enum.group_by(&hd/1, fn [_, schema, table | _] -> {schema, table} end)
+              |> Enum.filter(fn {_name, tables} -> length(Enum.uniq(tables)) > 1 end)
+              |> Enum.map(&elem(&1, 0))
 
-            set = Map.get(selecto, :set) || %{}
+            if ambiguous != [] do
+              {:error,
+               %Selecto.Error{
+                 type: :query_enforcement,
+                 message: "a domain relation name matches more than one table",
+                 details: %{
+                   code: :query_rule_not_evaluable,
+                   reason: :relation_ambiguous,
+                   relations: ambiguous,
+                   adapter: :mariadb
+                 }
+               }}
+            else
+              types =
+                Enum.reduce(rows, %{}, fn [relation, _schema, _table, column, type], acc ->
+                  relation = to_string(relation)
+                  column = column |> to_string() |> String.downcase()
+                  type = type |> to_string() |> String.downcase()
 
-            set =
-              set
-              |> Map.put(:storage_column_types, types)
-              |> Map.put(:zone_independent_timestamps, true)
+                  Map.update(acc, relation, %{column => MapSet.new([type])}, fn columns ->
+                    Map.update(columns, column, MapSet.new([type]), &MapSet.put(&1, type))
+                  end)
+                end)
 
-            {:ok, %{selecto | set: set}}
+              set = Map.get(selecto, :set) || %{}
+
+              set =
+                set
+                |> Map.put(:storage_column_types, types)
+                |> Map.put(:zone_independent_timestamps, true)
+
+              {:ok, %{selecto | set: set}}
+            end
 
           {:error, _} = error ->
             error
