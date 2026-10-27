@@ -543,6 +543,68 @@ defmodule SelectoDBMariaDB.SessionStateIntegrationTest do
     end)
   end
 
+  test "any view column in a scope compare needs a passthrough proof in every branch (R40b, R40c)" do
+    with_database(fn conn ->
+      Process.put(:conn, conn)
+
+      ddl!(
+        conn,
+        "CREATE TABLE r40b (id INT PRIMARY KEY, ts TIMESTAMP NULL, k VARCHAR(10)) ENGINE=InnoDB"
+      )
+
+      ddl!(
+        conn,
+        "INSERT INTO r40b VALUES (1, '2023-12-31 22:00:00', 'a'), (2, '2024-01-01 03:00:00', 'b')"
+      )
+
+      views = [
+        # Reported VARCHAR, but zone-dependent.
+        {"v_fmt", "SELECT id, DATE_FORMAT(ts, '%Y-%m-%d %H') AS k FROM r40b"},
+        # A UNION whose first branch is an expression.
+        {"v_union",
+         "SELECT id, DATE_FORMAT(ts, '%Y') AS k FROM r40b WHERE id = 1 UNION ALL SELECT id, k FROM r40b WHERE id = 2"},
+        # A derived table aliased like the base table.
+        {"v_derived",
+         "SELECT r40b.id, r40b.k FROM (SELECT id, DATE_FORMAT(ts, '%Y') AS k FROM r40b) r40b"},
+        # A literal that looks like a passthrough item (R40c addition).
+        {"v_literal",
+         "SELECT id, CONCAT('`x`.`r40b`.`k` AS `k`', DATE_FORMAT(ts, '%Y')) AS k FROM r40b"}
+      ]
+
+      for {name, sql} <- views, do: ddl!(conn, "CREATE VIEW #{name} AS #{sql}")
+      ddl!(conn, "CREATE VIEW v_plain AS SELECT b.id, b.k FROM r40b b")
+
+      domain = fn table ->
+        %{
+          name: table,
+          source: relation(table, %{id: %{type: :integer}, k: %{type: :string}}),
+          schemas: %{},
+          joins: %{},
+          required_filters: [{"k", {:gte, "2"}}]
+        }
+      end
+
+      for {name, _sql} <- views do
+        assert rows(run_domain(domain.(name))) == :column_unresolved, name
+      end
+
+      # A proven passthrough keeps the base column's type.
+      assert rows(run_domain(domain.("v_plain"))) == [[1], [2]]
+
+      # The caller's own filters on such a column keep working.
+      result =
+        domain.("v_fmt")
+        |> Map.put(:required_filters, [])
+        |> Selecto.configure(conn, adapter: Adapter, validate: false)
+        |> Selecto.select(["id"])
+        |> Selecto.filter({"k", {:gte, "2"}})
+        |> Selecto.order_by(["id"])
+        |> Selecto.execute()
+
+      assert {:ok, {_rows, _columns, _aliases}} = result
+    end)
+  end
+
   test "a computed value read from a TIMESTAMP scope column is refused (R15)" do
     with_database(fn conn ->
       Process.put(:conn, conn)

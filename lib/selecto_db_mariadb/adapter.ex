@@ -296,7 +296,7 @@ defmodule SelectoDBMariaDB.Adapter do
                   end)
                 end)
 
-              types = prove_view_temporals(connection, rows, types)
+              types = prove_view_columns(connection, rows, types)
               set = Map.get(selecto, :set) || %{}
 
               set =
@@ -315,26 +315,27 @@ defmodule SelectoDBMariaDB.Adapter do
 
   def prepare_read(selecto, _connection), do: {:ok, selecto}
 
-  # R40: a view's temporal column keeps its reported type only when the view
-  # definition proves it is a base-table column taken as is
-  # ("`db`.`t`.`col` AS `name`" or "`t`.`col` AS `name`" as a whole select
-  # item, the base a BASE TABLE). A direct TIMESTAMP source is TIMESTAMP
-  # (epoch compares); anything else (an expression such as
-  # `ts + INTERVAL 0 SECOND`, an alias, a nested view) is unproven and a
-  # scope compare on it refuses.
-  @temporal_types ~w(datetime timestamp date time year)
-
-  defp prove_view_temporals(connection, rows, types) do
-    views =
-      rows
-      |> Enum.filter(fn [_tag, _schema, _table, _column, type] ->
-        String.downcase(to_string(type)) in @temporal_types
-      end)
-      |> Enum.map(fn [tag, schema, table, column, _type] ->
+  # MySQL lists a view's base tables in information_schema.VIEW_TABLE_USAGE;
+  # MariaDB has no such table (the shape test alone proves the column).
+  @view_column_usage false
+  # R40, R40b, R40c: a column of a VIEW used in a scope compare keeps a type
+  # only when the view text proves it is a base-table column passed through
+  # as is: the view is one plain SELECT (or a UNION whose every branch is
+  # one) whose FROM list holds only base tables, and the column's item is
+  # exactly `alias`.`col` AS `name` with the alias naming one of them; on
+  # MySQL, information_schema.VIEW_TABLE_USAGE must also list that base
+  # table (MySQL 8.4 has no VIEW_COLUMN_USAGE; the shape test proves the
+  # column). The column then takes the base column's type (a TIMESTAMP
+  # compares by epoch). Anything else (DATE_FORMAT(ts), ts + INTERVAL 0
+  # SECOND, a derived table, a nested view) is unproven and a scope compare
+  # on it refuses (column_unresolved), whatever type the view reports.
+  defp prove_view_columns(connection, rows, types) do
+    columns =
+      Enum.map(rows, fn [tag, schema, table, column, _type] ->
         {to_string(tag), to_string(schema), to_string(table), to_string(column)}
       end)
 
-    relations = views |> Enum.map(fn {_, s, t, _} -> {s, t} end) |> Enum.uniq()
+    relations = columns |> Enum.map(fn {_, s, t, _} -> {s, t} end) |> Enum.uniq()
 
     with [_ | _] <- relations,
          {:ok, %{rows: definitions}} <-
@@ -352,55 +353,229 @@ defmodule SelectoDBMariaDB.Adapter do
           {{to_string(s), to_string(t)}, to_string(d || "")}
         end)
 
-      Enum.reduce(views, types, fn {tag, schema, table, column}, acc ->
+      Enum.reduce(columns, types, fn {tag, schema, table, column}, acc ->
         case Map.fetch(definitions, {schema, table}) do
           :error ->
             acc
 
           {:ok, definition} ->
-            kind = view_column_source(connection, schema, definition, column)
+            kind = view_column_type(connection, schema, table, definition, column)
             put_in(acc, [tag, String.downcase(column)], MapSet.new([kind]))
         end
       end)
     else
       [] -> types
-      _error -> mark_unproven(views, types)
+      _error -> mark_unproven(columns, types)
     end
   end
 
-  defp view_column_source(connection, schema, definition, column) do
+  @unproven "selecto_unproven_view_column"
+
+  defp view_column_type(connection, schema, view, definition, column) do
+    with {:ok, branches} <- view_branches(definition),
+         sources when is_list(sources) <-
+           Enum.reduce_while(branches, [], fn branch, acc ->
+             case branch_source(branch, schema, column) do
+               {:ok, source} -> {:cont, [source | acc]}
+               :error -> {:halt, :error}
+             end
+           end),
+         types when is_list(types) <-
+           Enum.reduce_while(sources, [], fn source, acc ->
+             case base_column_type(connection, schema, view, source) do
+               {:ok, type} -> {:cont, [type | acc]}
+               :error -> {:halt, :error}
+             end
+           end),
+         [type] <- Enum.uniq(types) do
+      type
+    else
+      _ -> @unproven
+    end
+  end
+
+  # The view's SELECT branches (a UNION's every branch), each one plain.
+  defp view_branches(definition) do
+    branches =
+      definition
+      |> split_top(~r/\Aunion(?:\s+(?:all|distinct))?\b/i)
+      |> Enum.map(&strip_parens/1)
+
+    if Enum.all?(branches, &Regex.match?(~r/\Aselect\s/i, &1)), do: {:ok, branches}, else: :error
+  end
+
+  # {db, table, column} of the base column the branch's item `column` passes
+  # through, or :error.
+  defp branch_source(branch, schema, column) do
+    body = Regex.replace(~r/\Aselect\s+(?:distinct\s+)?/i, branch, "")
+
+    with [items, from] <- split_top(body, ~r/\Afrom\b/i, 2),
+         [from | _] <- split_top(from, ~r/\A(?:where|group|having|order|limit|window)\b/i, 2),
+         {:ok, tables} <- from_tables(from, schema),
+         ident = "`((?:[^`]|``)+)`",
+         target = "`" <> Regex.escape(String.replace(column, "`", "``")) <> "`",
+         [_ | _] = matches <-
+           items
+           |> split_top(~r/\A,/)
+           |> Enum.map(&String.trim/1)
+           |> Enum.map(
+             &Regex.run(~r/\A(?:#{ident}\.)?#{ident}\.#{ident}\s+AS\s+#{target}\z/i, &1,
+               capture: :all_but_first
+             )
+           )
+           |> Enum.reject(&is_nil/1),
+         [[db, qualifier, base_column]] <- matches,
+         {:ok, {base_db, base_table}} <- Map.fetch(tables, {unescape(db), unescape(qualifier)}) do
+      {:ok, {base_db, base_table, unescape(base_column)}}
+    else
+      _ -> :error
+    end
+  end
+
+  # alias (and table name) => {db, table} for a FROM list of base-table
+  # references only (comma lists and joins); a derived table refuses.
+  defp from_tables(from, schema) do
     ident = "`((?:[^`]|``)+)`"
-    target = Regex.escape(String.replace(column, "`", "``"))
 
-    pattern =
-      ~r/(?:\bselect\s+|,)\s*(?:#{ident}\.)?#{ident}\.#{ident}\s+AS\s+`#{target}`\s*(?:,|\s+from\b)/i
+    items =
+      from
+      |> split_top(
+        ~r/\A(?:,|(?:(?:natural|inner|cross|straight_join|left|right)(?:\s+outer)?\s+)*join\b|straight_join\b)/i
+      )
+      |> Enum.map(&String.trim/1)
+      |> Enum.reject(&(&1 == ""))
+      |> Enum.map(&(&1 |> split_top(~r/\A(?:on|using)\b/i, 2) |> hd() |> String.trim()))
 
-    case Regex.run(pattern, definition, capture: :all_but_first) do
-      [db, base, base_column] ->
-        db = if db == "", do: schema, else: String.replace(db, "``", "`")
+    Enum.reduce_while(items, {:ok, %{}}, fn item, {:ok, acc} ->
+      case Regex.run(~r/\A(?:#{ident}\.)?#{ident}(?:\s+(?:AS\s+)?#{ident})?\z/i, item,
+             capture: :all_but_first
+           ) do
+        nil ->
+          {:halt, :error}
 
-        case execute(
-               connection,
-               "SELECT c.DATA_TYPE FROM information_schema.COLUMNS c " <>
-                 "JOIN information_schema.TABLES t ON t.TABLE_SCHEMA = c.TABLE_SCHEMA " <>
-                 "AND t.TABLE_NAME = c.TABLE_NAME AND t.TABLE_TYPE = 'BASE TABLE' " <>
-                 "WHERE BINARY c.TABLE_SCHEMA = BINARY ? AND BINARY c.TABLE_NAME = BINARY ? " <>
-                 "AND c.COLUMN_NAME = ?",
-               [db, String.replace(base, "``", "`"), String.replace(base_column, "``", "`")],
-               []
-             ) do
-          {:ok, %{rows: [[type]]}} -> String.downcase(to_string(type))
-          _ -> "selecto_unproven_temporal"
-        end
+        parts ->
+          [db, table | alias] = parts ++ []
+          db = if db == "", do: schema, else: unescape(db)
+          table = unescape(table)
 
-      _ ->
-        "selecto_unproven_temporal"
+          name =
+            case alias do
+              [a] when a != "" -> unescape(a)
+              _ -> table
+            end
+
+          acc = Map.put(acc, {"", name}, {db, table})
+          acc = if alias in [[], [""]], do: Map.put(acc, {db, table}, {db, table}), else: acc
+          {:cont, {:ok, acc}}
+      end
+    end)
+  end
+
+  defp base_column_type(connection, schema, view, {db, table, column}) do
+    vcu =
+      if @view_column_usage,
+        do:
+          " AND EXISTS (SELECT 1 FROM information_schema.VIEW_TABLE_USAGE u " <>
+            "WHERE BINARY u.VIEW_SCHEMA = BINARY ? AND BINARY u.VIEW_NAME = BINARY ? " <>
+            "AND BINARY u.TABLE_SCHEMA = BINARY c.TABLE_SCHEMA AND BINARY u.TABLE_NAME = BINARY c.TABLE_NAME)",
+        else: ""
+
+    params = [db, table, column] ++ if(@view_column_usage, do: [schema, view], else: [])
+
+    case execute(
+           connection,
+           "SELECT #{@storage_type_sql} FROM information_schema.COLUMNS c " <>
+             "JOIN information_schema.TABLES t ON t.TABLE_SCHEMA = c.TABLE_SCHEMA " <>
+             "AND t.TABLE_NAME = c.TABLE_NAME AND t.TABLE_TYPE = 'BASE TABLE' " <>
+             "WHERE BINARY c.TABLE_SCHEMA = BINARY ? AND BINARY c.TABLE_NAME = BINARY ? " <>
+             "AND c.COLUMN_NAME = ?" <> vcu,
+           params,
+           []
+         ) do
+      {:ok, %{rows: [[type]]}} -> {:ok, String.downcase(to_string(type))}
+      _ -> :error
     end
   end
 
-  defp mark_unproven(views, types) do
-    Enum.reduce(views, types, fn {tag, _schema, _table, column}, acc ->
-      put_in(acc, [tag, String.downcase(column)], MapSet.new(["selecto_unproven_temporal"]))
+  # Splits `text` where `separator` matches at parenthesis depth 0, outside
+  # backtick identifiers and string literals (at most `parts` pieces).
+  defp split_top(text, separator, parts \\ :infinity),
+    do: split_top(text, separator, parts, 0, 0, nil, [])
+
+  defp split_top(text, _separator, _parts, start, i, _quote, acc) when i >= byte_size(text),
+    do: Enum.reverse([binary_part(text, start, byte_size(text) - start) | acc])
+
+  defp split_top(text, separator, parts, start, i, quote, acc) do
+    char = :binary.at(text, i)
+    boundary? = i == 0 or not word_char?(:binary.at(text, i - 1)) or char == ?,
+
+    match =
+      if quote == nil and char not in [?`, ?', ?", ?(] and boundary? and
+           (parts == :infinity or length(acc) + 1 < parts),
+         do: Regex.run(separator, binary_part(text, i, byte_size(text) - i)),
+         else: nil
+
+    cond do
+      quote != nil ->
+        split_top(
+          text,
+          separator,
+          parts,
+          start,
+          i + 1,
+          if(char == quote, do: nil, else: quote),
+          acc
+        )
+
+      char in [?`, ?', ?"] ->
+        split_top(text, separator, parts, start, i + 1, char, acc)
+
+      char == ?( ->
+        close = matching_paren(text, i)
+        split_top(text, separator, parts, start, close + 1, nil, acc)
+
+      match != nil ->
+        piece = binary_part(text, start, i - start)
+        next = i + byte_size(hd(match))
+        split_top(text, separator, parts, next, next, nil, [piece | acc])
+
+      true ->
+        split_top(text, separator, parts, start, i + 1, nil, acc)
+    end
+  end
+
+  defp matching_paren(text, i), do: matching_paren(text, i + 1, 1, nil)
+
+  defp matching_paren(text, i, _depth, _quote) when i >= byte_size(text), do: byte_size(text) - 1
+
+  defp matching_paren(text, i, depth, quote) do
+    char = :binary.at(text, i)
+
+    cond do
+      quote != nil -> matching_paren(text, i + 1, depth, if(char == quote, do: nil, else: quote))
+      char in [?`, ?', ?"] -> matching_paren(text, i + 1, depth, char)
+      char == ?( -> matching_paren(text, i + 1, depth + 1, nil)
+      char == ?) and depth == 1 -> i
+      char == ?) -> matching_paren(text, i + 1, depth - 1, nil)
+      true -> matching_paren(text, i + 1, depth, nil)
+    end
+  end
+
+  defp word_char?(char), do: char in ?a..?z or char in ?A..?Z or char in ?0..?9 or char == ?_
+
+  defp strip_parens(text) do
+    text = String.trim(text)
+
+    if String.starts_with?(text, "(") and matching_paren(text, 0) == byte_size(text) - 1,
+      do: strip_parens(binary_part(text, 1, byte_size(text) - 2)),
+      else: text
+  end
+
+  defp unescape(name), do: String.replace(name || "", "``", "`")
+
+  defp mark_unproven(columns, types) do
+    Enum.reduce(columns, types, fn {tag, _schema, _table, column}, acc ->
+      put_in(acc, [tag, String.downcase(column)], MapSet.new([@unproven]))
     end)
   end
 
