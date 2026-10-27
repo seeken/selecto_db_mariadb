@@ -180,13 +180,111 @@ defmodule SelectoDBMariaDB.Adapter do
   defp execute_direct(connection, query, params, opts) do
     if dependency_available?() do
       with :ok <- require_binary_protocol(opts) do
-        Session.run(connection, &execute_unchecked(&1, query, params, opts), opts)
+        Session.run(connection, &execute_checked(&1, query, params, opts), opts)
       end
     else
       {:error, @missing_dependency}
     end
   rescue
     error in DBConnection.ConnectionError -> {:error, sanitize_error(error)}
+  end
+
+  # A Selecto read (`selecto_read: true`, set by Selecto's executor) first
+  # refuses a relation a TEMPORARY table shadows.
+  defp execute_checked(connection, query, params, opts) do
+    if Keyword.get(opts, :selecto_read) == true do
+      with :ok <- Session.refuse_temporary_shadows(connection, query, opts) do
+        execute_unchecked(connection, query, params, Keyword.delete(opts, :selecto_read))
+      end
+    else
+      execute_unchecked(connection, query, params, opts)
+    end
+  end
+
+  @doc false
+  # Before a read compiles (Selecto.Executor.prepare_read/1): the storage
+  # data types of every column of the domain's relations, so a scope
+  # comparison on a TIMESTAMP column compiles zone-independently
+  # (Selecto.Builder.ExactCompare.zone_column?/3, item 62a). Resolved in the
+  # database each relation names (the connection's current one when it
+  # names none).
+  def prepare_read(%{domain: domain} = selecto, connection) when is_map(domain) do
+    case domain |> collect_relations([]) |> Enum.uniq() |> Enum.flat_map(&split_relation/1) do
+      [] ->
+        {:ok, selecto}
+
+      relations ->
+        conditions =
+          Enum.map_join(relations, " OR ", fn
+            {nil, _table} -> "(TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?)"
+            {_schema, _table} -> "(TABLE_SCHEMA = ? AND TABLE_NAME = ?)"
+          end)
+
+        params =
+          Enum.flat_map(relations, fn
+            {nil, table} -> [table]
+            {schema, table} -> [schema, table]
+          end)
+
+        sql =
+          "SELECT COLUMN_NAME, DATA_TYPE FROM information_schema.COLUMNS WHERE " <> conditions
+
+        case execute(connection, sql, params, []) do
+          {:ok, %{rows: rows}} ->
+            types =
+              Enum.reduce(rows, %{}, fn [column, type], acc ->
+                key = column |> to_string() |> String.downcase()
+                type = type |> to_string() |> String.downcase()
+                Map.update(acc, key, MapSet.new([type]), &MapSet.put(&1, type))
+              end)
+
+            set = Map.get(selecto, :set) || %{}
+
+            set =
+              set
+              |> Map.put(:storage_column_types, types)
+              |> Map.put(:zone_independent_timestamps, true)
+
+            {:ok, %{selecto | set: set}}
+
+          {:error, _} = error ->
+            error
+        end
+    end
+  end
+
+  def prepare_read(selecto, _connection), do: {:ok, selecto}
+
+  # Every relation a domain names: source and schema tables, association
+  # bridges.
+  defp collect_relations(map, acc) when is_map(map) and not is_struct(map) do
+    Enum.reduce(map, acc, fn
+      {key, value}, acc
+      when key in [:source_table, "source_table"] and
+             (is_binary(value) or (is_atom(value) and not is_nil(value))) ->
+        [to_string(value) | acc]
+
+      {key, %{} = through}, acc when key in [:through, "through"] ->
+        table = Map.get(through, :table) || Map.get(through, "table")
+        acc = if is_binary(table), do: [table | acc], else: acc
+        collect_relations(through, acc)
+
+      {_key, value}, acc ->
+        collect_relations(value, acc)
+    end)
+  end
+
+  defp collect_relations(list, acc) when is_list(list),
+    do: Enum.reduce(list, acc, &collect_relations/2)
+
+  defp collect_relations(_value, acc), do: acc
+
+  defp split_relation(relation) do
+    case String.split(relation, ".") do
+      [table] -> [{nil, table}]
+      [schema, table] -> [{schema, table}]
+      _ -> []
+    end
   end
 
   @doc false
@@ -417,24 +515,40 @@ defmodule SelectoDBMariaDB.Adapter do
   @impl Selecto.DB.WriteAdapter
   def execute_write_unsafe(connection, %Command{} = command, opts) do
     with :ok <- Command.validate(command) do
-      with_write_transaction(connection, fn tx ->
-        with :ok <- verify_write_session(tx), do: execute_write_command(tx, command, opts)
+      with_write_transaction(connection, fn tx, mode ->
+        with {:ok, session} <- verify_write_session(tx, mode),
+             opts = Keyword.put(opts, :selecto_session, session),
+             {:ok, result} <- execute_write_command(tx, command, opts),
+             :ok <- session_unchanged(tx, opts) do
+          {:ok, result}
+        end
       end)
     end
   end
 
   def execute_write_unsafe(connection, %Batch{} = batch, opts) do
     with :ok <- Batch.validate(batch) do
-      with_write_transaction(connection, fn tx ->
-        with :ok <- verify_write_session(tx) do
-          opts = Keyword.put(opts, :batch_commands, length(batch.commands))
+      with_write_transaction(connection, fn tx, mode ->
+        with {:ok, session} <- verify_write_session(tx, mode) do
+          opts =
+            opts
+            |> Keyword.put(:batch_commands, length(batch.commands))
+            |> Keyword.put(:selecto_session, session)
 
-          Enum.reduce_while(batch.commands, {:ok, []}, fn command, {:ok, results} ->
+          batch.commands
+          |> Enum.reduce_while({:ok, []}, fn command, {:ok, results} ->
             case execute_write_command(tx, command, opts) do
               {:ok, result} -> {:cont, {:ok, results ++ [result]}}
               {:error, _} = error -> {:halt, error}
             end
           end)
+          |> case do
+            {:ok, results} ->
+              with :ok <- session_unchanged(tx, opts), do: {:ok, results}
+
+            error ->
+              error
+          end
         end
       end)
     end
@@ -444,11 +558,23 @@ defmodule SelectoDBMariaDB.Adapter do
   def execute_write_unsafe(_connection, write, _opts), do: invalid_write_input(write)
 
   # The write's own transaction connection carries the session check
-  # (SelectoDBMariaDB.Session) before any statement of the write runs.
-  defp verify_write_session(tx) do
-    case Session.verify(tx) do
-      :ok ->
-        :ok
+  # (SelectoDBMariaDB.Session) before any statement of the write runs. A
+  # managed transaction on a connection whose session has autocommit=0 would
+  # BEGIN over the host's open implicit transaction (item 42; a pooled
+  # connection handed back that way, or a host's own): it is refused, never
+  # written into.
+  defp verify_write_session(tx, mode) do
+    case Session.state(tx) do
+      {:ok, %{autocommit: autocommit}} when mode == :managed and autocommit in [0, "0"] ->
+        {:error,
+         Error.new(
+           :transaction_unsupported,
+           "MariaDB connection holds an open implicit transaction (autocommit=0)",
+           details: %{adapter: :mariadb, code: :leaked_transaction}
+         )}
+
+      {:ok, session} ->
+        {:ok, session}
 
       {:error, %Selecto.Error{details: %{category: :invalid_session, setting: setting}}} ->
         {:error,
@@ -464,11 +590,42 @@ defmodule SelectoDBMariaDB.Adapter do
     end
   end
 
+  # The session's time_zone and sql_mode after a write statement (items 59,
+  # 62): a row trigger can SET them, and MariaDB does not roll a session
+  # variable back. A change restores the values seen before and refuses; the
+  # write's transaction or savepoint then rolls its DML back.
+  defp session_unchanged(tx, opts) do
+    case Keyword.get(opts, :selecto_session) do
+      nil ->
+        :ok
+
+      session ->
+        case Session.unchanged(tx, session) do
+          :ok ->
+            :ok
+
+          {:error, _} ->
+            {:error,
+             Error.new(
+               :query_enforcement,
+               "MariaDB write changed the session's time_zone or sql_mode",
+               details: %{
+                 code: :query_rule_violation,
+                 reason: :session_state_changed,
+                 adapter: :mariadb
+               }
+             )}
+        end
+    end
+  end
+
   # Upserts run the target-exact emulation (SelectoDBMariaDB.Upsert), never
   # ON DUPLICATE KEY UPDATE.
   defp execute_write_command(connection, %Command{operation: :upsert} = command, opts) do
     with :ok <-
            InsertAdmission.require_transactional(connection, command, &execute_unchecked/4, opts),
+         # After the metadata lock, like every catalog read of the write.
+         {:ok, command} <- with_storage_types(connection, command, opts),
          :ok <- InsertAdmission.before_upsert(connection, command, &execute_unchecked/4, opts),
          {:ok, plan} <- WriteCompiler.upsert_plan(command, opts),
          {:ok, affected} <-
@@ -480,6 +637,7 @@ defmodule SelectoDBMariaDB.Adapter do
              &control_statement/2,
              opts
            ),
+         :ok <- session_unchanged(connection, opts),
          {:ok, affected} <- check_cardinality(affected, command.expected_cardinality) do
       {:ok,
        %Result{
@@ -498,6 +656,8 @@ defmodule SelectoDBMariaDB.Adapter do
   defp execute_write_command(connection, command, opts) do
     with :ok <-
            InsertAdmission.require_transactional(connection, command, &execute_unchecked/4, opts),
+         # After the metadata lock, like every catalog read of the write.
+         {:ok, command} <- with_storage_types(connection, command, opts),
          :ok <-
            InsertAdmission.before_insert(connection, command, &execute_unchecked/4, opts),
          {:ok, locked} <-
@@ -508,6 +668,7 @@ defmodule SelectoDBMariaDB.Adapter do
              command,
              execute_unchecked(connection, statement.text, statement.params, opts)
            ),
+         :ok <- session_unchanged(connection, opts),
          {:ok, affected_rows} <- enforce_cardinality(command, query_result),
          :ok <-
            InsertAdmission.after_insert(
@@ -530,6 +691,33 @@ defmodule SelectoDBMariaDB.Adapter do
       {:error, %Error{} = error} -> {:error, error}
       {:error, %Selecto.Error{details: %{category: category}}} -> execution_failed(category)
       {:error, reason} -> {:error, write_error(:execution_failed, reason)}
+    end
+  end
+
+  # The columns of the written relation stored as TIMESTAMP: every
+  # comparison of the write and its re-reads on one compares by epoch
+  # (WriteCompiler, item 62a).
+  defp with_storage_types(connection, %Command{} = command, opts) do
+    {schema_sql, params} =
+      case command.relation |> to_string() |> String.split(".") do
+        [schema, table] -> {"?", [schema, table]}
+        [table] -> {"DATABASE()", [table]}
+        _other -> {"DATABASE()", [to_string(command.relation)]}
+      end
+
+    case execute_unchecked(
+           connection,
+           "SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = " <>
+             schema_sql <> " AND TABLE_NAME = ? AND DATA_TYPE = 'timestamp'",
+           params,
+           opts
+         ) do
+      {:ok, %{rows: rows}} ->
+        fields = Enum.map(rows, fn [column] -> to_string(column) end)
+        {:ok, %{command | metadata: Map.put(command.metadata, :storage_timestamp_fields, fields)}}
+
+      {:error, _} = error ->
+        error
     end
   end
 
@@ -574,15 +762,28 @@ defmodule SelectoDBMariaDB.Adapter do
   # Inside the caller's transaction the write runs under its own savepoint,
   # so a refusal after its DML (a post-image violation) undoes that DML even
   # when the caller ignores the error and commits (w3exrev16 item 18).
+  #
+  # A checked-out connection with autocommit=0 is inside the host's implicit
+  # transaction even before its first statement (items 29, 42): the write
+  # takes a savepoint there too, never BEGIN/COMMIT (which would commit the
+  # host's work, item 39).
   defp with_write_transaction(%DBConnection{} = connection, fun) do
-    if DBConnection.status(connection) == :transaction do
-      with_savepoint(connection, fun)
+    if DBConnection.status(connection) == :transaction or implicit_transaction?(connection) do
+      with_savepoint(connection, &fun.(&1, :host))
     else
-      with_managed_transaction(connection, fun)
+      with_managed_transaction(connection, &fun.(&1, :managed))
     end
   end
 
-  defp with_write_transaction(connection, fun), do: with_managed_transaction(connection, fun)
+  defp with_write_transaction(connection, fun),
+    do: with_managed_transaction(connection, &fun.(&1, :managed))
+
+  defp implicit_transaction?(connection) do
+    case MyXQL.query(connection, "SELECT @@session.autocommit", [], query_type: :text) do
+      {:ok, %MyXQL.Result{rows: [[autocommit]]}} -> autocommit in [0, "0"]
+      _ -> false
+    end
+  end
 
   defp with_savepoint(connection, fun) do
     name = "selecto_write_#{Base.encode16(:crypto.strong_rand_bytes(8), case: :lower)}"

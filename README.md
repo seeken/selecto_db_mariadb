@@ -81,6 +81,32 @@ triggers or rules.
   `STRICT_ALL_TABLES`. If any check fails, the call is refused before any
   statement runs. Set these with MyXQL's `after_connect` if the server
   defaults differ.
+- The time zone and sql_mode are compared again after every read, after
+  every fetched stream batch (before its rows are handed out) and after
+  every write statement: a stored function a domain view calls, or a row
+  trigger, can `SET time_zone` mid-statement and leave it changed. A change
+  restores the values seen before (session variables are not
+  transactional), discards the rows and refuses
+  (`query_rule_violation`, `reason: :session_state_changed`); a write's
+  transaction or savepoint rolls back. A switch made and undone inside one
+  statement cannot be seen that way, so host, trusted, required and tenant
+  comparisons, and association `where` pins, on a column stored as
+  TIMESTAMP compare `UNIX_TIMESTAMP(col)` with an epoch computed in Elixir
+  (the storage types are read before each read and each write). DATETIME
+  columns compare as before.
+- A Selecto read refuses a relation a TEMPORARY table shadows
+  (`query_rule_not_evaluable`, `reason: :temporary_shadow`); a row trigger
+  can create one for the rest of the session. Unrelated temporary tables
+  keep working.
+- A checked-out connection with `autocommit=0` is inside the host's implicit
+  transaction even before its first statement: a write there takes a
+  savepoint, never BEGIN/COMMIT (which would commit the host's work). A
+  managed write on a connection left with `autocommit=0` is refused
+  (`:leaked_transaction`).
+- On an AUTO_INCREMENT key only a canonical positive integer names the
+  inserted row for the re-read: every value MySQL reads as zero (`0`, `'0'`,
+  `'00'`, `'+0'`, `0.0`, FALSE) generates a new id, so a guarded insert
+  assigning one is not evaluable.
 - UUID columns (`:uuid`, `:binary_id`) are stored as text: CHAR(36), or
   MariaDB's native UUID type. Filters and writes bind the string form.
   BINARY(16) UUID storage is not supported.

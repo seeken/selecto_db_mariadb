@@ -277,6 +277,38 @@ defmodule SelectoDBMariaDB.WriteCompiler do
 
   def compile_predicate({:in, {:field, field}, values}, opts, offset)
       when is_list(values) and values != [] do
+    # A TIMESTAMP column compares by epoch (item 62a), one equality per value.
+    if timestamp_field?(field, opts),
+      do: compile_predicate({:or, Enum.map(values, &{:eq, {:field, field}, &1})}, opts, offset),
+      else: compile_in(field, values, opts, offset)
+  end
+
+  # A comparison on a column stored as TIMESTAMP compares the column's UNIX
+  # epoch with the value's, computed here as UTC: zone-independent, so a
+  # row trigger or stored function that switches time_zone mid-statement
+  # (and back) cannot widen it (item 62a). The session check requires UTC
+  # before every statement, so the result is the same as before.
+  def compile_predicate({operator, {:field, field}, value}, opts, offset)
+      when operator in [:eq, :neq, :gt, :gte, :lt, :lte] do
+    if timestamp_field?(field, opts),
+      do: compile_epoch_comparison(operator, field, value, opts, offset),
+      else: compile_comparison(operator, field, value, opts, offset)
+  end
+
+  def compile_predicate({:is_null, {:field, field}}, opts, _offset),
+    do: {:ok, %{text: "#{quote_field(field, opts)} IS NULL", params: []}}
+
+  def compile_predicate({:not_null, {:field, field}}, opts, _offset),
+    do: {:ok, %{text: "#{quote_field(field, opts)} IS NOT NULL", params: []}}
+
+  def compile_predicate(predicate, _opts, _offset) do
+    {:error,
+     Error.new(:invalid_predicate, "unsupported portable MariaDB predicate",
+       details: %{predicate: predicate}
+     )}
+  end
+
+  defp compile_in(field, values, opts, offset) do
     values
     |> Enum.reduce_while({:ok, [], [], offset}, fn value, {:ok, texts, params, next} ->
       case compile_value(value, opts, next) do
@@ -313,8 +345,50 @@ defmodule SelectoDBMariaDB.WriteCompiler do
     end
   end
 
-  def compile_predicate({operator, {:field, field}, value}, opts, offset)
-      when operator in [:eq, :neq, :gt, :gte, :lt, :lte] do
+  defp timestamp_field?(field, opts) do
+    name = field |> field_name() |> to_string() |> String.downcase()
+    name in Keyword.get(opts, :timestamp_fields, [])
+  end
+
+  defp compile_epoch_comparison(operator, field, value, opts, offset) do
+    operator_text = %{eq: "=", neq: "!=", gt: ">", gte: ">=", lt: "<", lte: "<="}[operator]
+    column = "UNIX_TIMESTAMP(#{quote_field(field, opts)})"
+
+    case epoch_value(value, opts) do
+      {:ok, :now} ->
+        {:ok, %{text: "#{column} #{operator_text} UNIX_TIMESTAMP()", params: []}}
+
+      {:ok, epoch} ->
+        with {:ok, compiled} <- parameter(epoch, offset) do
+          {:ok, %{text: "#{column} #{operator_text} #{compiled.text}", params: compiled.params}}
+        end
+
+      :error ->
+        {:error,
+         Error.new(
+           :query_enforcement,
+           "a comparison on a TIMESTAMP column needs a date or time value",
+           details: %{code: :query_rule_not_evaluable, reason: :timestamp_value}
+         )}
+    end
+  end
+
+  defp epoch_value({:literal, {:system, :now}}, _opts), do: {:ok, :now}
+  defp epoch_value({:literal, nil}, _opts), do: :error
+
+  defp epoch_value({:literal, value}, _opts),
+    do: Selecto.Builder.ExactCompare.epoch(value)
+
+  defp epoch_value({:context, key}, opts) do
+    case fetch_context(Keyword.get(opts, :context, %{}), key) do
+      {:ok, value} -> Selecto.Builder.ExactCompare.epoch(value)
+      :error -> :error
+    end
+  end
+
+  defp epoch_value(_value, _opts), do: :error
+
+  defp compile_comparison(operator, field, value, opts, offset) do
     with {:ok, compiled} <- compile_value(value, opts, offset) do
       operator_text = %{eq: "=", neq: "!=", gt: ">", gte: ">=", lt: "<", lte: "<="}[operator]
       column = quote_field(field, opts)
@@ -341,19 +415,6 @@ defmodule SelectoDBMariaDB.WriteCompiler do
         {:ok, %{text: "#{column} #{operator_text} #{compiled.text}", params: compiled.params}}
       end
     end
-  end
-
-  def compile_predicate({:is_null, {:field, field}}, opts, _offset),
-    do: {:ok, %{text: "#{quote_field(field, opts)} IS NULL", params: []}}
-
-  def compile_predicate({:not_null, {:field, field}}, opts, _offset),
-    do: {:ok, %{text: "#{quote_field(field, opts)} IS NOT NULL", params: []}}
-
-  def compile_predicate(predicate, _opts, _offset) do
-    {:error,
-     Error.new(:invalid_predicate, "unsupported portable MariaDB predicate",
-       details: %{predicate: predicate}
-     )}
   end
 
   @doc false
@@ -669,7 +730,15 @@ defmodule SelectoDBMariaDB.WriteCompiler do
       |> Enum.filter(fn {_field, mode} -> mode end)
       |> Map.new()
 
-    Keyword.put(opts, :exact_fields, exact)
+    timestamps =
+      metadata
+      |> Map.get(:storage_timestamp_fields, [])
+      |> List.wrap()
+      |> Enum.map(&(&1 |> to_string() |> String.downcase()))
+
+    opts
+    |> Keyword.put(:exact_fields, exact)
+    |> Keyword.put(:timestamp_fields, timestamps)
   end
 
   defp with_field_types(opts, _metadata), do: opts
