@@ -94,6 +94,17 @@ triggers or rules.
   TIMESTAMP compare `UNIX_TIMESTAMP(col)` with an epoch computed in Elixir
   (the storage types are read before each read and each write). DATETIME
   columns compare as before.
+- Scope comparisons (host, trusted, required, engine tenant, and query
+  member filters, never the caller's own) follow each column's storage
+  type, read per relation and column: a TIMESTAMP compares by epoch, a
+  character column by utf8mb4 bytes (an integer-declared column stored as
+  VARCHAR included), and a computed value, pattern or date part over a
+  TIMESTAMP is refused (`reason: :timestamp_operator`). Relation names are
+  matched exactly as the server resolves them: with
+  `lower_case_table_names = 0` the lookup compares database and table names
+  by bytes (`events` and `Events` are two tables), otherwise as the server
+  folds them; a domain name that matches more than one table refuses
+  (`reason: :relation_ambiguous`).
 - A Selecto read refuses a relation a TEMPORARY table shadows
   (`query_rule_not_evaluable`, `reason: :temporary_shadow`); a row trigger
   can create one for the rest of the session. Unrelated temporary tables

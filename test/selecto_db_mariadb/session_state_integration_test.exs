@@ -354,6 +354,199 @@ defmodule SelectoDBMariaDB.SessionStateIntegrationTest do
     end)
   end
 
+  defp run_domain(domain) do
+    domain
+    |> Selecto.configure(Process.get(:conn), adapter: Adapter, validate: false)
+    |> Selecto.select(["id"])
+    |> Selecto.order_by(["id"])
+    |> Selecto.execute()
+  end
+
+  defp relation(table, columns) do
+    %{
+      source_table: table,
+      primary_key: :id,
+      redact_fields: [],
+      fields: Map.keys(columns),
+      columns: columns,
+      associations: %{}
+    }
+  end
+
+  test "storage types are keyed by relation: a same-named column elsewhere does not decide (H1, R18)" do
+    with_database(fn conn ->
+      Process.put(:conn, conn)
+      ddl!(conn, "CREATE TABLE h1a (id INT PRIMARY KEY, ts TIMESTAMP NULL) ENGINE=InnoDB")
+
+      ddl!(
+        conn,
+        "CREATE TABLE h1b (id INT PRIMARY KEY, a_id INT, ts DATETIME NULL) ENGINE=InnoDB"
+      )
+
+      ddl!(conn, "INSERT INTO h1a VALUES (1, '2023-01-01 00:00:00')")
+
+      ddl!(
+        conn,
+        "INSERT INTO h1b VALUES (1, 1, '2023-06-01 00:00:00'), (2, 1, '2025-01-01 00:00:00')"
+      )
+
+      domain = %{
+        name: "h1b",
+        source:
+          relation("h1b", %{
+            id: %{type: :integer},
+            a_id: %{type: :integer},
+            ts: %{type: :naive_datetime}
+          })
+          |> Map.put(:associations, %{
+            a: %{queryable: :a, field: :a, owner_key: :a_id, related_key: :id, cardinality: :one}
+          }),
+        schemas: %{a: relation("h1a", %{id: %{type: :integer}, ts: %{type: :utc_datetime}})},
+        joins: %{a: %{type: :left, name: "a"}},
+        required_filters: [{"ts", {:lt, "2024-01-01 00:00:00"}}]
+      }
+
+      # h1b.ts is DATETIME: the native comparison, not a refusal for the
+      # TIMESTAMP of h1a's same-named column.
+      assert rows(run_domain(domain)) == [[1]]
+    end)
+  end
+
+  test "an integer-declared scope column stored as VARCHAR compares bytes (R26)" do
+    with_database(fn conn ->
+      Process.put(:conn, conn)
+      ddl!(conn, "CREATE TABLE r26 (id INT PRIMARY KEY, org_n VARCHAR(8) NOT NULL) ENGINE=InnoDB")
+      ddl!(conn, "INSERT INTO r26 VALUES (1, '1'), (2, '01'), (3, ' 1'), (4, '1x')")
+      assert query!(conn, "SELECT id FROM r26 WHERE org_n = 1 ORDER BY id") |> length() > 1
+
+      domain = %{
+        name: "r26",
+        source: relation("r26", %{id: %{type: :integer}, org_n: %{type: :integer}}),
+        schemas: %{},
+        joins: %{},
+        required_filters: [{"org_n", 1}]
+      }
+
+      assert rows(run_domain(domain)) == [[1]]
+    end)
+  end
+
+  test "relation names are matched exactly: rv_v and rv_V are two tables (R31)" do
+    with_database(fn conn ->
+      Process.put(:conn, conn)
+      ddl!(conn, "CREATE TABLE rv_v (id INT PRIMARY KEY, ts TIMESTAMP NULL) ENGINE=InnoDB")
+      ddl!(conn, "CREATE TABLE rv_V (id INT PRIMARY KEY, ts DATETIME NULL) ENGINE=InnoDB")
+
+      ddl!(
+        conn,
+        "INSERT INTO rv_v VALUES (1, '2023-12-31 22:00:00'), (2, '2024-01-01 03:00:00')"
+      )
+
+      ddl!(conn, "INSERT INTO rv_V VALUES (1, '2020-01-01 00:00:00')")
+
+      domain = fn table, type ->
+        %{
+          name: table,
+          source: relation(table, %{id: %{type: :integer}, ts: %{type: type}}),
+          schemas: %{},
+          joins: %{},
+          required_filters: [{"ts", {:lt, "2024-01-01 00:00:00"}}]
+        }
+      end
+
+      assert rows(run_domain(domain.("rv_v", :utc_datetime))) == [[1]]
+      assert rows(run_domain(domain.("rv_V", :naive_datetime))) == [[1]]
+
+      # Each read is keyed by its own table's types.
+      selecto =
+        domain.("rv_v", :utc_datetime)
+        |> Selecto.configure(conn, adapter: Adapter, validate: false)
+
+      assert {:ok, prepared} = Adapter.prepare_read(selecto, conn)
+      assert Map.keys(prepared.set.storage_column_types) == ["rv_v"]
+      assert prepared.set.storage_column_types["rv_v"]["ts"] == MapSet.new(["timestamp"])
+    end)
+  end
+
+  test "a computed value read from a TIMESTAMP scope column is refused (R15)" do
+    with_database(fn conn ->
+      Process.put(:conn, conn)
+      ddl!(conn, "CREATE TABLE r15 (id INT PRIMARY KEY, ts TIMESTAMP NULL) ENGINE=InnoDB")
+      ddl!(conn, "INSERT INTO r15 VALUES (1, '2024-01-01 03:00:00')")
+
+      for expression <- [
+            ["cast", ["field", "ts"], "string"],
+            ["concat", ["literal", ""], ["field", "ts"]]
+          ] do
+        domain = %{
+          name: "r15",
+          source:
+            relation("r15", %{
+              id: %{type: :integer},
+              ts: %{type: :utc_datetime},
+              tss: %{type: :string, computed: %{kind: :expression, expression: expression}}
+            }),
+          schemas: %{},
+          joins: %{},
+          required_filters: [{"tss", {:gte, "2024-01-01"}}]
+        }
+
+        assert rows(run_domain(domain)) == :timestamp_operator, inspect(expression)
+      end
+
+      domain = %{
+        name: "r15",
+        source: relation("r15", %{id: %{type: :integer}, ts: %{type: :utc_datetime}}),
+        schemas: %{},
+        joins: %{},
+        required_filters: [{"ts", {:case_insensitive_like, "2024%"}}]
+      }
+
+      assert rows(run_domain(domain)) == :timestamp_operator
+    end)
+  end
+
+  test "a query member's authored filter is host scope and compares bytes (R24)" do
+    with_database(fn conn ->
+      Process.put(:conn, conn)
+      ddl!(conn, "CREATE TABLE mroot (id INT PRIMARY KEY) ENGINE=InnoDB")
+
+      ddl!(
+        conn,
+        "CREATE TABLE mbr (id INT PRIMARY KEY, org_key VARCHAR(8) NOT NULL) ENGINE=InnoDB"
+      )
+
+      ddl!(conn, "INSERT INTO mroot VALUES (1), (2)")
+      ddl!(conn, "INSERT INTO mbr VALUES (1, 't1'), (2, 'T1')")
+
+      domain = %{
+        name: "mroot",
+        source: relation("mroot", %{id: %{type: :integer}}),
+        schemas: %{mbr: relation("mbr", %{id: %{type: :integer}, org_key: %{type: :string}})},
+        joins: %{},
+        query_members: %{
+          ctes: %{
+            m: %{
+              source: "mbr",
+              query: %{"select" => ["id"], "filter" => ["eq", "org_key", "t1"]},
+              join: %{owner_key: "id", related_key: "id", type: "inner"}
+            }
+          }
+        }
+      }
+
+      result =
+        domain
+        |> Selecto.configure(conn, adapter: Adapter, validate: false)
+        |> Selecto.with_cte(:m)
+        |> Selecto.select(["id"])
+        |> Selecto.order_by(["id"])
+        |> Selecto.execute()
+
+      assert rows(result) == [[1]]
+    end)
+  end
+
   defp update(table, id, note) do
     {:ok, command} =
       Command.new(%{
