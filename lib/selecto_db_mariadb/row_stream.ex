@@ -87,7 +87,7 @@ defmodule SelectoDBMariaDB.RowStream do
   end
 
   defp shadow_check(conn, statement, opts) do
-    if Keyword.get(opts, :selecto_read) == true,
+    if Keyword.get(opts, :selecto_session_guard) == true,
       do: SelectoDBMariaDB.Session.refuse_temporary_shadows(conn, statement),
       else: :ok
   end
