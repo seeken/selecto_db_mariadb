@@ -138,6 +138,13 @@ defmodule SelectoDBMariaDB.Adapter do
   def stream(connection, query, params, opts) do
     connection = resolve_connection(connection)
 
+    # A Selecto read's stream (Selecto.Executor.selecto_read?/0, captured
+    # here: the producer runs in its own process) refuses TEMPORARY shadows.
+    opts =
+      if Selecto.Executor.selecto_read?(),
+        do: Keyword.put(opts, :selecto_session_guard, true),
+        else: opts
+
     cond do
       not dependency_available?() ->
         {:error, @missing_dependency}
@@ -189,12 +196,13 @@ defmodule SelectoDBMariaDB.Adapter do
     error in DBConnection.ConnectionError -> {:error, sanitize_error(error)}
   end
 
-  # A Selecto read (`selecto_read: true`, set by Selecto's executor) first
-  # refuses a relation a TEMPORARY table shadows.
+  # A Selecto read (marked by Selecto's executor,
+  # Selecto.Executor.selecto_read?/0) first refuses a relation a TEMPORARY
+  # table shadows.
   defp execute_checked(connection, query, params, opts) do
-    if Keyword.get(opts, :selecto_read) == true do
+    if Selecto.Executor.selecto_read?() do
       with :ok <- Session.refuse_temporary_shadows(connection, query, opts) do
-        execute_unchecked(connection, query, params, Keyword.delete(opts, :selecto_read))
+        execute_unchecked(connection, query, params, opts)
       end
     else
       execute_unchecked(connection, query, params, opts)
@@ -209,7 +217,12 @@ defmodule SelectoDBMariaDB.Adapter do
   # database each relation names (the connection's current one when it
   # names none).
   def prepare_read(%{domain: domain} = selecto, connection) when is_map(domain) do
-    case domain |> collect_relations([]) |> Enum.uniq() |> Enum.flat_map(&split_relation/1) do
+    domains = [domain | Enum.map(Selecto.Executor.set_operands(selecto), &Map.get(&1, :domain))]
+
+    case domains
+         |> Enum.reduce([], &collect_relations/2)
+         |> Enum.uniq()
+         |> Enum.flat_map(&split_relation/1) do
       [] ->
         {:ok, selecto}
 
