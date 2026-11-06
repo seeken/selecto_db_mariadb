@@ -248,9 +248,11 @@ defmodule SelectoDBMariaDB.Session do
 
   @doc false
   # Returns `value` once the connection is idle. A rollback can be killed like
-  # any statement (MariaDB fails it with 1317): it is retried, then the
-  # connection closes, since a connection that may still hold Selecto's
-  # transaction must not be reused. `value` is the original result in every
+  # any statement (MariaDB fails it with 1317, the transaction still open): it
+  # is retried, then the connection closes, since a connection that may still
+  # hold Selecto's transaction must not be reused. Nothing else runs in between:
+  # Selecto never sets autocommit, so no later statement can commit what the
+  # rollback did not undo. `value` is the original result in every
   # case. The read-only state a read carries lives in the transaction this
   # ends: START TRANSACTION READ ONLY rather than one-shot SET TRANSACTION,
   # which survives a failed read and a table-less SELECT.
@@ -289,8 +291,10 @@ defmodule SelectoDBMariaDB.Session do
   end
 
   def fail_transaction(conn) do
-    _ = text(conn, @rollback, [])
-    :ok
+    case settle(conn, :ok, []) do
+      {:selecto_session_close, :ok} -> close_held(conn)
+      :ok -> :ok
+    end
   end
 
   @doc false
@@ -345,11 +349,10 @@ defmodule SelectoDBMariaDB.Session do
 
   # A connection the caller holds: it cannot go on holding what could not be
   # undone, so it closes under the caller, whose next statement says so.
-  def checkout(%DBConnection{pool_ref: pool_ref} = conn, fun, _opts) do
+  def checkout(%DBConnection{} = conn, fun, _opts) do
     case fun.(conn) do
       {:selecto_session_close, value} ->
-        error = DBConnection.ConnectionError.exception("Selecto could not end its transaction")
-        _ = DBConnection.Holder.disconnect(pool_ref, error)
+        close_held(conn)
         finish(value)
 
       value ->
@@ -389,6 +392,12 @@ defmodule SelectoDBMariaDB.Session do
     after
       Process.delete(ref)
     end
+  end
+
+  defp close_held(%DBConnection{pool_ref: pool_ref}) do
+    error = DBConnection.ConnectionError.exception("Selecto could not end its transaction")
+    _ = DBConnection.Holder.disconnect(pool_ref, error)
+    :ok
   end
 
   defp finish({:selecto_session_raise, kind, reason, stack}),
