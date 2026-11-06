@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- A guard no longer passes on its own failure: a killed shadow check or lock
+  probe keeps its error (only "no such table" and its kin mean absent), and an
+  unreadable autocommit refuses the write. A write whose RELEASE SAVEPOINT failed
+  is undone, or the connection closes, so the host's COMMIT cannot store it.
 - Every Selecto transaction ending is `COMMIT` or `ROLLBACK AND NO CHAIN NO
   RELEASE`, sent as statements: MyXQL's callbacks send the bare form, which at
   `completion_type` 1 opened a transaction the host's next write was lost in

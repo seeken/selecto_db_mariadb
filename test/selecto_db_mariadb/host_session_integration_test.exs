@@ -22,7 +22,8 @@ defmodule SelectoDBMariaDB.HostSessionIntegrationTest do
       password: System.get_env("SELECTO_MARIADB_PASSWORD", ""),
       database: System.get_env("SELECTO_MARIADB_DATABASE", "selecto_test"),
       pool_size: 1
-    ] ++ extra
+    ]
+    |> Keyword.merge(extra)
   end
 
   defp open(extra \\ []) do
@@ -453,6 +454,88 @@ defmodule SelectoDBMariaDB.HostSessionIntegrationTest do
     assert sql(conn, "INSERT INTO hs_log VALUES ('host')") == 1
     close(conn)
     assert sql(other, "SELECT COUNT(*) FROM hs_log") == [[1]]
+  end
+
+  # A proxy that answers the first command naming `needle` with ERR 1317, as a
+  # KILL QUERY landing on it would, without passing it on.
+  defp killing_proxy(needle) do
+    {:ok, listener} =
+      :gen_tcp.listen(0, [:binary, packet: :raw, active: false, ip: {127, 0, 0, 1}, nodelay: true])
+
+    {:ok, port} = :inet.port(listener)
+    armed = :atomics.new(1, [])
+    target = Keyword.fetch!(opts(), :port)
+    spawn_link(fn -> proxy_accept(listener, target, armed, needle) end)
+    {port, armed}
+  end
+
+  defp proxy_accept(listener, target, armed, needle) do
+    with {:ok, client} <- :gen_tcp.accept(listener) do
+      {:ok, server} =
+        :gen_tcp.connect({127, 0, 0, 1}, target, [:binary, packet: :raw, active: false])
+
+      spawn(fn -> proxy_replies(server, client) end)
+      spawn(fn -> proxy_commands(client, server, armed, needle) end)
+      proxy_accept(listener, target, armed, needle)
+    end
+  end
+
+  defp proxy_replies(server, client) do
+    with {:ok, data} <- :gen_tcp.recv(server, 0), :ok <- :gen_tcp.send(client, data) do
+      proxy_replies(server, client)
+    else
+      _closed -> :gen_tcp.close(client)
+    end
+  end
+
+  defp proxy_commands(client, server, armed, needle) do
+    with {:ok, <<size::little-24, sequence>> = header} <- :gen_tcp.recv(client, 4),
+         {:ok, body} <- :gen_tcp.recv(client, size) do
+      if :atomics.get(armed, 1) == 1 and :binary.match(body, needle) != :nomatch do
+        :atomics.put(armed, 1, 0)
+        error = <<0xFF, 1317::little-16, "#70100", "Query execution was interrupted">>
+        :gen_tcp.send(client, <<byte_size(error)::little-24, sequence + 1>> <> error)
+      else
+        :gen_tcp.send(server, header <> body)
+      end
+
+      proxy_commands(client, server, armed, needle)
+    else
+      _closed -> :gen_tcp.close(server)
+    end
+  end
+
+  test "a killed shadow check does not let a TEMPORARY table answer" do
+    {port, armed} = killing_proxy("SHOW CREATE TABLE")
+    conn = open(hostname: "127.0.0.1", port: port)
+    sql(conn, "CREATE TEMPORARY TABLE hs_t (id INT, org VARCHAR(20), v INT)")
+    sql(conn, "INSERT INTO hs_t VALUES (777, 'shadow', 0)")
+
+    :atomics.put(armed, 1, 1)
+    assert {:error, %{details: %{code: 1317}}} = read(conn)
+    close(conn)
+  end
+
+  test "a write whose RELEASE SAVEPOINT failed is not committed by the host", %{other: other} do
+    {port, armed} = killing_proxy("RELEASE SAVEPOINT")
+    conn = open(hostname: "127.0.0.1", port: port)
+
+    result =
+      try do
+        DBConnection.run(conn, fn held ->
+          {:ok, _} = MyXQL.query(held, "START TRANSACTION", [], query_type: :text)
+          :atomics.put(armed, 1, 1)
+          written = Adapter.execute_write_unsafe(held, insert(60), [])
+          {:ok, _} = MyXQL.query(held, "COMMIT", [], query_type: :text)
+          throw({:written, written})
+        end)
+      catch
+        :throw, {:written, written} -> written
+      end
+
+    assert {:error, _} = result
+    assert sql(other, "SELECT COUNT(*) FROM hs_t WHERE id = 60") == [[0]]
+    close(conn)
   end
 
   test "a connection that cannot be returned to idle closes, keeping the original result" do
