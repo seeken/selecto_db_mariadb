@@ -45,8 +45,6 @@ defmodule SelectoDBMariaDB.Session do
   @commit "COMMIT AND NO CHAIN NO RELEASE"
   @rollback "ROLLBACK AND NO CHAIN NO RELEASE"
 
-  # A statement a kill or a host's pending interrupt ended before it ran.
-  @interrupted [1317, 3024, 1969]
   @lock_probe_relation "selecto_lock_probe_absent"
 
   # The errors that say a name is no table this session can reach: no such
@@ -101,7 +99,7 @@ defmodule SelectoDBMariaDB.Session do
   end
 
   @doc false
-  # A Selecto read of `query` (R55): see guarded_read/4.
+  # A Selecto read of `query` (R55): see guarded_read/5.
   def read(conn, query, fun, opts \\ []) do
     checkout(
       conn,
@@ -110,6 +108,7 @@ defmodule SelectoDBMariaDB.Session do
           guarded_read(
             checked_out,
             query,
+            before,
             fn -> checked(checked_out, before, fun, opts) end,
             opts
           )
@@ -131,7 +130,9 @@ defmodule SelectoDBMariaDB.Session do
   #
   # Inside a host transaction the read runs as written: no savepoint, no
   # anchor, no read-only mode (R66). A writing view reached that way is the
-  # host's to undo.
+  # host's to undo. autocommit=0 is a host transaction from its first statement,
+  # so a read there runs as written too: it opens what the host's own SELECT
+  # would, and its snapshot and locks stay until the host ends them.
   #
   # On an idle connection, the read is its own START TRANSACTION READ ONLY,
   # ended by ROLLBACK AND NO CHAIN NO RELEASE, so a writing view reached by
@@ -146,8 +147,8 @@ defmodule SelectoDBMariaDB.Session do
   # is not available there, and a writing view at autocommit=1 commits as it
   # would for the host's own SELECT. A global FLUSH TABLES WITH READ LOCK does
   # not show in the probe and survives START TRANSACTION.
-  def guarded_read(conn, query, work, opts \\ []) do
-    if DBConnection.status(conn) == :idle do
+  def guarded_read(conn, query, %{autocommit: autocommit}, work, opts \\ []) do
+    if DBConnection.status(conn) == :idle and autocommit not in [0, "0"] do
       case host_locks(conn, relations(query), opts) do
         :none ->
           case transact(conn, read_start(query), fn -> {:rollback, work.()} end, opts) do

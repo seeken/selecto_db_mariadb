@@ -248,7 +248,7 @@ defmodule SelectoDBMariaDB.Adapter do
     error in DBConnection.ConnectionError -> {:error, sanitize_error(error)}
   end
 
-  # A Selecto read follows Session.guarded_read/4; a catalog read Selecto issues
+  # A Selecto read follows Session.guarded_read/5; a catalog read Selecto issues
   # for itself ends what it opened; anything else runs as written.
   defp route(connection, query, fun, opts) do
     cond do
