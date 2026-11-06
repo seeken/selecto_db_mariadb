@@ -243,6 +243,20 @@ defmodule SelectoDBMariaDB.HostSessionIntegrationTest do
     close(conn)
   end
 
+  test "a read at autocommit=0 keeps its snapshot until the host ends it", %{other: other} do
+    conn = open()
+    sql(conn, "SET SESSION autocommit = 0")
+
+    assert {:ok, {[[1], [2], [3]], _, _}} = read(conn)
+    sql(other, "INSERT INTO hs_t VALUES (9, 't1', 0)")
+    assert {:ok, {[[1], [2], [3]], _, _}} = read(conn)
+    assert {:ok, [[1], [2], [3]]} = stream(conn)
+
+    sql(conn, "COMMIT")
+    assert {:ok, {[[1], [2], [3], [9]], _, _}} = read(conn)
+    close(conn)
+  end
+
   test "a raw statement at autocommit=0 keeps the connection and the host's transaction",
        %{other: other} do
     conn = open()

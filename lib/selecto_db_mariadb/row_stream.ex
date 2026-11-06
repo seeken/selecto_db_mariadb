@@ -5,7 +5,7 @@ defmodule SelectoDBMariaDB.RowStream do
   # then COM_STMT_FETCH) streamed by a producer process.
   #
   # Ownership: the producer checks the connection out (Session.checkout/3). A
-  # Selecto read's cursor runs as Session.guarded_read/4 says: on an idle
+  # Selecto read's cursor runs as Session.guarded_read/5 says: on an idle
   # connection inside a read-only transaction the producer owns and ends,
   # inside a host transaction as written. While a host holds the connection
   # the producer waits in the pool queue and fails on the queue timeout; it
@@ -40,7 +40,7 @@ defmodule SelectoDBMariaDB.RowStream do
               # uses, before the cursor opens and again after every fetched
               # batch, before its rows are handed out (items 59, 62); a
               # Selecto read also refuses a relation a TEMPORARY table
-              # shadows, and runs as Session.guarded_read/4 says.
+              # shadows, and runs as Session.guarded_read/5 says.
               with {:ok, session} <- Session.state(checked_out) do
                 cursor = fn ->
                   with :ok <- shadow_check(checked_out, statement, opts) do
@@ -67,7 +67,7 @@ defmodule SelectoDBMariaDB.RowStream do
                 end
 
                 if Keyword.get(opts, :selecto_session_guard) == true,
-                  do: Session.guarded_read(checked_out, statement, cursor),
+                  do: Session.guarded_read(checked_out, statement, session, cursor),
                   else: cursor.()
               end
               |> case do

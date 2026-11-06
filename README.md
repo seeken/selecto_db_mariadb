@@ -122,7 +122,8 @@ triggers or rules.
 - Every transaction Selecto ends, it ends with `COMMIT AND NO CHAIN NO RELEASE`
   or `ROLLBACK AND NO CHAIN NO RELEASE`: `completion_type` is the host's and
   neither chains a new transaction nor closes the connection under Selecto.
-- A read on an idle connection is its own `START TRANSACTION READ ONLY`, ended
+- A read on an idle connection at `autocommit=1` is its own
+  `START TRANSACTION READ ONLY`, ended
   by that ROLLBACK, so a view that writes refuses (`reason: :read_only_read`)
   and nothing survives the read. Read-only state lives in that transaction;
   no session setting is touched. If the ending itself fails it is retried,
@@ -130,6 +131,9 @@ triggers or rules.
 - A read inside a host transaction runs as written: no savepoint, no anchor,
   no read-only mode. A writing view reached there is the host's to undo, and
   a write it made to a non-transactional table cannot be undone by anyone.
+  `autocommit=0` is a host transaction from its first statement: a read there
+  opens what the host's own SELECT would, and its snapshot stays until the host
+  ends it.
 - A read under `LOCK TABLES` or `FLUSH TABLES t WITH READ LOCK` runs as
   written too, because START TRANSACTION would release those locks: a writing
   view reached there at `autocommit=1` commits, as it would for the host's own
