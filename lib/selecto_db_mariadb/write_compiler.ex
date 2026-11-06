@@ -824,7 +824,8 @@ defmodule SelectoDBMariaDB.WriteCompiler do
     end)
   end
 
-  defp quote_relation(relation),
+  @doc false
+  def quote_relation(relation),
     do: relation |> to_string() |> String.split(".") |> Enum.map_join(".", &quote_identifier/1)
 
   defp quote_identifier(identifier),

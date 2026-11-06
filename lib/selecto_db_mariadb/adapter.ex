@@ -134,7 +134,7 @@ defmodule SelectoDBMariaDB.Adapter do
 
   @impl true
   # A read-only server-side cursor; see SelectoDBMariaDB.RowStream for the
-  # connection-ownership rules (no transaction control statements are issued).
+  # connection-ownership rules.
   def stream(connection, query, params, opts) do
     connection = resolve_connection(connection)
 
@@ -161,18 +161,14 @@ defmodule SelectoDBMariaDB.Adapter do
   end
 
   @impl true
-  def transaction(connection, fun, _opts) when is_function(fun, 1) do
+  # A transaction Selecto owns ends through Session.owned_transaction/3, never
+  # through MyXQL.transaction/3: MyXQL sends a bare COMMIT or ROLLBACK, which
+  # obeys the host's completion_type.
+  def transaction(connection, fun, opts) when is_function(fun, 1) do
     if dependency_available?() do
-      case MyXQL.transaction(resolve_connection(connection), fn tx ->
-             case fun.(tx) do
-               {:ok, result} -> result
-               {:error, reason} -> MyXQL.rollback(tx, reason)
-               result -> result
-             end
-           end) do
-        {:ok, result} -> {:ok, result}
-        {:error, reason} -> {:error, reason}
-      end
+      connection
+      |> resolve_connection()
+      |> run_transaction(fun, opts)
     else
       {:error, @missing_dependency}
     end
@@ -182,18 +178,84 @@ defmodule SelectoDBMariaDB.Adapter do
     :exit, reason -> {:error, reason}
   end
 
+  defp run_transaction(%DBConnection{conn_mode: :transaction} = tx, fun, _opts) do
+    if Session.owned?(tx), do: nested_transaction(tx, fun), else: host_transaction(tx, fun)
+  end
+
+  defp run_transaction(connection, fun, opts) do
+    connection
+    |> Session.checkout(&owned_transaction(&1, fun, opts), opts)
+    |> transaction_result()
+  end
+
+  defp owned_transaction(checked_out, fun, opts) do
+    case {DBConnection.status(checked_out), Session.host_locks(checked_out, [], opts)} do
+      {:idle, :none} -> Session.owned_transaction(checked_out, fun, opts)
+      {:idle, :held} -> {:error, host_table_locks()}
+      {:idle, {:error, _} = error} -> error
+      _not_idle -> {:error, unowned_transaction()}
+    end
+  end
+
+  # Inside a transaction Selecto owns: a failure dooms the owner's ending.
+  defp nested_transaction(tx, fun) do
+    case fun.(tx) do
+      {:ok, result} ->
+        {:ok, result}
+
+      {:error, reason} ->
+        Session.fail_transaction(tx)
+        {:error, reason}
+
+      result ->
+        {:ok, result}
+    end
+  end
+
+  # Inside a host's DBConnection transaction: no statement is sent here.
+  defp host_transaction(tx, fun) do
+    MyXQL.transaction(tx, fn nested ->
+      case fun.(nested) do
+        {:ok, result} -> result
+        {:error, reason} -> MyXQL.rollback(nested, reason)
+        result -> result
+      end
+    end)
+  end
+
+  defp transaction_result(
+         {:error, %DBConnection.ConnectionError{message: "transaction rolling back"}}
+       ),
+       do: {:error, :rollback}
+
+  defp transaction_result({:error, %DBConnection.ConnectionError{} = error}),
+    do: {:error, sanitize_error(error)}
+
+  defp transaction_result({:error, %MyXQL.Error{} = error}), do: {:error, sanitize_error(error)}
+  defp transaction_result(result), do: result
+
   # Each call first verifies the session (SelectoDBMariaDB.Session) on the
   # connection that then runs the statement.
   defp execute_direct(connection, query, params, opts) do
     if dependency_available?() do
       with :ok <- require_binary_protocol(opts) do
-        Session.run(connection, &execute_checked(&1, query, params, opts), opts)
+        route(connection, query, &execute_checked(&1, query, params, opts), opts)
       end
     else
       {:error, @missing_dependency}
     end
   rescue
     error in DBConnection.ConnectionError -> {:error, sanitize_error(error)}
+  end
+
+  # A Selecto read follows Session.guarded_read/4; a catalog read Selecto issues
+  # for itself ends what it opened; anything else runs as written.
+  defp route(connection, query, fun, opts) do
+    cond do
+      Selecto.Executor.selecto_read?(opts) -> Session.read(connection, query, fun, opts)
+      Keyword.get(opts, :selecto_catalog) == true -> Session.catalog(connection, fun, opts)
+      true -> Session.run(connection, fun, opts)
+    end
   end
 
   # A Selecto read (marked by Selecto's executor,
@@ -264,7 +326,7 @@ defmodule SelectoDBMariaDB.Adapter do
             {name, {schema, table}} -> [name, schema, schema, table, table]
           end)
 
-        case execute(connection, sql, params, []) do
+        case execute(connection, sql, params, selecto_catalog: true) do
           {:ok, %{rows: rows}} ->
             ambiguous =
               rows
@@ -347,7 +409,7 @@ defmodule SelectoDBMariaDB.Adapter do
                  "WHERE BINARY TABLE_SCHEMA = BINARY ? AND BINARY TABLE_NAME = BINARY ?"
              end),
              Enum.flat_map(relations, fn {s, t} -> [s, t] end),
-             []
+             selecto_catalog: true
            ) do
       definitions =
         Map.new(definitions, fn [s, t, d] ->
@@ -402,7 +464,7 @@ defmodule SelectoDBMariaDB.Adapter do
                "WHERE BINARY u.VIEW_SCHEMA = BINARY ? AND BINARY u.VIEW_NAME = BINARY ? " <>
                "AND c.DATA_TYPE = 'timestamp'",
              [schema, view],
-             []
+             selecto_catalog: true
            ) do
         {:ok, %{rows: [[0]]}} -> false
         _ -> true
@@ -541,7 +603,7 @@ defmodule SelectoDBMariaDB.Adapter do
              "WHERE BINARY c.TABLE_SCHEMA = BINARY ? AND BINARY c.TABLE_NAME = BINARY ? " <>
              "AND c.COLUMN_NAME = ?" <> vcu,
            params,
-           []
+           selecto_catalog: true
          ) do
       {:ok, %{rows: [[type]]}} -> {:ok, String.downcase(to_string(type))}
       _ -> :error
@@ -708,11 +770,32 @@ defmodule SelectoDBMariaDB.Adapter do
   # a lock (1205); the caller may retry.
   @deadlock_codes [1213]
   @lock_timeout_codes [1205]
+  # KILL QUERY (1317) and the server's statement time limit (3024 on MySQL,
+  # 1969 on MariaDB).
+  @canceled_codes [1317, 3024, 1969]
 
   # Driver errors carry the server's message (which can quote row values) and
   # the statement text. Only a stable category and the numeric server code
   # leave the adapter.
   @doc false
+  # A read's own READ ONLY transaction refused a write it reached (R55).
+  def sanitize_error(%MyXQL.Error{mysql: %{code: 1792}}) do
+    %Selecto.Error{
+      type: :query_enforcement,
+      message: "MariaDB refuses a read that tried to write",
+      details: %{code: :query_rule_not_evaluable, reason: :read_only_read, adapter: :mariadb}
+    }
+  end
+
+  def sanitize_error(%MyXQL.Error{mysql: %{code: code}}) when code in @canceled_codes do
+    Selecto.Error.query_error("MariaDB canceled the statement", nil, [], %{
+      adapter: :mariadb,
+      category: :query_canceled,
+      code: code,
+      sqlstate: "70100"
+    })
+  end
+
   def sanitize_error(%MyXQL.Error{mysql: %{code: code}}) when is_integer(code) do
     Selecto.Error.query_error("MariaDB rejected the statement", nil, [], %{
       adapter: :mariadb,
@@ -819,7 +902,7 @@ defmodule SelectoDBMariaDB.Adapter do
         [name] -> {nil, name}
       end
 
-    case execute(connection, @column_catalog_sql, [schema, name], []) do
+    case execute(connection, @column_catalog_sql, [schema, name], selecto_catalog: true) do
       {:ok, %{rows: rows}} ->
         {:ok,
          Map.new(rows, fn [column, type, collation] ->
@@ -890,7 +973,7 @@ defmodule SelectoDBMariaDB.Adapter do
   @impl Selecto.DB.WriteAdapter
   def execute_write_unsafe(connection, %Command{} = command, opts) do
     with :ok <- Command.validate(command) do
-      with_write_transaction(connection, fn tx, mode ->
+      with_write_transaction(connection, [command.relation], fn tx, mode ->
         with {:ok, session} <- verify_write_session(tx, mode),
              opts = Keyword.put(opts, :selecto_session, session),
              {:ok, result} <- execute_write_command(tx, command, opts),
@@ -903,7 +986,9 @@ defmodule SelectoDBMariaDB.Adapter do
 
   def execute_write_unsafe(connection, %Batch{} = batch, opts) do
     with :ok <- Batch.validate(batch) do
-      with_write_transaction(connection, fn tx, mode ->
+      relations = Enum.map(batch.commands, & &1.relation)
+
+      with_write_transaction(connection, relations, fn tx, mode ->
         with {:ok, session} <- verify_write_session(tx, mode) do
           opts =
             opts
@@ -938,6 +1023,8 @@ defmodule SelectoDBMariaDB.Adapter do
   # BEGIN over the host's open implicit transaction (item 42; a pooled
   # connection handed back that way, or a host's own): it is refused, never
   # written into.
+  defp verify_write_session(_tx, {:verified, session}), do: {:ok, session}
+
   defp verify_write_session(tx, mode) do
     case Session.state(tx) do
       {:ok, %{autocommit: autocommit}} when mode == :managed and autocommit in [0, "0"] ->
@@ -979,7 +1066,7 @@ defmodule SelectoDBMariaDB.Adapter do
           :ok ->
             :ok
 
-          {:error, _} ->
+          {:error, %Selecto.Error{details: %{reason: :session_state_changed}}} ->
             {:error,
              Error.new(
                :query_enforcement,
@@ -990,6 +1077,14 @@ defmodule SelectoDBMariaDB.Adapter do
                  adapter: :mariadb
                }
              )}
+
+          # The check itself failed (a kill, a lost connection): that failure
+          # is what the caller is told.
+          {:error, %Selecto.Error{details: %{category: category}}} ->
+            execution_failed(category)
+
+          {:error, reason} ->
+            {:error, write_error(:execution_failed, reason)}
         end
     end
   end
@@ -1174,16 +1269,80 @@ defmodule SelectoDBMariaDB.Adapter do
   # transaction even before its first statement (items 29, 42): the write
   # takes a savepoint there too, never BEGIN/COMMIT (which would commit the
   # host's work, item 39).
-  defp with_write_transaction(%DBConnection{} = connection, fun) do
+  defp with_write_transaction(%DBConnection{} = connection, relations, fun) do
     if DBConnection.status(connection) == :transaction or implicit_transaction?(connection) do
       with_savepoint(connection, &fun.(&1, :host))
     else
-      with_managed_transaction(connection, &fun.(&1, :managed))
+      owned_write(connection, relations, fun)
     end
   end
 
-  defp with_write_transaction(connection, fun),
-    do: with_managed_transaction(connection, &fun.(&1, :managed))
+  # A pid or pool: the checkout is Selecto's, so a transaction on it is one
+  # nobody here holds. Beginning over it would be an implicit commit or a
+  # rollback of the host's work, so the write refuses without a statement
+  # (as PostgreSQL does).
+  defp with_write_transaction(connection, relations, fun),
+    do: owned_write(connection, relations, fun)
+
+  defp owned_write(connection, relations, fun) do
+    connection
+    |> Session.checkout(fn checked_out ->
+      if DBConnection.status(checked_out) == :idle,
+        do: with_managed_transaction(checked_out, relations, fun),
+        else: {:error, unowned_transaction()}
+    end)
+    |> case do
+      {:ok, result} -> {:ok, result}
+      {:error, %Error{} = error} -> {:error, error}
+      {:error, reason} -> {:error, write_error(:transaction_failed, reason)}
+    end
+  rescue
+    exception -> {:error, write_error(:transaction_failed, exception)}
+  catch
+    :exit, reason -> {:error, write_error(:transaction_failed, reason)}
+  end
+
+  # Checks come before START TRANSACTION, which would commit an open
+  # transaction and release the session's table locks.
+  defp with_managed_transaction(connection, relations, fun) do
+    with {:ok, session} <- verify_write_session(connection, :managed),
+         :ok <- no_host_locks(connection, relations) do
+      Session.transact(connection, "START TRANSACTION", fn ->
+        case fun.(connection, {:verified, session}) do
+          {:ok, _} = ok -> {:commit, ok}
+          {:error, _} = error -> {:rollback, error}
+        end
+      end)
+    end
+  end
+
+  defp no_host_locks(connection, relations) do
+    quoted = relations |> Enum.uniq() |> Enum.map(&WriteCompiler.quote_relation/1)
+
+    case Session.host_locks(connection, quoted) do
+      :none -> :ok
+      :held -> {:error, host_table_locks()}
+      {:error, reason} -> {:error, write_error(:transaction_failed, reason)}
+    end
+  end
+
+  defp unowned_transaction do
+    Error.new(
+      :query_enforcement,
+      "MariaDB write refused: this connection is in a transaction Selecto did not open and " <>
+        "the caller does not hold; use DBConnection.run/3 and pass its connection",
+      details: %{code: :query_rule_not_evaluable, reason: :unowned_transaction, adapter: :mariadb}
+    )
+  end
+
+  defp host_table_locks do
+    Error.new(
+      :query_enforcement,
+      "MariaDB transaction refused: this session holds table locks that START TRANSACTION " <>
+        "would release",
+      details: %{code: :query_rule_not_evaluable, reason: :host_table_locks, adapter: :mariadb}
+    )
+  end
 
   defp implicit_transaction?(connection) do
     case MyXQL.query(connection, "SELECT @@session.autocommit", [], query_type: :text) do
@@ -1208,8 +1367,12 @@ defmodule SelectoDBMariaDB.Adapter do
         case result do
           {:ok, _} = ok ->
             case query.("RELEASE SAVEPOINT #{name}") do
-              {:ok, _} -> ok
-              {:error, reason} -> {:error, write_error(:transaction_failed, reason)}
+              {:ok, _} ->
+                ok
+
+              {:error, reason} ->
+                rollback_to_savepoint(connection, query, name)
+                {:error, write_error(:transaction_failed, reason)}
             end
 
           {:error, %Error{}} = error ->
@@ -1230,31 +1393,18 @@ defmodule SelectoDBMariaDB.Adapter do
   # transaction) leaves no savepoint to return to: the caller's transaction
   # is then marked failed, as a nested rollback would, so it cannot commit
   # as if its earlier statements had survived.
-  defp rollback_to_savepoint(connection, query, name) do
+  defp rollback_to_savepoint(connection, query, name, attempts \\ 3) do
     case query.("ROLLBACK TO SAVEPOINT #{name}") do
       {:ok, _} ->
         _ = query.("RELEASE SAVEPOINT #{name}")
         :ok
 
+      # A kill can land on the undo: the write's DML is still there.
+      {:error, %MyXQL.Error{mysql: %{code: 1317}}} when attempts > 1 ->
+        rollback_to_savepoint(connection, query, name, attempts - 1)
+
       {:error, _} ->
-        _ = MyXQL.transaction(connection, &MyXQL.rollback(&1, :write_rolled_back))
-        :ok
-    end
-  end
-
-  defp with_managed_transaction(connection, fun) do
-    case transaction(connection, fun, []) do
-      {:ok, result} ->
-        {:ok, result}
-
-      {:error, %Error{} = error} ->
-        {:error, error}
-
-      {:error, @missing_dependency} ->
-        {:error, write_error(:adapter_dependency_missing, @missing_dependency)}
-
-      {:error, reason} ->
-        {:error, write_error(:transaction_failed, reason)}
+        Session.fail_transaction(connection)
     end
   end
 
@@ -1430,7 +1580,7 @@ defmodule SelectoDBMariaDB.Adapter do
   end
 
   defp introspection_query(connection, query, params) do
-    execute(connection, query, params, prepared: false)
+    execute(connection, query, params, prepared: false, selecto_catalog: true)
   end
 
   defp resolve_schema(connection, opts) do

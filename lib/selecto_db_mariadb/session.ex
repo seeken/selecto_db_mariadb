@@ -37,12 +37,31 @@ defmodule SelectoDBMariaDB.Session do
 
   @utc_zones ["UTC", "+00:00", "Etc/UTC"]
 
+  # Selecto's transaction endings. completion_type belongs to the host: at 1
+  # a bare COMMIT or ROLLBACK opens a new transaction and at 2 it closes the
+  # connection, so every ending Selecto sends names both clauses, on every
+  # path. MyXQL's own commit and rollback callbacks send the bare statement
+  # and are not used for transactions Selecto owns.
+  @commit "COMMIT AND NO CHAIN NO RELEASE"
+  @rollback "ROLLBACK AND NO CHAIN NO RELEASE"
+
+  # A statement a kill or a host's pending interrupt ended before it ran.
+  @interrupted [1317, 3024, 1969]
+  @lock_probe_relation "selecto_lock_probe_absent"
+  @undo_attempts 3
+
+  @doc false
+  def commit_statement, do: @commit
+
+  @doc false
+  def rollback_statement, do: @rollback
+
   @doc false
   # Run `fun` on one checked-out connection after the session check. `conn`
   # is a pool or connection pid, a registered name, or a checked-out
-  # `DBConnection` (inside a transaction).
+  # `DBConnection` (inside a transaction). The statement runs as written.
   def run(conn, fun, opts \\ []) do
-    DBConnection.run(
+    checkout(
       conn,
       fn checked_out ->
         with {:ok, before} <- state(checked_out, opts),
@@ -51,9 +70,327 @@ defmodule SelectoDBMariaDB.Session do
           result
         end
       end,
-      Keyword.take(opts, [:timeout, :queue_timeout, :queue_target, :queue_interval])
+      opts
     )
   end
+
+  @doc false
+  # A catalog read Selecto issues for itself. At autocommit=0 it can open a
+  # transaction on an idle connection; that snapshot is Selecto's, so it ends
+  # here and the read that follows finds the connection as the host left it.
+  def catalog(conn, fun, opts \\ []) do
+    checkout(
+      conn,
+      fn checked_out ->
+        with {:ok, before} <- state(checked_out, opts) do
+          if DBConnection.status(checked_out) == :idle do
+            ended(checked_out, fn -> checked(checked_out, before, fun, opts) end, opts)
+          else
+            checked(checked_out, before, fun, opts)
+          end
+        end
+      end,
+      opts
+    )
+  end
+
+  @doc false
+  # A Selecto read of `query` (R55): see guarded_read/4.
+  def read(conn, query, fun, opts \\ []) do
+    checkout(
+      conn,
+      fn checked_out ->
+        with {:ok, before} <- state(checked_out, opts) do
+          guarded_read(
+            checked_out,
+            query,
+            fn -> checked(checked_out, before, fun, opts) end,
+            opts
+          )
+        end
+      end,
+      opts
+    )
+  end
+
+  defp checked(conn, before, fun, opts) do
+    with {:ok, _} = result <- fun.(conn),
+         :ok <- unchanged(conn, before, opts) do
+      result
+    end
+  end
+
+  @doc false
+  # How a Selecto read runs on a checked-out connection.
+  #
+  # Inside a host transaction the read runs as written: no savepoint, no
+  # anchor, no read-only mode (R66). A writing view reached that way is the
+  # host's to undo.
+  #
+  # On an idle connection, the read is its own START TRANSACTION READ ONLY,
+  # ended by ROLLBACK AND NO CHAIN NO RELEASE, so a writing view reached by
+  # the read refuses and nothing survives it. Read-only state lives only in
+  # that transaction: there is no session setting to restore, and a failed
+  # read cannot leave one behind. A row-locking read cannot be READ ONLY; it
+  # gets a plain transaction with the same ending.
+  #
+  # START TRANSACTION releases LOCK TABLES and FLUSH TABLES t WITH READ LOCK,
+  # so a read first asks whether the session holds them (host_locks/3). With
+  # such locks the read runs as written and keeps them: the owned transaction
+  # is not available there, and a writing view at autocommit=1 commits as it
+  # would for the host's own SELECT. A global FLUSH TABLES WITH READ LOCK does
+  # not show in the probe and survives START TRANSACTION.
+  def guarded_read(conn, query, work, opts \\ []) do
+    if DBConnection.status(conn) == :idle do
+      case host_locks(conn, relations(query), opts) do
+        :none ->
+          case transact(conn, read_start(query), fn -> {:rollback, work.()} end, opts) do
+            {:error, %MyXQL.Error{} = error} -> {:error, sanitize(error)}
+            {:error, %DBConnection.ConnectionError{} = error} -> {:error, sanitize(error)}
+            other -> other
+          end
+
+        :held ->
+          ended(conn, work, opts)
+
+        {:error, reason} ->
+          settle(conn, {:error, sanitize(reason)}, opts)
+      end
+    else
+      work.()
+    end
+  end
+
+  defp read_start(query) do
+    if Regex.match?(~r/\bFOR\s+(?:UPDATE|SHARE)\b/i, IO.iodata_to_binary(query)),
+      do: "START TRANSACTION",
+      else: "START TRANSACTION READ ONLY"
+  end
+
+  @doc false
+  # Whether this session holds LOCK TABLES or FLUSH TABLES t WITH READ LOCK:
+  # `:held`, `:none`, or the error that ended the probe. Under such locks a
+  # table not locked under this alias answers 1100. The probe is prepared
+  # and never executed: MariaDB evaluates a DETERMINISTIC function of a view
+  # at optimisation, so running SELECT 1 FROM view WHERE FALSE would commit
+  # that function's writes. A relation that does not resolve says nothing,
+  # so the next is asked, then a name that exists nowhere (1100 under locks,
+  # 1146 otherwise).
+  def host_locks(conn, relations, opts \\ []) do
+    (relations ++ [@lock_probe_relation])
+    |> Enum.reduce_while(:none, fn relation, :none ->
+      case lock_probe(conn, relation, opts) do
+        :continue -> {:cont, :none}
+        :none -> {:halt, :none}
+        other -> {:halt, other}
+      end
+    end)
+  end
+
+  defp lock_probe(conn, relation, opts) do
+    statement = "SELECT 1 FROM #{relation} AS selecto_lock_probe WHERE FALSE"
+
+    case MyXQL.prepare(conn, "", statement, Keyword.take(opts, [:timeout])) do
+      {:ok, query} ->
+        _ = MyXQL.close(conn, query, Keyword.take(opts, [:timeout]))
+        :none
+
+      {:error, %MyXQL.Error{mysql: %{code: 1100}}} ->
+        :held
+
+      {:error, %MyXQL.Error{mysql: %{code: code}} = error} when code in @interrupted ->
+        {:error, error}
+
+      {:error, %MyXQL.Error{}} ->
+        :continue
+
+      {:error, _} = error ->
+        error
+    end
+  end
+
+  @doc false
+  # One transaction Selecto owns on an idle checked-out connection. `work`
+  # returns `{:commit, value}` or `{:rollback, value}`; whatever happens, the
+  # connection leaves here idle or closes (settle/3).
+  def transact(conn, start, work, opts \\ []) do
+    case text(conn, start, opts) do
+      {:ok, _} ->
+        case attempt(work) do
+          {:commit, value} ->
+            case text(conn, @commit, opts) do
+              {:ok, _} -> value
+              {:error, _} = error -> settle(conn, error, opts)
+            end
+
+          {:rollback, value} ->
+            settle(conn, value, opts)
+
+          {:selecto_session_raise, _, _, _} = raised ->
+            settle(conn, raised, opts)
+        end
+
+      {:error, _} = error ->
+        settle(conn, error, opts)
+    end
+  end
+
+  # `work` as written, then the end of whatever transaction it opened on a
+  # connection that was idle: only a snapshot of Selecto's own read can be in
+  # it. ROLLBACK keeps table locks.
+  defp ended(conn, work, opts), do: settle(conn, attempt(work), opts)
+
+  defp attempt(work) do
+    work.()
+  catch
+    kind, reason -> {:selecto_session_raise, kind, reason, __STACKTRACE__}
+  end
+
+  @doc false
+  # Returns `value` once the connection is idle. A rollback can be killed like
+  # any statement: it is retried, then the connection closes, since a
+  # connection that may still hold Selecto's transaction must not be reused.
+  # `value` is the original result in every case.
+  def settle(conn, value, opts \\ []) do
+    if idle?(conn, opts, @undo_attempts), do: value, else: {:selecto_session_close, value}
+  end
+
+  defp idle?(conn, opts, attempts) do
+    case DBConnection.status(conn) do
+      :transaction ->
+        case text(conn, @rollback, opts) do
+          {:ok, _} -> DBConnection.status(conn) != :transaction
+          {:error, %MyXQL.Error{}} when attempts > 1 -> idle?(conn, opts, attempts - 1)
+          {:error, %MyXQL.Error{}} -> false
+          {:error, _} -> DBConnection.status(conn) != :transaction
+        end
+
+      _idle_or_gone ->
+        true
+    end
+  end
+
+  @doc false
+  # The undo of a savepoint that could not be returned to, inside a
+  # transaction Selecto did not begin on this call. Under a DBConnection
+  # transaction no statement is sent: the holder's own ending rolls back.
+  # On a transaction Selecto owns, the owner's ending does.
+  def fail_transaction(%DBConnection{conn_mode: :transaction, conn_ref: ref} = conn) do
+    if Process.get({__MODULE__, :owned, ref}) do
+      Process.put({__MODULE__, :owned, ref}, :failed)
+    else
+      _ = DBConnection.transaction(conn, &DBConnection.rollback(&1, :write_rolled_back))
+    end
+
+    :ok
+  end
+
+  def fail_transaction(conn) do
+    _ = text(conn, @rollback, [])
+    :ok
+  end
+
+  @doc false
+  # `fun` gets a connection DBConnection treats as inside a transaction, so
+  # DBConnection.rollback/2 and nested transaction/3 calls keep working
+  # against a transaction whose ending Selecto sends.
+  def owned_transaction(%DBConnection{conn_ref: ref} = conn, fun, opts \\ []) do
+    tx = %{conn | conn_mode: :transaction}
+    key = {__MODULE__, :owned, ref}
+    Process.put(key, :open)
+
+    try do
+      transact(
+        conn,
+        "START TRANSACTION",
+        fn ->
+          result =
+            try do
+              fun.(tx)
+            catch
+              :throw, {DBConnection, ^ref, reason} -> {:error, reason}
+            end
+
+          case {Process.get(key), result} do
+            {:failed, _} -> {:rollback, {:error, :rollback}}
+            {_, {:error, _} = error} -> {:rollback, error}
+            {_, {:ok, _} = ok} -> {:commit, ok}
+            {_, other} -> {:commit, {:ok, other}}
+          end
+        end,
+        opts
+      )
+    after
+      Process.delete(key)
+    end
+  end
+
+  @doc false
+  def owned?(%DBConnection{conn_ref: ref}), do: Process.get({__MODULE__, :owned, ref}) != nil
+
+  @doc false
+  # One connection for `fun`, without DBConnection.run/3's status comparison:
+  # that closes a connection whose status changed, and the first InnoDB access
+  # at autocommit=0 changes it, taking the host's connection, its locks and
+  # its variables. Leaving the callback by throw is the public way past the
+  # comparison.
+  #
+  # The comparison is what closes a connection `fun` could not return to idle
+  # (settle/3): returning normally lets it run, and the original result
+  # comes back after it.
+  def checkout(conn, fun, opts \\ [])
+
+  def checkout(%DBConnection{} = conn, fun, _opts) do
+    case fun.(conn) do
+      {:selecto_session_close, value} -> finish(value)
+      value -> finish(value)
+    end
+  end
+
+  def checkout(conn, fun, opts) do
+    ref = make_ref()
+
+    try do
+      DBConnection.run(
+        conn,
+        fn checked_out ->
+          case fun.(checked_out) do
+            {:selecto_session_close, value} ->
+              Process.put(ref, {:closed, value})
+              :closed
+
+            value ->
+              throw({ref, value})
+          end
+        end,
+        Keyword.take(opts, [:timeout, :queue_timeout, :queue_target, :queue_interval])
+      )
+    catch
+      :throw, {^ref, value} ->
+        finish(value)
+
+      :error, %DBConnection.ConnectionError{} = error ->
+        case Process.get(ref) do
+          {:closed, value} -> finish(value)
+          nil -> reraise(error, __STACKTRACE__)
+        end
+    else
+      :closed -> finish(elem(Process.get(ref), 1))
+    after
+      Process.delete(ref)
+    end
+  end
+
+  defp finish({:selecto_session_raise, kind, reason, stack}),
+    do: :erlang.raise(kind, reason, stack)
+
+  defp finish(value), do: value
+
+  defp text(conn, statement, opts) do
+    MyXQL.query(conn, statement, [], [query_type: :text] ++ Keyword.take(opts, [:timeout]))
+  end
+
+  defp sanitize(reason), do: SelectoDBMariaDB.Adapter.sanitize_error(reason)
 
   @doc false
   def verify(conn, opts \\ []) do
@@ -98,7 +435,12 @@ defmodule SelectoDBMariaDB.Session do
       {:ok, %MyXQL.Result{rows: [[^time_zone, ^sql_mode]]}} ->
         :ok
 
-      _changed ->
+      # The check itself failed (a kill, a lost connection): nothing says the
+      # session changed, and the failure is what the caller is told.
+      {:error, reason} ->
+        {:error, sanitize(reason)}
+
+      {:ok, _changed} ->
         _ =
           MyXQL.query(conn, "SET SESSION time_zone = ?, SESSION sql_mode = ?", [
             time_zone,
