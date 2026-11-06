@@ -439,11 +439,12 @@ defmodule SelectoDBMariaDB.Adapter do
     end
   end
 
-  # The view's SELECT branches (a UNION's every branch), each one plain.
+  # The view's SELECT branches, each one plain: any set operator (UNION,
+  # INTERSECT, EXCEPT, MINUS) makes more than one, and no proof (R40d).
   defp view_branches(definition) do
     branches =
       definition
-      |> split_top(~r/\Aunion(?:\s+(?:all|distinct))?\b/i)
+      |> split_top(~r/\A(?:union|intersect|except|minus)(?:\s+(?:all|distinct))?\b/i)
       |> Enum.map(&strip_parens/1)
 
     # R40d: one SELECT only, with no subquery or derived table anywhere.

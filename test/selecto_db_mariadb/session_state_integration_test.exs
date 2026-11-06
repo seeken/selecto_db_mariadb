@@ -563,6 +563,9 @@ defmodule SelectoDBMariaDB.SessionStateIntegrationTest do
         # A UNION whose first branch is an expression.
         {"v_union",
          "SELECT id, DATE_FORMAT(ts, '%Y') AS k FROM r40b WHERE id = 1 UNION ALL SELECT id, k FROM r40b WHERE id = 2"},
+        # A set operator UNION splitting does not see (R40d).
+        {"v_except", "SELECT id, k FROM r40b EXCEPT SELECT id, DATE_FORMAT(ts, '%Y') FROM r40b"},
+        {"v_intersect", "SELECT id, k FROM r40b INTERSECT SELECT id, k FROM r40b WHERE id = 1"},
         # A derived table aliased like the base table.
         {"v_derived",
          "SELECT r40b.id, r40b.k FROM (SELECT id, DATE_FORMAT(ts, '%Y') AS k FROM r40b) r40b"},
