@@ -11,8 +11,13 @@
   `completion_type` 1 opened a transaction the host's next write was lost in
   and at 2 closed the connection.
 - Reads and streams at `autocommit=0` keep the host's connection, variables and
-  locks: `DBConnection.run/3` closed a connection whose status changed.
-- An idle read or stream is `START TRANSACTION READ ONLY` ended by ROLLBACK (R55).
+  locks: `DBConnection.run/3` closed a connection whose status changed. They run
+  as written, so their snapshot stays until the host ends it.
+- Hand-built text on a read path must be a read by its first word
+  (`hand_built_not_a_read`); where a read runs as written, a `WITH` that says
+  INSERT, UPDATE, DELETE or REPLACE refuses (`hand_built_write`).
+- An idle read or stream at `autocommit=1` is `START TRANSACTION READ ONLY` ended by
+  ROLLBACK (R55).
   A read that reaches a write refuses (`read_only_read`). Under `LOCK TABLES` a
   read runs as written; the lock probe is prepared, never executed.
 - A write or `transaction/3` on a pid in a host transaction refuses

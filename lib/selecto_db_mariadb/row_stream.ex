@@ -67,7 +67,14 @@ defmodule SelectoDBMariaDB.RowStream do
                 end
 
                 if Keyword.get(opts, :selecto_session_guard) == true,
-                  do: Session.guarded_read(checked_out, statement, session, cursor),
+                  do:
+                    Session.guarded_read(
+                      checked_out,
+                      statement,
+                      session,
+                      cursor,
+                      Keyword.take(opts, [:selecto_generated])
+                    ),
                   else: cursor.()
               end
               |> case do

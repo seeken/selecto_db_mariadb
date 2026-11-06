@@ -134,6 +134,10 @@ triggers or rules.
   `autocommit=0` is a host transaction from its first statement: a read there
   opens what the host's own SELECT would, and its snapshot stays until the host
   ends it.
+- Hand-built text on a read path runs as written, but must be a read by its
+  first word (`reason: :hand_built_not_a_read`), and in a host transaction,
+  where nothing would stop it, a `WITH` that says INSERT, UPDATE, DELETE or
+  REPLACE refuses (`reason: :hand_built_write`).
 - A read under `LOCK TABLES` or `FLUSH TABLES t WITH READ LOCK` runs as
   written too, because START TRANSACTION would release those locks: a writing
   view reached there at `autocommit=1` commits, as it would for the host's own

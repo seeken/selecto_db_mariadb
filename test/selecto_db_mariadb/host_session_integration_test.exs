@@ -243,6 +243,49 @@ defmodule SelectoDBMariaDB.HostSessionIntegrationTest do
     close(conn)
   end
 
+  test "hand-built text on a read path must be a read (R68)", %{other: other} do
+    conn = open()
+    read = &Adapter.execute(&1, &2, [], selecto_read: true)
+
+    for text <- [
+          "COMMIT",
+          "ROLLBACK",
+          "DELETE FROM hs_t",
+          "SET @x = 1",
+          "/* SELECT */ COMMIT",
+          "/*! DELETE FROM hs_t */",
+          "-- SELECT\nCOMMIT",
+          "# SELECT\nCOMMIT",
+          "(COMMIT)",
+          "SELECTED",
+          ""
+        ] do
+      assert {:error, %{details: %{reason: :hand_built_not_a_read}}} = read.(conn, text), text
+    end
+
+    assert {:ok, %{rows: [[1]]}} = read.(conn, "/* a */ -- b\n ((SELECT 1))")
+    assert {:ok, %{rows: [["delete"]]}} = read.(conn, "SELECT 'delete'")
+
+    # In a host transaction nothing stops a write, and the read stays as written.
+    sql(conn, "START TRANSACTION")
+    sql(conn, "INSERT INTO hs_log VALUES ('host')")
+    assert {:error, %{details: %{reason: :hand_built_not_a_read}}} = read.(conn, "COMMIT")
+
+    assert {:error, %{details: %{reason: :hand_built_write}}} =
+             read.(conn, "WITH x AS (SELECT 1 AS id) DELETE hs_t FROM hs_t JOIN x USING (id)")
+
+    assert {:ok, %{rows: [[1]]}} =
+             read.(conn, "WITH x AS (SELECT 1 AS id) SELECT id FROM x FOR UPDATE")
+
+    assert {:ok, %{rows: [["update"]]}} =
+             read.(conn, "WITH x AS (SELECT 'update' AS id) SELECT id FROM x")
+
+    sql(conn, "ROLLBACK")
+    assert sql(other, "SELECT COUNT(*) FROM hs_log") == [[0]]
+    assert sql(other, "SELECT COUNT(*) FROM hs_t") == [[3]]
+    close(conn)
+  end
+
   test "a read at autocommit=0 keeps its snapshot until the host ends it", %{other: other} do
     conn = open()
     sql(conn, "SET SESSION autocommit = 0")

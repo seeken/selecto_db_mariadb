@@ -148,24 +148,95 @@ defmodule SelectoDBMariaDB.Session do
   # would for the host's own SELECT. A global FLUSH TABLES WITH READ LOCK does
   # not show in the probe and survives START TRANSACTION.
   def guarded_read(conn, query, %{autocommit: autocommit}, work, opts \\ []) do
-    if DBConnection.status(conn) == :idle and autocommit not in [0, "0"] do
-      case host_locks(conn, relations(query), opts) do
-        :none ->
-          case transact(conn, read_start(query), fn -> {:rollback, work.()} end, opts) do
-            {:error, %MyXQL.Error{} = error} -> {:error, sanitize(error)}
-            {:error, %DBConnection.ConnectionError{} = error} -> {:error, sanitize(error)}
-            other -> other
-          end
+    hand_built? = Keyword.get(opts, :selecto_generated) != true
+    text = IO.iodata_to_binary(query)
 
-        :held ->
-          ended(conn, work, opts)
+    with :ok <- if(hand_built?, do: hand_built_read(text), else: :ok) do
+      as_written = fn -> if hand_built? and writes?(text), do: host_write(), else: work.() end
 
-        {:error, reason} ->
-          settle(conn, {:error, sanitize(reason)}, opts)
+      if DBConnection.status(conn) == :idle and autocommit not in [0, "0"] do
+        case host_locks(conn, relations(query), opts) do
+          :none ->
+            case transact(conn, read_start(query), fn -> {:rollback, work.()} end, opts) do
+              {:error, %MyXQL.Error{} = error} -> {:error, sanitize(error)}
+              {:error, %DBConnection.ConnectionError{} = error} -> {:error, sanitize(error)}
+              other -> other
+            end
+
+          :held ->
+            ended(conn, as_written, opts)
+
+          {:error, reason} ->
+            settle(conn, {:error, sanitize(reason)}, opts)
+        end
+      else
+        as_written.()
       end
-    else
-      work.()
     end
+  end
+
+  # Hand-built text runs as written (R68), so it must be a read by its first
+  # word, past comments and opening parentheses: COMMIT there would end the
+  # read's transaction, or the host's. An executable comment is no comment.
+  defp hand_built_read(text) do
+    word = first_word(text)
+
+    if word != nil and String.upcase(word) in ~w(SELECT WITH VALUES TABLE),
+      do: :ok,
+      else: hand_built_refusal(:hand_built_not_a_read, "must be a read")
+  end
+
+  defp first_word(<<c, rest::binary>>) when c in [?\s, ?\t, ?\n, ?\r, ?\f, ?(],
+    do: first_word(rest)
+
+  defp first_word(<<"/*!", _::binary>>), do: nil
+  defp first_word(<<"/*M!", _::binary>>), do: nil
+
+  defp first_word(<<"/*", rest::binary>>) do
+    case :binary.split(rest, "*/") do
+      [_comment, tail] -> first_word(tail)
+      [_never_closed] -> nil
+    end
+  end
+
+  defp first_word(<<"#", rest::binary>>), do: past_line(rest)
+  defp first_word(<<"-- ", rest::binary>>), do: past_line(rest)
+
+  defp first_word(text) do
+    case Regex.run(~r/\A[A-Za-z]+(?![A-Za-z0-9_$])/, text) do
+      [word] -> word
+      nil -> nil
+    end
+  end
+
+  defp past_line(rest) do
+    case :binary.split(rest, "\n") do
+      [_line, tail] -> first_word(tail)
+      [_no_end] -> nil
+    end
+  end
+
+  # Where a read runs as written nothing stops a write, and only a statement
+  # that opens WITH can be one: its words decide, strings and comments aside.
+  defp writes?(text) do
+    "WITH" == text |> first_word() |> to_string() |> String.upcase() and
+      Regex.match?(
+        ~r/\b(?:INSERT|UPDATE|DELETE|REPLACE)\b(?!\s*\()/i,
+        ~r/'(?:[^'\\]|\\.|'')*'|"(?:[^"\\]|\\.|"")*"|`(?:[^`]|``)*`|\/\*.*?\*\/|(?:#|-- )[^\n]*|\bFOR\s+UPDATE\b/is
+        |> Regex.replace(text, " ")
+      )
+  end
+
+  defp host_write,
+    do: hand_built_refusal(:hand_built_write, "must not write in a host transaction")
+
+  defp hand_built_refusal(reason, message) do
+    {:error,
+     %Selecto.Error{
+       type: :query_enforcement,
+       message: "MariaDB refuses hand-built SQL on a read path: it " <> message,
+       details: %{code: :query_rule_not_evaluable, reason: reason, adapter: :mariadb}
+     }}
   end
 
   defp read_start(query) do
