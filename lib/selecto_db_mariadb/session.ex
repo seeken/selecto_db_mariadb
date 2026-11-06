@@ -48,6 +48,12 @@ defmodule SelectoDBMariaDB.Session do
   # A statement a kill or a host's pending interrupt ended before it ran.
   @interrupted [1317, 3024, 1969]
   @lock_probe_relation "selecto_lock_probe_absent"
+
+  # The errors that say a name is no table this session can reach: no such
+  # table, database or default database, text that is no name, no privilege,
+  # not locked. A read of such a name fails on its own. Nothing else says the
+  # name is absent, a kill above all: a guard does not pass on its own failure.
+  @absent [1146, 1049, 1046, 1064, 1142, 1100]
   @undo_attempts 3
 
   @doc false
@@ -198,10 +204,7 @@ defmodule SelectoDBMariaDB.Session do
       {:error, %MyXQL.Error{mysql: %{code: 1100}}} ->
         :held
 
-      {:error, %MyXQL.Error{mysql: %{code: code}} = error} when code in @interrupted ->
-        {:error, error}
-
-      {:error, %MyXQL.Error{}} ->
+      {:error, %MyXQL.Error{mysql: %{code: code}}} when code in @absent ->
         :continue
 
       {:error, _} = error ->
@@ -494,8 +497,14 @@ defmodule SelectoDBMariaDB.Session do
             do: {:halt, temporary_shadow()},
             else: {:cont, :ok}
 
-        _other ->
+        {:error, %MyXQL.Error{mysql: %{code: code}}} when code in @absent ->
           {:cont, :ok}
+
+        {:error, reason} ->
+          {:halt, {:error, sanitize(reason)}}
+
+        {:ok, _unreadable} ->
+          {:halt, temporary_shadow()}
       end
     end)
   end

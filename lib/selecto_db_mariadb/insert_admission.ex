@@ -524,7 +524,7 @@ defmodule SelectoDBMariaDB.InsertAdmission do
   # property of the scope (w3exrev17 MEDIUM): it keeps its category so the
   # caller may retry. Anything else stays not evaluable.
   defp retryable_or_denied({:error, %Selecto.Error{details: %{category: category}}} = error)
-       when category in [:deadlock_detected, :lock_timeout],
+       when category in [:deadlock_detected, :lock_timeout, :query_canceled, :connection_error],
        do: error
 
   defp retryable_or_denied({:error, %Error{}} = error), do: error

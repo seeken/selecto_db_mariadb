@@ -1270,10 +1270,11 @@ defmodule SelectoDBMariaDB.Adapter do
   # takes a savepoint there too, never BEGIN/COMMIT (which would commit the
   # host's work, item 39).
   defp with_write_transaction(%DBConnection{} = connection, relations, fun) do
-    if DBConnection.status(connection) == :transaction or implicit_transaction?(connection) do
-      with_savepoint(connection, &fun.(&1, :host))
-    else
-      owned_write(connection, relations, fun)
+    case {DBConnection.status(connection), implicit_transaction(connection)} do
+      {:transaction, _} -> with_savepoint(connection, &fun.(&1, :host))
+      {_idle, {:ok, true}} -> with_savepoint(connection, &fun.(&1, :host))
+      {_idle, {:ok, false}} -> owned_write(connection, relations, fun)
+      {_idle, {:error, reason}} -> {:error, write_error(:transaction_failed, reason)}
     end
   end
 
@@ -1344,10 +1345,13 @@ defmodule SelectoDBMariaDB.Adapter do
     )
   end
 
-  defp implicit_transaction?(connection) do
+  # Neither answer is safe to guess: a savepoint outside a transaction undoes
+  # nothing, and BEGIN inside one commits it.
+  defp implicit_transaction(connection) do
     case MyXQL.query(connection, "SELECT @@session.autocommit", [], query_type: :text) do
-      {:ok, %MyXQL.Result{rows: [[autocommit]]}} -> autocommit in [0, "0"]
-      _ -> false
+      {:ok, %MyXQL.Result{rows: [[autocommit]]}} -> {:ok, autocommit in [0, "0"]}
+      {:ok, _unreadable} -> {:error, :session_unreadable}
+      {:error, _} = error -> error
     end
   end
 
