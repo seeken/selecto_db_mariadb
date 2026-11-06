@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- Every Selecto transaction ending is `COMMIT` or `ROLLBACK AND NO CHAIN NO
+  RELEASE`, sent as statements: MyXQL's callbacks send the bare form, which at
+  `completion_type` 1 opened a transaction the host's next write was lost in
+  and at 2 closed the connection.
+- Reads and streams at `autocommit=0` keep the host's connection, variables and
+  locks: `DBConnection.run/3` closed a connection whose status changed.
+- An idle read or stream is `START TRANSACTION READ ONLY` ended by ROLLBACK (R55).
+  A read that reaches a write refuses (`read_only_read`). Under `LOCK TABLES` a
+  read runs as written; the lock probe is prepared, never executed.
+- A write or `transaction/3` on a pid in a host transaction refuses
+  (`unowned_transaction`) and leaves it alone; under table locks it refuses
+  (`host_table_locks`).
+- A failed session check reports its own error, never `session_state_changed`.
+  KILL QUERY is `query_canceled` with code 1317.
 - Every governed write, `:many` included, takes the table's metadata lock
   and is refused unless the table is InnoDB (`non_transactional_engine`): a
   row trigger SIGNAL left partial changes on MyISAM, MEMORY and Aria

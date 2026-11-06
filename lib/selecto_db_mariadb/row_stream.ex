@@ -4,18 +4,21 @@ defmodule SelectoDBMariaDB.RowStream do
   # A server-side read-only cursor (COM_STMT_EXECUTE with CURSOR_TYPE_READ_ONLY,
   # then COM_STMT_FETCH) streamed by a producer process.
   #
-  # Ownership: the producer checks the connection out with `DBConnection.run/3`
-  # and never issues BEGIN, COMMIT, ROLLBACK or SAVEPOINT. While a host holds
-  # the connection (for example inside its own transaction) the producer waits
-  # in the pool queue and fails on the queue timeout; it never interleaves with,
-  # ends or rolls back host work. Each chunk waits for the consumer's
-  # acknowledgement, so at most one fetch is buffered. Closing the stream (or
-  # the consumer exiting) cancels the producer, which deallocates the cursor
-  # and checks the connection back in.
+  # Ownership: the producer checks the connection out (Session.checkout/3). A
+  # Selecto read's cursor runs as Session.guarded_read/4 says: on an idle
+  # connection inside a read-only transaction the producer owns and ends,
+  # inside a host transaction as written. While a host holds the connection
+  # the producer waits in the pool queue and fails on the queue timeout; it
+  # never interleaves with, ends or rolls back host work. Each chunk waits for
+  # the consumer's acknowledgement, so at most one fetch is buffered. Closing
+  # the stream (or the consumer exiting) cancels the producer, which
+  # deallocates the cursor, ends its transaction and checks the connection in.
   #
   # The columns are reported before enumeration, so opening the stream runs the
   # cursor's first fetch. A stream that is opened but never enumerated releases
   # its cursor and connection after `:receive_timeout`.
+
+  alias SelectoDBMariaDB.{Session, StoredValues}
 
   @default_max_rows 500
 
@@ -30,31 +33,46 @@ defmodule SelectoDBMariaDB.RowStream do
          :ok <- positive_integer(:receive_timeout, receive_timeout) do
       producer =
         Keyword.get(opts, :stream_producer, fn send_chunk ->
-          DBConnection.run(
+          Session.checkout(
             conn,
             fn checked_out ->
               # The session is checked on the connection the cursor then
               # uses, before the cursor opens and again after every fetched
               # batch, before its rows are handed out (items 59, 62); a
               # Selecto read also refuses a relation a TEMPORARY table
-              # shadows.
-              with {:ok, session} <- SelectoDBMariaDB.Session.state(checked_out),
-                   :ok <- shadow_check(checked_out, statement, opts) do
-                checked_out
-                |> MyXQL.stream(statement, params, max_rows: max_rows, timeout: stream_timeout)
-                |> Enum.reduce_while(:ok, fn %MyXQL.Result{rows: rows, columns: columns}, :ok ->
-                  # A stored value outside the supported range ends the
-                  # stream with a typed error (SelectoDBMariaDB.StoredValues).
-                  with :ok <- SelectoDBMariaDB.Session.unchanged(checked_out, session),
-                       :ok <- SelectoDBMariaDB.StoredValues.check(rows) do
-                    send_chunk.(rows || [], columns || [])
-                    {:cont, :ok}
+              # shadows, and runs as Session.guarded_read/4 says.
+              with {:ok, session} <- Session.state(checked_out) do
+                cursor = fn ->
+                  with :ok <- shadow_check(checked_out, statement, opts) do
+                    checked_out
+                    |> MyXQL.stream(statement, params,
+                      max_rows: max_rows,
+                      timeout: stream_timeout
+                    )
+                    |> Enum.reduce_while(:ok, fn %MyXQL.Result{rows: rows, columns: columns},
+                                                 :ok ->
+                      # A stored value outside the supported range ends the
+                      # stream with a typed error (StoredValues).
+                      with :ok <- Session.unchanged(checked_out, session),
+                           :ok <- StoredValues.check(rows) do
+                        send_chunk.(rows || [], columns || [])
+                        {:cont, :ok}
+                      else
+                        {:error, error} -> {:halt, {:producer_failed, error}}
+                      end
+                    end)
                   else
-                    {:error, error} -> {:halt, {:producer_failed, error}}
+                    {:error, error} -> {:producer_failed, error}
                   end
-                end)
-              else
+                end
+
+                if Keyword.get(opts, :selecto_session_guard) == true,
+                  do: Session.guarded_read(checked_out, statement, cursor),
+                  else: cursor.()
+              end
+              |> case do
                 {:error, error} -> {:producer_failed, error}
+                other -> other
               end
             end,
             timeout: stream_timeout
@@ -196,8 +214,8 @@ defmodule SelectoDBMariaDB.RowStream do
         Process.demonitor(parent_monitor_ref, [:flush])
       end
 
-    # DBConnection.run/3 returns the producer's value or raises, so any other
-    # result is a fully consumed cursor.
+    # The producer returns its value or raises, so any other result is a fully
+    # consumed cursor.
     case result do
       {:consumer_cancelled, ^ref} -> :ok
       {:producer_failed, reason} -> send(parent, {ref, {:producer_failed, reason}})

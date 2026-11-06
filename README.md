@@ -119,6 +119,26 @@ triggers or rules.
   savepoint, never BEGIN/COMMIT (which would commit the host's work). A
   managed write on a connection left with `autocommit=0` is refused
   (`:leaked_transaction`).
+- Every transaction Selecto ends, it ends with `COMMIT AND NO CHAIN NO RELEASE`
+  or `ROLLBACK AND NO CHAIN NO RELEASE`: `completion_type` is the host's and
+  neither chains a new transaction nor closes the connection under Selecto.
+- A read on an idle connection is its own `START TRANSACTION READ ONLY`, ended
+  by that ROLLBACK, so a view that writes refuses (`reason: :read_only_read`)
+  and nothing survives the read. Read-only state lives in that transaction;
+  no session setting is touched. If the ending itself fails it is retried,
+  then the connection closes.
+- A read inside a host transaction runs as written: no savepoint, no anchor,
+  no read-only mode. A writing view reached there is the host's to undo, and
+  a write it made to a non-transactional table cannot be undone by anyone.
+- A read under `LOCK TABLES` or `FLUSH TABLES t WITH READ LOCK` runs as
+  written too, because START TRANSACTION would release those locks: a writing
+  view reached there at `autocommit=1` commits, as it would for the host's own
+  SELECT. Reads keep the host's connection, variables and locks. A write or
+  `transaction/3` under such locks refuses (`reason: :host_table_locks`).
+- A write or `transaction/3` on a pid or pool whose connection is in a
+  transaction refuses without sending a statement
+  (`reason: :unowned_transaction`). Pass the connection from
+  `DBConnection.run/3` to write inside a transaction you hold.
 - On an AUTO_INCREMENT key only a canonical positive integer names the
   inserted row for the re-read: every value MySQL reads as zero (`0`, `'0'`,
   `'00'`, `'+0'`, `0.0`, FALSE) generates a new id, so a guarded insert
