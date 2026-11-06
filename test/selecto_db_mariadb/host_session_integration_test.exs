@@ -468,4 +468,30 @@ defmodule SelectoDBMariaDB.HostSessionIntegrationTest do
     assert id(conn) != before
     close(conn)
   end
+
+  test "a held connection that cannot be returned to idle closes under its holder" do
+    conn = open()
+    before = id(conn)
+
+    result =
+      try do
+        DBConnection.run(conn, fn held ->
+          {:ok, _} = MyXQL.query(held, "START TRANSACTION", [], query_type: :text)
+
+          value =
+            Session.checkout(held, fn checked_out ->
+              {:selecto_session_close, {:error, :original}}
+              |> then(fn closed -> if checked_out == held, do: closed end)
+            end)
+
+          throw({:held, value, MyXQL.query(held, "SELECT 1", [], query_type: :text)})
+        end)
+      catch
+        :throw, {:held, value, next} -> {value, next}
+      end
+
+    assert {{:error, :original}, {:error, %DBConnection.ConnectionError{}}} = result
+    assert id(conn) != before
+    close(conn)
+  end
 end
