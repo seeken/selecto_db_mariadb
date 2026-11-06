@@ -248,9 +248,12 @@ defmodule SelectoDBMariaDB.Session do
 
   @doc false
   # Returns `value` once the connection is idle. A rollback can be killed like
-  # any statement: it is retried, then the connection closes, since a
-  # connection that may still hold Selecto's transaction must not be reused.
-  # `value` is the original result in every case.
+  # any statement (MariaDB fails it with 1317): it is retried, then the
+  # connection closes, since a connection that may still hold Selecto's
+  # transaction must not be reused. `value` is the original result in every
+  # case. The read-only state a read carries lives in the transaction this
+  # ends: START TRANSACTION READ ONLY rather than one-shot SET TRANSACTION,
+  # which survives a failed read and a table-less SELECT.
   def settle(conn, value, opts \\ []) do
     if idle?(conn, opts, @undo_attempts), do: value, else: {:selecto_session_close, value}
   end
@@ -340,10 +343,17 @@ defmodule SelectoDBMariaDB.Session do
   # comes back after it.
   def checkout(conn, fun, opts \\ [])
 
-  def checkout(%DBConnection{} = conn, fun, _opts) do
+  # A connection the caller holds: it cannot go on holding what could not be
+  # undone, so it closes under the caller, whose next statement says so.
+  def checkout(%DBConnection{pool_ref: pool_ref} = conn, fun, _opts) do
     case fun.(conn) do
-      {:selecto_session_close, value} -> finish(value)
-      value -> finish(value)
+      {:selecto_session_close, value} ->
+        error = DBConnection.ConnectionError.exception("Selecto could not end its transaction")
+        _ = DBConnection.Holder.disconnect(pool_ref, error)
+        finish(value)
+
+      value ->
+        finish(value)
     end
   end
 
