@@ -335,6 +335,7 @@ defmodule SelectoDBMariaDB.SessionCheckIntegrationTest do
         driver!(conn, "SET SESSION max_error_count = 3")
 
         harmless = "SELECT SUM(code) FROM w"
+        assert %{num_warnings: 100} = MyXQL.query!(conn, harmless, [])
         assert {:ok, %{rows: [[_sum]]}} = Adapter.execute(conn, harmless, [], @built)
         assert {:ok, stream, _columns} = Adapter.stream(conn, harmless, [], @built)
         assert [[_sum]] = Enum.to_list(stream)
