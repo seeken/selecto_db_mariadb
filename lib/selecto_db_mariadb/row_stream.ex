@@ -73,7 +73,7 @@ defmodule SelectoDBMariaDB.RowStream do
                       statement,
                       session,
                       cursor,
-                      Keyword.take(opts, [:selecto_generated])
+                      Keyword.take(opts, [:selecto_generated, :selecto_statement])
                     ),
                   else: cursor.()
               end

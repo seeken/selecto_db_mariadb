@@ -45,7 +45,10 @@ defmodule SelectoDBMariaDB.Session do
   @commit "COMMIT AND NO CHAIN NO RELEASE"
   @rollback "ROLLBACK AND NO CHAIN NO RELEASE"
 
-  @lock_probe_relation "selecto_lock_probe_absent"
+  @lock_probe_relation "selecto_lock_probe_absent.selecto_lock_probe_absent"
+  @visible_tables "SELECT TABLE_SCHEMA, TABLE_NAME FROM information_schema.TABLES " <>
+                    "WHERE TABLE_TYPE = 'BASE TABLE' AND TABLE_SCHEMA NOT IN " <>
+                    "('information_schema', 'performance_schema') LIMIT 20"
 
   # The errors that say a name is no table this session can reach: no such
   # table, database or default database, text that is no name, no privilege,
@@ -149,21 +152,29 @@ defmodule SelectoDBMariaDB.Session do
   # not show in the probe and survives START TRANSACTION.
   def guarded_read(conn, query, %{autocommit: autocommit}, work, opts \\ []) do
     hand_built? = Keyword.get(opts, :selecto_generated) != true
-    text = IO.iodata_to_binary(query)
+
+    # The text as the caller gave it: a statement prefix is not the host's.
+    {text, params} = Keyword.get(opts, :selecto_statement, {IO.iodata_to_binary(query), []})
 
     with :ok <- if(hand_built?, do: hand_built_read(text), else: :ok) do
-      as_written = fn -> if hand_built? and writes?(text), do: host_write(), else: work.() end
+      as_written = fn ->
+        with :ok <- if(hand_built?, do: no_write(conn, text, params, opts), else: :ok) do
+          work.()
+        end
+      end
 
       if DBConnection.status(conn) == :idle and autocommit not in [0, "0"] do
         case host_locks(conn, relations(query), opts) do
           :none ->
-            case transact(conn, read_start(query), fn -> {:rollback, work.()} end, opts) do
+            start = read_start(query, hand_built?)
+
+            case transact(conn, start, fn -> {:rollback, work.()} end, opts) do
               {:error, %MyXQL.Error{} = error} -> {:error, sanitize(error)}
               {:error, %DBConnection.ConnectionError{} = error} -> {:error, sanitize(error)}
               other -> other
             end
 
-          :held ->
+          held when held in [:held, :unsettled] ->
             ended(conn, as_written, opts)
 
           {:error, reason} ->
@@ -175,57 +186,134 @@ defmodule SelectoDBMariaDB.Session do
     end
   end
 
-  # Hand-built text runs as written (R68), so it must be a read by its first
-  # word, past comments and opening parentheses: COMMIT there would end the
-  # read's transaction, or the host's. An executable comment is no comment.
+  @reads ~w(SELECT WITH VALUES TABLE SHOW EXPLAIN DESCRIBE DESC ANALYZE)
+  @read_select_types ["SIMPLE", "PRIMARY", "SUBQUERY", "DERIVED", "UNION", "UNION RESULT"] ++
+                       ["DEPENDENT SUBQUERY", "DEPENDENT UNION", "DEPENDENT DERIVED"] ++
+                       ["UNCACHEABLE SUBQUERY", "UNCACHEABLE UNION"] ++
+                       ["MATERIALIZED", "LATERAL DERIVED"]
+
+  # Hand-built text runs as written (R68), so its first word, past comments and
+  # opening parentheses, must say it reads: COMMIT there would end the read's
+  # transaction, or the host's. An executable comment is no comment. Row locks
+  # refuse on every route (R72): hosts take them through their own driver.
   defp hand_built_read(text) do
-    word = first_word(text)
+    rest = past_comments(text)
+    word = first_word(rest)
 
-    if word != nil and String.upcase(word) in ~w(SELECT WITH VALUES TABLE),
-      do: :ok,
-      else: hand_built_refusal(:hand_built_not_a_read, "must be a read")
-  end
+    cond do
+      word == nil or String.upcase(word) not in @reads ->
+        hand_built_refusal(:hand_built_not_a_read, "must be a read")
 
-  defp first_word(<<c, rest::binary>>) when c in [?\s, ?\t, ?\n, ?\r, ?\f, ?(],
-    do: first_word(rest)
+      String.upcase(word) == "ANALYZE" and not analyzes_select?(rest) ->
+        hand_built_refusal(:hand_built_not_a_read, "must be a read")
 
-  defp first_word(<<"/*!", _::binary>>), do: nil
-  defp first_word(<<"/*M!", _::binary>>), do: nil
+      row_lock?(text) ->
+        hand_built_refusal(:hand_built_row_lock, "must not take row locks")
 
-  defp first_word(<<"/*", rest::binary>>) do
-    case :binary.split(rest, "*/") do
-      [_comment, tail] -> first_word(tail)
-      [_never_closed] -> nil
+      true ->
+        :ok
     end
   end
 
-  defp first_word(<<"#", rest::binary>>), do: past_line(rest)
-  defp first_word(<<"-- ", rest::binary>>), do: past_line(rest)
+  defp analyzes_select?(text),
+    do: Regex.match?(~r/\AANALYZE\s+(?:FORMAT\s*=\s*\w+\s+)?\(*\s*SELECT\b/i, text)
+
+  # Words split by comments are still the words: an executable comment's text
+  # runs, and any other comment is whitespace. A string that says FOR UPDATE
+  # refuses too: this has to fail closed.
+  defp row_lock?(text) do
+    bare =
+      text
+      |> then(&Regex.replace(~r/\/\*(?:M?!\d*)(.*?)\*\//s, &1, " \\1 "))
+      |> then(&Regex.replace(~r/\/\*.*?\*\//s, &1, " "))
+
+    Regex.match?(~r/\bFOR\s+(?:UPDATE|SHARE)\b|\bLOCK\s+IN\s+SHARE\s+MODE\b/i, bare)
+  end
+
+  defp past_comments(<<c, rest::binary>>) when c in [?\s, ?\t, ?\n, ?\r, ?\f, ?\v, ?(],
+    do: past_comments(rest)
+
+  defp past_comments(<<"/*!", _::binary>>), do: ""
+  defp past_comments(<<"/*M!", _::binary>>), do: ""
+
+  defp past_comments(<<"/*", rest::binary>>) do
+    case :binary.split(rest, "*/") do
+      [_comment, tail] -> past_comments(tail)
+      [_never_closed] -> ""
+    end
+  end
+
+  defp past_comments(<<"#", rest::binary>>), do: past_line(rest)
+
+  defp past_comments(<<"--", c, rest::binary>>) when c in [?\s, ?\t, ?\n, ?\r, ?\f, ?\v],
+    do: if(c == ?\n, do: past_comments(rest), else: past_line(rest))
+
+  defp past_comments(text), do: text
+
+  defp past_line(rest) do
+    case :binary.split(rest, "\n") do
+      [_line, tail] -> past_comments(tail)
+      [_no_end] -> ""
+    end
+  end
 
   defp first_word(text) do
-    case Regex.run(~r/\A[A-Za-z]+(?![A-Za-z0-9_$])/, text) do
+    case Regex.run(~r/\A[A-Za-z]+(?![A-Za-z0-9_$])/, past_comments(text)) do
       [word] -> word
       nil -> nil
     end
   end
 
-  defp past_line(rest) do
-    case :binary.split(rest, "\n") do
-      [_line, tail] -> first_word(tail)
-      [_no_end] -> nil
+  # Where a read runs as written nothing stops a write. Only WITH can open a
+  # statement that writes, or ANALYZE run one, and text decides nothing here:
+  # versioned comments, NO_BACKSLASH_ESCAPES, ANSI_QUOTES and a backquoted alias
+  # have all beaten a lexer. The server parses it: EXPLAIN says what it would do,
+  # and whatever that cannot settle refuses.
+  defp no_write(conn, text, params, opts) do
+    case text |> first_word() |> to_string() |> String.upcase() do
+      "WITH" -> explained_read(conn, text, params, opts)
+      word when word in ~w(ANALYZE EXPLAIN DESC DESCRIBE) -> analyzed(conn, text, params, opts)
+      _reads -> :ok
     end
   end
 
-  # Where a read runs as written nothing stops a write, and only a statement
-  # that opens WITH can be one: its words decide, strings and comments aside.
-  defp writes?(text) do
-    "WITH" == text |> first_word() |> to_string() |> String.upcase() and
-      Regex.match?(
-        ~r/\b(?:INSERT|UPDATE|DELETE|REPLACE)\b(?!\s*\()/i,
-        ~r/'(?:[^'\\]|\\.|'')*'|"(?:[^"\\]|\\.|"")*"|`(?:[^`]|``)*`|\/\*.*?\*\/|(?:#|-- )[^\n]*|\bFOR\s+UPDATE\b/is
-        |> Regex.replace(text, " ")
-      )
+  # ANALYZE runs what it analyses, so what follows the keyword is judged as itself.
+  defp analyzed(conn, text, params, opts) do
+    prefix = ~r/\A(?:(?:EXPLAIN|DESC|DESCRIBE)\s+)?ANALYZE\s+(?:FORMAT\s*=\s*\w+\s+)?/i
+    rest = past_comments(text)
+
+    cond do
+      Regex.match?(prefix, rest) ->
+        explained_read(conn, Regex.replace(prefix, rest, "", global: false), params, opts)
+
+      Regex.match?(~r/\banalyze\b/i, text) ->
+        host_write()
+
+      true ->
+        :ok
+    end
   end
+
+  defp explained_read(conn, text, params, opts) do
+    case MyXQL.query(conn, "EXPLAIN " <> text, params, Keyword.take(opts, [:timeout])) do
+      {:ok, %MyXQL.Result{columns: columns, rows: [_ | _] = rows}} when is_list(columns) ->
+        case Enum.find_index(columns, &(String.downcase(&1) == "select_type")) do
+          nil ->
+            host_write()
+
+          index ->
+            if Enum.all?(rows, &(read_type(Enum.at(&1, index)) in @read_select_types)),
+              do: :ok,
+              else: host_write()
+        end
+
+      _unsettled ->
+        host_write()
+    end
+  end
+
+  defp read_type(type) when is_binary(type), do: String.upcase(type)
+  defp read_type(_other), do: nil
 
   defp host_write,
     do: hand_built_refusal(:hand_built_write, "must not write in a host transaction")
@@ -239,7 +327,9 @@ defmodule SelectoDBMariaDB.Session do
      }}
   end
 
-  defp read_start(query) do
+  defp read_start(_query, true), do: "START TRANSACTION READ ONLY"
+
+  defp read_start(query, false) do
     if Regex.match?(~r/\bFOR\s+(?:UPDATE|SHARE)\b/i, IO.iodata_to_binary(query)),
       do: "START TRANSACTION",
       else: "START TRANSACTION READ ONLY"
@@ -247,20 +337,28 @@ defmodule SelectoDBMariaDB.Session do
 
   @doc false
   # Whether this session holds LOCK TABLES or FLUSH TABLES t WITH READ LOCK:
-  # `:held`, `:none`, or the error that ended the probe. Under such locks a
-  # table not locked under this alias answers 1100. The probe is prepared
-  # and never executed: MariaDB evaluates a DETERMINISTIC function of a view
-  # at optimisation, so running SELECT 1 FROM view WHERE FALSE would commit
-  # that function's writes. A relation that does not resolve says nothing,
-  # so the next is asked, then a name that exists nowhere (1100 under locks,
-  # 1146 otherwise).
+  # `:held`, `:none`, `:unsettled` when no probe could tell, or the error that
+  # ended the probe. Under such locks a table not locked under this alias answers
+  # 1100, and a name that exists nowhere does too: otherwise it answers 1146. The
+  # probe is prepared and never executed: MariaDB evaluates a DETERMINISTIC
+  # function of a view at optimisation, so running SELECT 1 FROM view WHERE FALSE
+  # would commit that function's writes.
+  #
+  # No default database (1046) and table-only grants (1142) say nothing about
+  # locks. Then a table this role can see answers: LOCK TABLES needs SELECT on
+  # what it locks, so with none to see, there are none.
   def host_locks(conn, relations, opts \\ []) do
-    (relations ++ [@lock_probe_relation])
-    |> Enum.reduce_while(:none, fn relation, :none ->
+    case probe_names(conn, relations ++ [@lock_probe_relation], opts) do
+      :unsettled -> probe_visible(conn, opts)
+      settled -> settled
+    end
+  end
+
+  defp probe_names(conn, names, opts) do
+    Enum.reduce_while(names, :unsettled, fn relation, _ ->
       case lock_probe(conn, relation, opts) do
-        :continue -> {:cont, :none}
-        :none -> {:halt, :none}
-        other -> {:halt, other}
+        :continue -> {:cont, :unsettled}
+        settled -> {:halt, settled}
       end
     end)
   end
@@ -276,6 +374,9 @@ defmodule SelectoDBMariaDB.Session do
       {:error, %MyXQL.Error{mysql: %{code: 1100}}} ->
         :held
 
+      {:error, %MyXQL.Error{mysql: %{code: code}}} when code in [1146, 1049] ->
+        if relation == @lock_probe_relation, do: :none, else: :continue
+
       {:error, %MyXQL.Error{mysql: %{code: code}}} when code in @absent ->
         :continue
 
@@ -283,6 +384,23 @@ defmodule SelectoDBMariaDB.Session do
         error
     end
   end
+
+  defp probe_visible(conn, opts) do
+    case MyXQL.query(conn, @visible_tables, [], Keyword.take(opts, [:timeout])) do
+      {:ok, %MyXQL.Result{rows: []}} ->
+        :none
+
+      {:ok, %MyXQL.Result{rows: rows}} ->
+        rows
+        |> Enum.map(fn [schema, table] -> quoted_name(schema) <> "." <> quoted_name(table) end)
+        |> then(&probe_names(conn, &1, opts))
+
+      {:error, _} ->
+        :unsettled
+    end
+  end
+
+  defp quoted_name(name), do: "`" <> String.replace(to_string(name), "`", "``") <> "`"
 
   @doc false
   # One transaction Selecto owns on an idle checked-out connection. `work`
@@ -351,10 +469,12 @@ defmodule SelectoDBMariaDB.Session do
   end
 
   @doc false
-  # The undo of a savepoint that could not be returned to, inside a
-  # transaction Selecto did not begin on this call. Under a DBConnection
-  # transaction no statement is sent: the holder's own ending rolls back.
-  # On a transaction Selecto owns, the owner's ending does.
+  # The undo of a savepoint that could not be returned to, inside a transaction
+  # Selecto did not begin on this call. Under a DBConnection transaction no
+  # statement is sent: the holder's own ending rolls back. On a transaction
+  # Selecto owns, the owner's ending does. Any other transaction is the host's
+  # and Selecto never ends it (R72): the connection closes, so the holder's next
+  # statement fails, and no COMMIT can report what this write left behind.
   def fail_transaction(%DBConnection{conn_mode: :transaction, conn_ref: ref} = conn) do
     if Process.get({__MODULE__, :owned, ref}) do
       Process.put({__MODULE__, :owned, ref}, :failed)
@@ -365,12 +485,7 @@ defmodule SelectoDBMariaDB.Session do
     :ok
   end
 
-  def fail_transaction(conn) do
-    case settle(conn, :ok, []) do
-      {:selecto_session_close, :ok} -> close_held(conn)
-      :ok -> :ok
-    end
-  end
+  def fail_transaction(conn), do: close_held(conn)
 
   @doc false
   # `fun` gets a connection DBConnection treats as inside a transaction, so
