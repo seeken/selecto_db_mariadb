@@ -274,7 +274,7 @@ defmodule SelectoDBMariaDB.HostSessionIntegrationTest do
     assert {:error, %{details: %{reason: :hand_built_write}}} =
              read.(conn, "WITH x AS (SELECT 1 AS id) DELETE hs_t FROM hs_t JOIN x USING (id)")
 
-    assert {:error, %{details: %{reason: :hand_built_row_lock}}} =
+    assert {:ok, %{rows: [[1]]}} =
              read.(conn, "WITH x AS (SELECT 1 AS id) SELECT id FROM x FOR UPDATE")
 
     assert {:ok, %{rows: [["update"]]}} =
@@ -369,26 +369,38 @@ defmodule SelectoDBMariaDB.HostSessionIntegrationTest do
     close(conn)
   end
 
-  test "hand-built row locks refuse, however they are written (R72)" do
+  test "a hand-built row lock holds in a host transaction, and ends with the read alone", %{
+    other: other
+  } do
     conn = open()
+    sql(other, "SET SESSION innodb_lock_wait_timeout = 1")
+    read = &Adapter.execute(conn, &1, [], selecto_read: true)
+    update = "UPDATE hs_t SET v = 1 WHERE id = 1"
 
     for text <- [
-          "SELECT id FROM hs_t FOR UPDATE",
-          "SELECT id FROM hs_t FOR SHARE",
-          "SELECT id FROM hs_t LOCK IN SHARE MODE",
-          "SELECT id FROM hs_t /*!50000 FOR UPDATE */",
-          "SELECT id FROM hs_t FOR/* */UPDATE"
-        ],
-        setup <- ["DO 0", "START TRANSACTION"] do
-      sql(conn, setup)
+          "SELECT id FROM hs_t WHERE id = 1 FOR UPDATE",
+          "SELECT id FROM hs_t WHERE id = 1 LOCK IN SHARE MODE",
+          "SELECT id FROM hs_t WHERE id = 1 /*!50000 FOR UPDATE */",
+          "SELECT id FROM hs_t WHERE id = 1 FOR/* */UPDATE"
+        ] do
+      # Alone: the rows, and nothing held afterwards.
+      assert {:ok, %{rows: [[1]]}} = read.(text), text
+      assert DBConnection.run(conn, &DBConnection.status/1) == :idle
+      assert sql(other, update) in [0, 1], text
 
-      assert {:error, %{details: %{reason: :hand_built_row_lock}}} =
-               Adapter.execute(conn, text, [], selecto_read: true),
-             text
-
+      # In the host's transaction: as written, so the lock is the host's.
+      sql(conn, "START TRANSACTION")
+      assert {:ok, %{rows: [[1]]}} = read.(text), text
+      assert sql(other, update) == {:error, 1205}, text
       sql(conn, "ROLLBACK AND NO CHAIN NO RELEASE")
     end
 
+    # Only a write is refused, and a string that says FOR UPDATE is a string.
+    assert {:ok, %{rows: [["for update"]]}} = read.("SELECT 'for update'")
+
+    sql(conn, "START TRANSACTION")
+    assert {:ok, %{rows: [["for update"]]}} = read.("SELECT 'for update'")
+    sql(conn, "ROLLBACK AND NO CHAIN NO RELEASE")
     close(conn)
   end
 
