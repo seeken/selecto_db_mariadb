@@ -107,19 +107,35 @@ defmodule SelectoDBMariaDB.Session do
     checkout(
       conn,
       fn checked_out ->
-        with {:ok, before} <- state(checked_out, opts) do
-          guarded_read(
-            checked_out,
-            query,
-            before,
-            fn -> checked(checked_out, before, fun, opts) end,
-            opts
-          )
+        if host_text?(opts) do
+          with {:ok, before} <- host_state(checked_out, opts) do
+            guarded_read(checked_out, query, before, fn -> fun.(checked_out) end, opts)
+          end
+        else
+          with {:ok, before} <- state(checked_out, opts) do
+            guarded_read(
+              checked_out,
+              query,
+              before,
+              fn -> checked(checked_out, before, fun, opts) end,
+              opts
+            )
+          end
         end
       end,
       opts
     )
   end
+
+  @doc false
+  # Text wholly the host's: no compile stamped it, and no compile carried it as a
+  # fragment. It runs in the host's session (R71), under no time_zone or sql_mode
+  # refusal and no TEMPORARY guard; only the encoding check stays. A statement
+  # Selecto built that carries a host fragment keeps every guard.
+  def host_text?(opts),
+    do:
+      Keyword.get(opts, :selecto_generated) != true and
+        Keyword.get(opts, :selecto_raw_sql) != true
 
   defp checked(conn, before, fun, opts) do
     with {:ok, _} = result <- fun.(conn),
@@ -151,7 +167,7 @@ defmodule SelectoDBMariaDB.Session do
   # would for the host's own SELECT. A global FLUSH TABLES WITH READ LOCK does
   # not show in the probe and survives START TRANSACTION.
   def guarded_read(conn, query, %{autocommit: autocommit}, work, opts \\ []) do
-    hand_built? = Keyword.get(opts, :selecto_generated) != true
+    hand_built? = host_text?(opts)
 
     # The text as the caller gave it: a statement prefix is not the host's.
     {text, params} = Keyword.get(opts, :selecto_statement, {IO.iodata_to_binary(query), []})
@@ -187,10 +203,6 @@ defmodule SelectoDBMariaDB.Session do
   end
 
   @reads ~w(SELECT WITH VALUES TABLE SHOW EXPLAIN DESCRIBE DESC ANALYZE)
-  @read_select_types ["SIMPLE", "PRIMARY", "SUBQUERY", "DERIVED", "UNION", "UNION RESULT"] ++
-                       ["DEPENDENT SUBQUERY", "DEPENDENT UNION", "DEPENDENT DERIVED"] ++
-                       ["UNCACHEABLE SUBQUERY", "UNCACHEABLE UNION"] ++
-                       ["MATERIALIZED", "LATERAL DERIVED"]
 
   # Hand-built text runs as written (R68), so its first word, past comments and
   # opening parentheses, must say it reads: COMMIT there would end the read's
@@ -262,59 +274,11 @@ defmodule SelectoDBMariaDB.Session do
     end
   end
 
-  # Where a read runs as written nothing stops a write. Only WITH can open a
-  # statement that writes, or ANALYZE run one, and text decides nothing here:
-  # versioned comments, NO_BACKSLASH_ESCAPES, ANSI_QUOTES and a backquoted alias
-  # have all beaten a lexer. The server parses it: EXPLAIN says what it would do,
-  # and whatever that cannot settle refuses.
-  defp no_write(conn, text, params, opts) do
-    case text |> first_word() |> to_string() |> String.upcase() do
-      "WITH" -> explained_read(conn, text, params, opts)
-      word when word in ~w(ANALYZE EXPLAIN DESC DESCRIBE) -> analyzed(conn, text, params, opts)
-      _reads -> :ok
-    end
-  end
-
-  # ANALYZE runs what it analyses, so what follows the keyword is judged as itself.
-  defp analyzed(conn, text, params, opts) do
-    prefix = ~r/\A(?:(?:EXPLAIN|DESC|DESCRIBE)\s+)?ANALYZE\s+(?:FORMAT\s*=\s*\w+\s+)?/i
-    rest = past_comments(text)
-
-    cond do
-      Regex.match?(prefix, rest) ->
-        explained_read(conn, Regex.replace(prefix, rest, "", global: false), params, opts)
-
-      Regex.match?(~r/\banalyze\b/i, text) ->
-        host_write()
-
-      true ->
-        :ok
-    end
-  end
-
-  defp explained_read(conn, text, params, opts) do
-    case MyXQL.query(conn, "EXPLAIN " <> text, params, Keyword.take(opts, [:timeout])) do
-      {:ok, %MyXQL.Result{columns: columns, rows: [_ | _] = rows}} when is_list(columns) ->
-        case Enum.find_index(columns, &(String.downcase(&1) == "select_type")) do
-          nil ->
-            host_write()
-
-          index ->
-            if Enum.all?(rows, &(read_type(Enum.at(&1, index)) in @read_select_types)),
-              do: :ok,
-              else: host_write()
-        end
-
-      _unsettled ->
-        host_write()
-    end
-  end
-
-  defp read_type(type) when is_binary(type), do: String.upcase(type)
-  defp read_type(_other), do: nil
-
-  defp host_write,
-    do: hand_built_refusal(:hand_built_write, "must not write in a host transaction")
+  # Where a read runs as written nothing stops a write. This stops honest
+  # mistakes, not evasion (R73), and the first word does that here: MariaDB cannot
+  # parse WITH ... UPDATE, and ANALYZE only reaches a SELECT past hand_built_read/1.
+  # No EXPLAIN: it evaluates a table-less CTE, running the read's functions twice.
+  defp no_write(_conn, _text, _params, _opts), do: :ok
 
   defp hand_built_refusal(reason, message) do
     {:error,
@@ -325,10 +289,14 @@ defmodule SelectoDBMariaDB.Session do
      }}
   end
 
+  # READ ONLY also refuses EXPLAIN UPDATE, which writes nothing.
+  defp plans?(text),
+    do: (text |> first_word() |> to_string() |> String.upcase()) in ~w(EXPLAIN DESC DESCRIBE)
+
   # A plain transaction stops no write, so hand-built text gets the check a read
   # that runs as written gets; the ROLLBACK then ends whatever a function did.
   defp read_start(conn, _query, {text, params}, true, opts) do
-    if row_lock?(text) do
+    if row_lock?(text) or plans?(text) do
       with :ok <- no_write(conn, text, params, opts), do: {:ok, "START TRANSACTION"}
     else
       {:ok, "START TRANSACTION READ ONLY"}
@@ -616,24 +584,49 @@ defmodule SelectoDBMariaDB.Session do
   end
 
   @doc false
+  # What text wholly the host's reads first (R71): only the encoding decides.
+  def host_state(conn, opts \\ []) do
+    case state_row(conn, opts) do
+      {:ok, [time_zone, _, client, connection, results, sql_mode, autocommit]} ->
+        if Enum.all?([client, connection, results], &(&1 == "utf8mb4")),
+          do: {:ok, %{time_zone: time_zone, sql_mode: sql_mode, autocommit: autocommit}},
+          else: refuse(:character_set)
+
+      {:ok, _unreadable} ->
+        refuse(:session)
+
+      {:error, _} = error ->
+        error
+    end
+  end
+
+  @doc false
   # The checked session state: `%{time_zone, sql_mode, autocommit}`.
   def state(conn, opts \\ []) do
+    case state_row(conn, opts) do
+      {:ok, [time_zone, _, _, _, _, sql_mode, autocommit] = row} ->
+        with :ok <- check(Enum.take(row, 6)) do
+          {:ok, %{time_zone: time_zone, sql_mode: sql_mode, autocommit: autocommit}}
+        end
+
+      {:ok, _unreadable} ->
+        refuse(:session)
+
+      {:error, _} = error ->
+        error
+    end
+  end
+
+  defp state_row(conn, opts) do
     case MyXQL.query(
            conn,
            SelectoDBMariaDB.Adapter.statement(@query),
            [],
            [query_type: :text] ++ Keyword.take(opts, [:timeout])
          ) do
-      {:ok, %MyXQL.Result{rows: [[time_zone, _, _, _, _, sql_mode, autocommit] = row]}} ->
-        with :ok <- check(Enum.take(row, 6)) do
-          {:ok, %{time_zone: time_zone, sql_mode: sql_mode, autocommit: autocommit}}
-        end
-
-      {:ok, _result} ->
-        refuse(:session)
-
-      {:error, reason} ->
-        {:error, SelectoDBMariaDB.Adapter.sanitize_error(reason)}
+      {:ok, %MyXQL.Result{rows: [row]}} -> {:ok, row}
+      {:ok, _result} -> {:ok, nil}
+      {:error, reason} -> {:error, sanitize(reason)}
     end
   end
 

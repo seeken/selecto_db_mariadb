@@ -135,16 +135,26 @@ triggers or rules.
   opens what the host's own SELECT would, and its snapshot stays until the host
   ends it. A pool whose connections are left at `autocommit=0` therefore keeps
   each connection's snapshot from one checkout to the next.
-- Hand-built text on a read path runs as written, but must be a read by its
-  first word (SELECT, WITH, VALUES, TABLE, SHOW, EXPLAIN, DESCRIBE, ANALYZE of a
-  select, or `reason: :hand_built_not_a_read`). In a host transaction, where
-  nothing would stop a write, the server decides: a WITH is EXPLAINed and its
-  `select_type` read, and anything but a read, or a statement EXPLAIN cannot
-  settle, refuses (`reason: :hand_built_write`), as does ANALYZE there.
+- Text wholly the host's (no compile built it) runs as written, in the host's
+  session: no `time_zone` or `sql_mode` refusal, no TEMPORARY guard; only the
+  encoding refusal stays. It must be a read by its first word (SELECT, WITH, VALUES,
+  TABLE, SHOW, EXPLAIN, DESCRIBE, ANALYZE of a select, or
+  `reason: :hand_built_not_a_read`). MariaDB's parser takes no
+  WITH ... UPDATE, so the first word is the whole check; it never EXPLAINs, since
+  that evaluates a table-less CTE and would run the read's functions twice.
+  That check stops honest mistakes, not evasion.
+- A statement Selecto built that carries a host fragment stays generated: its
+  relations, filters and tenant scope keep every guard, and only the fragment is
+  verbatim. Tenant scope depends on a `raw_sql_filter` being well-formed: one that
+  closes its own parenthesis escapes the scope.
+- **Never build hand-built text or a raw fragment from end-user input.** It is the
+  host's own code.
 - A hand-built row-locking read (`FOR UPDATE`, `FOR SHARE`, `LOCK IN SHARE MODE`)
   runs as the driver's would: in a host transaction it runs as written and the
   lock holds to the host's end; alone it ends with the read. The check here is
-  for writes, not locks.
+  for writes, not locks. On that idle path, or for EXPLAIN, R55 is met by the
+  ROLLBACK that ends the read: a function that writes there is undone, but a write
+  to a non-transactional table persists.
 - A read under `LOCK TABLES` or `FLUSH TABLES t WITH READ LOCK` runs as
   written too, because START TRANSACTION would release those locks: a writing
   view reached there at `autocommit=1` commits, as it would for the host's own
@@ -156,7 +166,9 @@ triggers or rules.
 - Selecto sends no ROLLBACK or COMMIT for a transaction it does not own. A write
   whose savepoint cannot be undone in a transaction begun with text on a held
   connection closes that connection, so the holder's next statement fails and no
-  COMMIT reports a false OK.
+  COMMIT reports a false OK. A transaction begun with text on a pool pid is host
+  misuse: a pool can reconnect between statements with or without Selecto. Use a
+  transaction handle.
 - A write or `transaction/3` on a pid or pool whose connection is in a
   transaction refuses without sending a statement
   (`reason: :unowned_transaction`). Pass the connection from
