@@ -1590,10 +1590,11 @@ defmodule SelectoDBMariaDB.Adapter do
   defp normalize_relation_source_kind(other), do: other
 
   @no_subquery_cache "SET STATEMENT optimizer_switch='subquery_cache=off'"
-  # The largest the server takes; a larger value warns.
-  @group_concat_pin 1_073_741_824
-  # Selecto.Advanced.CTE's limit on max_depth.
-  @depth_limit 10_000
+  # max_error_count at its maximum, so a cut cannot hide behind other warnings;
+  # group_concat_max_len at the largest the server takes, since more warns or
+  # fails; max_recursive_iterations at Selecto.Advanced.CTE's limit on max_depth.
+  @read_pins ", max_error_count=65535, group_concat_max_len=1073741824, " <>
+               "max_recursive_iterations=10000"
 
   @doc false
   # Every statement this adapter sends runs with MariaDB's subquery cache off.
@@ -1605,35 +1606,22 @@ defmodule SelectoDBMariaDB.Adapter do
   # subquery.)
   #
   # A statement Selecto built also pins what would cut its result silently
-  # (R74). group_concat_max_len fits anything short of the server's limit, and
-  # max_recursive_iterations fits the depth the statement declares: at the
-  # server's default of 1000 a clean chain stops early. A CTE that declares no
-  # depth keeps the session's bound. What still gets cut fails in
-  # Session.not_cut/3.
+  # (R74). At the server's default of 1000 iterations a clean chain stops early.
+  # A declared depth is its own bound, in the statement's text, so a cycle stops
+  # there; 10,000 bounds a CTE that declares none, beside one that does or not.
+  # What still gets cut fails in Session.not_cut/3.
   def statement(query, opts \\ []) do
     query = normalize_query(query)
 
     if String.starts_with?(query, @no_subquery_cache),
       do: query,
-      else: @no_subquery_cache <> read_pins(query, opts) <> " FOR " <> query
+      else: @no_subquery_cache <> read_pins(opts) <> " FOR " <> query
   end
 
-  defp read_pins(query, opts) do
+  defp read_pins(opts) do
     if Selecto.Executor.selecto_read?(opts) and not Session.host_text?(opts),
-      do: ", group_concat_max_len=#{@group_concat_pin}" <> depth_pin(query),
+      do: @read_pins,
       else: ""
-  end
-
-  # The recursion stops at `selecto_depth < N`, which takes N iterations.
-  defp depth_pin(query) do
-    case Regex.scan(~r/\.selecto_depth < (\d+)/, query, capture: :all_but_first) do
-      [] ->
-        ""
-
-      depths ->
-        depth = depths |> Enum.map(fn [depth] -> String.to_integer(depth) end) |> Enum.max()
-        ", max_recursive_iterations=#{min(depth, @depth_limit)}"
-    end
   end
 
   defp normalize_query(query) when is_binary(query), do: query

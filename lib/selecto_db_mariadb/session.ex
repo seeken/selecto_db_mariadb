@@ -51,6 +51,8 @@ defmodule SelectoDBMariaDB.Session do
   # GROUP_CONCAT or JSON_ARRAYAGG cut a row; a result over max_allowed_packet came
   # back NULL; max_recursive_iterations cut a CTE.
   @cut_warnings [1260, 1301, 1931]
+  # The server keeps this many conditions under the pin: more could hide a cut.
+  @warning_cap 65_535
 
   @utc_zones ["UTC", "+00:00", "Etc/UTC"]
 
@@ -772,8 +774,9 @@ defmodule SelectoDBMariaDB.Session do
 
   @doc false
   # Right after a statement Selecto built, while its warnings stand: the server
-  # says a result was cut only there (R74). Fewer warnings shown than counted
-  # cannot say it was not. Text wholly the host's reads what the host's session gives.
+  # says a result was cut only there (R74). Past the pin on max_error_count, fewer
+  # shown than counted cannot say it was not. Text wholly the host's reads what the
+  # host's session gives.
   def not_cut(conn, warnings, opts \\ [])
   def not_cut(_conn, warnings, _opts) when warnings in [0, nil], do: :ok
 
@@ -786,7 +789,8 @@ defmodule SelectoDBMariaDB.Session do
              [query_type: :text] ++ Keyword.take(opts, [:timeout])
            ) do
         {:ok, %MyXQL.Result{rows: rows}} ->
-          if length(rows) < warnings or Enum.any?(rows, &(Enum.at(&1, 1) in @cut_warnings)),
+          if warnings >= @warning_cap or length(rows) < warnings or
+               Enum.any?(rows, &(Enum.at(&1, 1) in @cut_warnings)),
             do: cut_result(),
             else: :ok
 

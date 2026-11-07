@@ -298,7 +298,7 @@ defmodule SelectoDBMariaDB.SessionCheckIntegrationTest do
     test "a CTE with no declared depth keeps the bound and fails visibly" do
       with_database(fn conn ->
         loop =
-          "WITH RECURSIVE w (a) AS (SELECT 1 UNION ALL SELECT a + 1 FROM w WHERE a < 5000) " <>
+          "WITH RECURSIVE w (a) AS (SELECT 1 UNION ALL SELECT a + 1 FROM w WHERE a < 20000) " <>
             "SELECT COUNT(*) FROM w"
 
         refusal = %{code: :query_rule_not_evaluable, reason: :result_cut, adapter: :mariadb}
@@ -312,6 +312,43 @@ defmodule SelectoDBMariaDB.SessionCheckIntegrationTest do
 
         # The host's own text reads what its session gives.
         assert {:ok, %{rows: [[1001]]}} = Adapter.execute(conn, loop, [], selecto_read: true)
+      end)
+    end
+
+    test "a declared depth does not lower the bound of a CTE beside it" do
+      with_database(fn conn ->
+        both =
+          "WITH RECURSIVE d (a, selecto_depth) AS (SELECT 1, 1 UNION ALL " <>
+            "SELECT d.a + 1, d.selecto_depth + 1 FROM d WHERE d.selecto_depth < 5), " <>
+            "n (a) AS (SELECT 1 UNION ALL SELECT a + 1 FROM n WHERE a < 20) " <>
+            "SELECT (SELECT COUNT(*) FROM d), (SELECT COUNT(*) FROM n)"
+
+        assert {:ok, %{rows: [[5, 20]]}} = Adapter.execute(conn, both, [], @built)
+      end)
+    end
+
+    test "harmless warnings past the session's cap answer; a cut behind them does not" do
+      with_database(fn conn ->
+        driver!(conn, "CREATE TABLE w (id INT PRIMARY KEY, code VARCHAR(20), note VARCHAR(100))")
+        values = Enum.map_join(1..100, ",", &"(#{&1}, '#{&1}-A', REPEAT('x', 90))")
+        driver!(conn, "INSERT INTO w VALUES #{values}")
+        driver!(conn, "SET SESSION max_error_count = 3")
+
+        harmless = "SELECT SUM(code) FROM w"
+        assert {:ok, %{rows: [[_sum]]}} = Adapter.execute(conn, harmless, [], @built)
+        assert {:ok, stream, _columns} = Adapter.stream(conn, harmless, [], @built)
+        assert [[_sum]] = Enum.to_list(stream)
+
+        # A 10,000-iteration cut behind 100 harmless warnings, with the cap kept at 3.
+        hidden =
+          "WITH RECURSIVE r (a) AS (SELECT 1 UNION ALL SELECT a + 1 FROM r WHERE a < 20000) " <>
+            "SELECT (SELECT SUM(code) FROM w), COUNT(*) FROM r"
+
+        assert {:error, %Selecto.Error{details: %{reason: :result_cut}}} =
+                 Adapter.execute(conn, hidden, [], @built)
+
+        assert [[3]] =
+                 MyXQL.query!(conn, "SELECT @@session.max_error_count", [], query_type: :text).rows
       end)
     end
 

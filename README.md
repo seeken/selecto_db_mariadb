@@ -88,12 +88,13 @@ triggers or rules.
   `after_connect` if the server defaults differ. Text wholly the host's is not
   held to this: it reads the past the host asked for.
 - A statement Selecto built pins, for that statement only, what would cut its
-  result: `group_concat_max_len` at the server's limit, and
-  `max_recursive_iterations` at the depth it declares, so a chain past the
-  server's 1000 runs in full and a cycle stops at `max_depth`. A CTE that declares
-  no depth keeps the session's bound. A result the server still cuts, or sends
-  as NULL over `max_allowed_packet`, is an error (`query_rule_not_evaluable`,
-  `reason: :result_cut`). The pins need no privilege.
+  result: `group_concat_max_len` at the server's limit, `max_error_count` at its
+  maximum, so other warnings cannot hide a cut, and `max_recursive_iterations` at
+  10,000, the largest `max_depth`. A chain past the server's 1000 runs in full, a
+  cycle stops at its declared `max_depth`, and a CTE that declares none stops at
+  10,000. A result the server cuts, or sends as NULL over `max_allowed_packet`, is
+  an error (`query_rule_not_evaluable`, `reason: :result_cut`). The pins need no
+  privilege.
 - Only a BASE TABLE or SYSTEM VERSIONED table is a write target: a write to a
   SEQUENCE (`reason: :sequence_target`, an INSERT would reset it) or a view
   (`reason: :unsupported_write_target`) refuses with `query_rule_not_evaluable`.
