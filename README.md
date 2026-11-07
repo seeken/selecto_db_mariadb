@@ -80,13 +80,23 @@ triggers or rules.
   must be utf8mb4, and sql_mode must include `STRICT_TRANS_TABLES` or
   `STRICT_ALL_TABLES`, and `system_versioning_asof` must be `DEFAULT`: set, a
   SELECT reads the past while UPDATE and DELETE hit current rows, so a scope or
-  post-image guard would prove a row that is no longer there. If any check
+  post-image guard would prove a row that is no longer there. `sql_select_limit`
+  must have no limit, or reads and a write's capture come back short, and
+  `div_precision_increment` must be the default, or an AVG changes. MariaDB
+  10.3.4 is the floor: the check reads `system_versioning_asof`. If any check
   fails, the call is refused before any statement runs. Set these with MyXQL's
   `after_connect` if the server defaults differ. Text wholly the host's is not
   held to this: it reads the past the host asked for.
-- A SEQUENCE is no write target: a governed write to one refuses
-  (`query_rule_not_evaluable`, `reason: :sequence_target`), since an INSERT
-  would reset it.
+- A statement Selecto built pins, for that statement only, what would cut its
+  result: `group_concat_max_len` at the server's limit, and
+  `max_recursive_iterations` at the depth it declares, so a chain past the
+  server's 1000 runs in full and a cycle stops at `max_depth`. A CTE that declares
+  no depth keeps the session's bound. A result the server still cuts, or sends
+  as NULL over `max_allowed_packet`, is an error (`query_rule_not_evaluable`,
+  `reason: :result_cut`). The pins need no privilege.
+- Only a BASE TABLE or SYSTEM VERSIONED table is a write target: a write to a
+  SEQUENCE (`reason: :sequence_target`, an INSERT would reset it) or a view
+  (`reason: :unsupported_write_target`) refuses with `query_rule_not_evaluable`.
 - The time zone and sql_mode are compared again after every read, after
   every fetched stream batch (before its rows are handed out) and after
   every write statement: a stored function a domain view calls, or a row

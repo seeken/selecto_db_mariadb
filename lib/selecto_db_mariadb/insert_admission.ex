@@ -30,6 +30,8 @@ defmodule SelectoDBMariaDB.InsertAdmission do
   alias Selecto.Write.{Command, Error}
   alias SelectoDBMariaDB.WriteCompiler
 
+  @write_table_types ["BASE TABLE", "SYSTEM VERSIONED"]
+
   @identifier ~r/\A[A-Za-z_][A-Za-z0-9_$]{0,63}\z/
 
   @doc false
@@ -497,32 +499,42 @@ defmodule SelectoDBMariaDB.InsertAdmission do
     with {:ok, _} <- execute.(connection, "SELECT 1 FROM " <> relation <> " LIMIT 0", [], opts),
          {:ok, %{rows: [[_name, create | _]]}} when is_binary(create) <-
            execute.(connection, "SHOW CREATE TABLE " <> relation, [], opts) do
-      cond do
-        Regex.match?(~r/\A\s*CREATE\s+TEMPORARY\s+TABLE/i, create) -> temporary_shadow()
-        sequence?(create) -> sequence_target()
-        true -> :ok
-      end
+      if Regex.match?(~r/\A\s*CREATE\s+TEMPORARY\s+TABLE/i, create),
+        do: temporary_shadow(),
+        else: writable_type(connection, command, execute, opts)
     else
       {:error, _} = error -> error
       _ -> :error
     end
   end
 
-  # SHOW CREATE TABLE answers for a SEQUENCE too and closes with its option; an
-  # INSERT would reset it. A comment closes in a quote, so none ends this way.
-  defp sequence?(create), do: Regex.match?(~r/\bSEQUENCE=1\s*\z/, create)
+  # What a table is comes from the catalog: SHOW CREATE TABLE prints no SEQUENCE
+  # option under NO_TABLE_OPTIONS. An INSERT would reset a SEQUENCE.
+  defp writable_type(connection, command, execute, opts) do
+    with {:ok, schema, table} <- relation(command.relation),
+         {:ok, %{rows: rows}} <-
+           execute.(
+             connection,
+             "SELECT TABLE_TYPE FROM information_schema.TABLES WHERE TABLE_SCHEMA = " <>
+               schema_sql(schema) <> " AND TABLE_NAME = ?",
+             schema_params(schema) ++ [table],
+             opts
+           ) do
+      case rows do
+        [[type]] when type in @write_table_types -> :ok
+        [["SEQUENCE"]] -> not_a_table(:sequence_target, "a SEQUENCE")
+        _other -> not_a_table(:unsupported_write_target, "no table")
+      end
+    end
+  end
 
-  defp sequence_target,
+  defp not_a_table(reason, what),
     do:
       {:error,
        Error.new(
          :query_enforcement,
-         "MariaDB write target is a SEQUENCE",
-         details: %{
-           code: :query_rule_not_evaluable,
-           reason: :sequence_target,
-           adapter: :mariadb
-         }
+         "MariaDB write target is " <> what,
+         details: %{code: :query_rule_not_evaluable, reason: reason, adapter: :mariadb}
        )}
 
   defp temporary_shadow,

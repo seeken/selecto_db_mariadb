@@ -17,7 +17,9 @@ defmodule SelectoDBMariaDB.SessionCheckIntegrationTest do
     {"SET character_set_results = latin1", :character_set},
     {"SET character_set_client = latin1", :character_set},
     {"SET SESSION sql_mode = 'NO_ENGINE_SUBSTITUTION'", :sql_mode},
-    {"SET @@system_versioning_asof = '2024-01-01 00:00:00'", :system_versioning_asof}
+    {"SET @@system_versioning_asof = '2024-01-01 00:00:00'", :system_versioning_asof},
+    {"SET SESSION sql_select_limit = 3", :sql_select_limit},
+    {"SET SESSION div_precision_increment = 0", :div_precision_increment}
   ]
 
   test "a safe session reads, streams and writes" do
@@ -53,6 +55,7 @@ defmodule SelectoDBMariaDB.SessionCheckIntegrationTest do
         driver!(conn, "SET SESSION time_zone = '+00:00', character_set_results = utf8mb4")
         driver!(conn, "SET character_set_client = utf8mb4, sql_mode = DEFAULT")
         driver!(conn, "SET @@system_versioning_asof = DEFAULT")
+        driver!(conn, "SET sql_select_limit = DEFAULT, div_precision_increment = DEFAULT")
         assert {:ok, %{rows: [[name]]}} = MyXQL.query(conn, "SELECT name FROM items", [])
         assert name == "a"
       end)
@@ -175,6 +178,242 @@ defmodule SelectoDBMariaDB.SessionCheckIntegrationTest do
     end
   end
 
+  describe "sql_select_limit (R74)" do
+    defp limited!(conn) do
+      driver!(conn, "CREATE TABLE lim (id INT PRIMARY KEY, org VARCHAR(10), v INT DEFAULT 0)")
+      values = Enum.map_join(1..10, ",", &"(#{&1}, 't1', 0)")
+      driver!(conn, "INSERT INTO lim VALUES #{values}")
+    end
+
+    defp scoped_all(field, value) do
+      scope = {:eq, {:field, "org"}, {:literal, "t1"}}
+
+      {:ok, command} =
+        Command.new(%{
+          operation: :update,
+          relation: "lim",
+          predicate: scope,
+          assignments: [%{field: field, value: {:literal, value}}],
+          expected_cardinality: {:exactly, 10},
+          metadata: %{post_image: %{predicate: scope, key: ["id"]}}
+        })
+
+      command
+    end
+
+    test "a capture is not short: a trigger moving the last row commits nothing" do
+      with_database(fn conn ->
+        limited!(conn)
+
+        driver!(conn, """
+        CREATE TRIGGER mv BEFORE UPDATE ON lim FOR EACH ROW
+        BEGIN IF NEW.id = 10 THEN SET NEW.org = 't2'; END IF; END
+        """)
+
+        driver!(conn, "SET SESSION sql_select_limit = 3")
+
+        assert {:error, %Error{details: %{setting: :sql_select_limit}}} =
+                 Adapter.execute_write_unsafe(conn, scoped_all("v", 7), [])
+
+        driver!(conn, "SET SESSION sql_select_limit = DEFAULT")
+
+        assert [["t1", 10, _sum]] =
+                 MyXQL.query!(conn, "SELECT org, COUNT(*), SUM(v) FROM lim GROUP BY org", [],
+                   query_type: :text
+                 ).rows
+      end)
+    end
+
+    test "a write's trigger that sets it is undone and refused" do
+      with_database(fn conn ->
+        limited!(conn)
+
+        driver!(conn, """
+        CREATE TRIGGER lim3 BEFORE UPDATE ON lim FOR EACH ROW SET @@session.sql_select_limit = 3
+        """)
+
+        assert {:error, %Error{details: %{reason: :session_state_changed}}} =
+                 Adapter.execute_write_unsafe(conn, scoped_all("v", 7), [])
+
+        assert [[18_446_744_073_709_551_615]] =
+                 MyXQL.query!(conn, "SELECT @@session.sql_select_limit", [], query_type: :text).rows
+      end)
+    end
+
+    test "text wholly the host's keeps the host's limit" do
+      with_database(fn conn ->
+        limited!(conn)
+        driver!(conn, "SET SESSION sql_select_limit = 3")
+
+        assert {:ok, %{rows: [_, _, _]}} =
+                 Adapter.execute(conn, "SELECT id FROM lim", [], selecto_read: true)
+      end)
+    end
+  end
+
+  describe "a read the server would cut (R74)" do
+    @built [selecto_read: true, selecto_generated: true]
+    @mixed [selecto_read: true, selecto_raw_sql: true]
+
+    defp walk(depth) do
+      "WITH RECURSIVE w (a, selecto_depth) AS (SELECT 1, 1 UNION ALL " <>
+        "SELECT w.a + 1, w.selecto_depth + 1 FROM w WHERE w.selecto_depth < #{depth}) " <>
+        "SELECT COUNT(*) FROM w"
+    end
+
+    defp notes!(conn) do
+      driver!(conn, "CREATE TABLE big (id INT PRIMARY KEY, note VARCHAR(200))")
+
+      driver!(
+        conn,
+        "SET STATEMENT max_recursive_iterations = 8000 FOR INSERT INTO big " <>
+          "WITH RECURSIVE s (n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM s WHERE n < 8000) " <>
+          "SELECT n, REPEAT('x', 190) FROM s"
+      )
+    end
+
+    test "a declared depth past the server's default runs in full" do
+      with_database(fn conn ->
+        for opts <- [@built, @mixed], depth <- [999, 1000, 1001, 2500] do
+          assert {:ok, %{rows: [[^depth]]}} = Adapter.execute(conn, walk(depth), [], opts)
+        end
+
+        assert {:ok, stream, _columns} = Adapter.stream(conn, walk(2500), [], @built)
+        assert Enum.to_list(stream) == [[2500]]
+      end)
+    end
+
+    test "a session setting does not cut a declared depth, and the pin leaves it as it was" do
+      with_database(fn conn ->
+        driver!(conn, "SET SESSION max_recursive_iterations = 10")
+        assert {:ok, %{rows: [[50]]}} = Adapter.execute(conn, walk(50), [], @built)
+
+        assert [[10]] =
+                 MyXQL.query!(conn, "SELECT @@session.max_recursive_iterations", [],
+                   query_type: :text
+                 ).rows
+      end)
+    end
+
+    test "a CTE with no declared depth keeps the bound and fails visibly" do
+      with_database(fn conn ->
+        loop =
+          "WITH RECURSIVE w (a) AS (SELECT 1 UNION ALL SELECT a + 1 FROM w WHERE a < 5000) " <>
+            "SELECT COUNT(*) FROM w"
+
+        refusal = %{code: :query_rule_not_evaluable, reason: :result_cut, adapter: :mariadb}
+
+        for opts <- [@built, @mixed] do
+          assert {:error, %Selecto.Error{type: :query_enforcement, details: ^refusal}} =
+                   Adapter.execute(conn, loop, [], opts)
+
+          assert {:error, %Selecto.Error{details: ^refusal}} = Adapter.stream(conn, loop, [], opts)
+        end
+
+        # The host's own text reads what its session gives.
+        assert {:ok, %{rows: [[1001]]}} = Adapter.execute(conn, loop, [], selecto_read: true)
+      end)
+    end
+
+    test "an aggregate fits at the server's default and under a small session value" do
+      with_database(fn conn ->
+        notes!(conn)
+        text = "SELECT JSON_LENGTH(JSON_ARRAYAGG(note)) FROM big"
+
+        assert {:ok, %{rows: [[8000]]}} = Adapter.execute(conn, text, [], @built)
+        driver!(conn, "SET SESSION group_concat_max_len = 1000")
+        assert {:ok, %{rows: [[8000]]}} = Adapter.execute(conn, text, [], @built)
+        assert {:ok, %{rows: [[8000]]}} = Adapter.execute(conn, text, [], @mixed)
+
+        assert {:ok, stream, _columns} = Adapter.stream(conn, text, [], @built)
+        assert Enum.to_list(stream) == [[8000]]
+
+        assert {:ok, %{rows: [[6]]}} = Adapter.execute(conn, text, [], selecto_read: true)
+      end)
+    end
+
+    test "a cut the pin could not stop is an error, and only a cut is" do
+      with_database(fn conn ->
+        notes!(conn)
+        driver!(conn, "SET SESSION group_concat_max_len = 1000")
+
+        cut = MyXQL.query!(conn, "SELECT LENGTH(GROUP_CONCAT(note)) FROM big", [])
+        assert cut.num_warnings == 1
+
+        assert {:error, %Selecto.Error{details: %{reason: :result_cut}}} =
+                 SelectoDBMariaDB.Session.not_cut(conn, cut.num_warnings, @built)
+
+        other = MyXQL.query!(conn, "SELECT CAST('1x' AS INT)", [])
+        assert other.num_warnings == 1
+        assert :ok = SelectoDBMariaDB.Session.not_cut(conn, other.num_warnings, @built)
+      end)
+    end
+
+    test "over max_allowed_packet is an error, not an OK with NULL" do
+      with_database(fn conn ->
+        [[packet]] =
+          MyXQL.query!(conn, "SELECT @@session.max_allowed_packet", [], query_type: :text).rows
+
+        rows = div(packet, 190) + 1000
+        driver!(conn, "CREATE TABLE huge (id INT PRIMARY KEY, note VARCHAR(200))")
+
+        driver!(
+          conn,
+          "SET STATEMENT max_recursive_iterations = #{rows} FOR INSERT INTO huge " <>
+            "WITH RECURSIVE s (n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM s WHERE n < #{rows}) " <>
+            "SELECT n, REPEAT('x', 190) FROM s"
+        )
+
+        refusal = {:error, :result_cut}
+        reason = fn {:error, %Selecto.Error{details: %{reason: reason}}} -> {:error, reason} end
+
+        assert reason.(Adapter.execute(conn, "SELECT JSON_ARRAYAGG(note) FROM huge", [], @built)) ==
+                 refusal
+
+        assert reason.(Adapter.execute(conn, "SELECT REPEAT('x', #{packet + 1})", [], @built)) ==
+                 refusal
+      end)
+    end
+
+    test "the pins are valid: TRADITIONAL runs them and they leave no warning" do
+      with_database(fn conn ->
+        notes!(conn)
+        driver!(conn, "SET SESSION sql_mode = 'TRADITIONAL'")
+        text = "SELECT JSON_LENGTH(JSON_ARRAYAGG(note)) FROM big"
+
+        assert {:ok, %{rows: [[8000]]}} = Adapter.execute(conn, text, [], @built)
+        assert {:ok, %{rows: [[1500]]}} = Adapter.execute(conn, walk(1500), [], @built)
+        assert {:ok, %{rows: [[10_000]]}} = Adapter.execute(conn, walk(10_000), [], @built)
+
+        for sql <- [text, walk(10_000)] do
+          pinned = Adapter.statement(sql, @built)
+          assert %{num_warnings: 0} = MyXQL.query!(conn, pinned, [])
+        end
+      end)
+    end
+
+    test "a plain role can set the pins" do
+      with_database(fn conn ->
+        [[database]] = MyXQL.query!(conn, "SELECT DATABASE()", [], query_type: :text).rows
+        user = "mp_pin_#{System.unique_integer([:positive])}"
+        driver!(conn, "CREATE USER '#{user}'@'%' IDENTIFIED BY 'pw'")
+        driver!(conn, "GRANT SELECT ON `#{database}`.* TO '#{user}'@'%'")
+
+        try do
+          options =
+            connection_options()
+            |> Keyword.merge(username: user, password: "pw", database: database)
+
+          {:ok, plain} = Adapter.connect(options)
+          assert {:ok, %{rows: [[1500]]}} = Adapter.execute(plain, walk(1500), [], @built)
+          Adapter.disconnect(plain)
+        after
+          driver!(conn, "DROP USER '#{user}'@'%'")
+        end
+      end)
+    end
+  end
+
   describe "a SEQUENCE is no write target" do
     defp sequence_state(conn),
       do:
@@ -220,6 +459,43 @@ defmodule SelectoDBMariaDB.SessionCheckIntegrationTest do
         end
 
         assert sequence_state(conn) == before
+      end)
+    end
+
+    test "NO_TABLE_OPTIONS cannot hide it" do
+      with_database(fn conn ->
+        driver!(conn, "CREATE SEQUENCE sq")
+        before = sequence_state(conn)
+        driver!(conn, "SET SESSION sql_mode = CONCAT(@@sql_mode, ',NO_TABLE_OPTIONS')")
+
+        {:ok, command} =
+          Command.new(%{
+            operation: :delete,
+            relation: "sq",
+            predicate: {:eq, {:field, "increment"}, {:literal, 1}}
+          })
+
+        assert {:error, %Error{details: %{reason: :sequence_target}}} =
+                 Adapter.execute_write_unsafe(conn, command, [])
+
+        assert sequence_state(conn) == before
+      end)
+    end
+
+    test "a view is no write target" do
+      with_database(fn conn ->
+        driver!(conn, "CREATE VIEW items_view AS SELECT id, name FROM items")
+
+        {:ok, command} =
+          Command.new(%{
+            operation: :update,
+            relation: "items_view",
+            predicate: {:eq, {:field, "id"}, {:literal, 1}},
+            assignments: [%{field: "name", value: {:literal, "v"}}]
+          })
+
+        assert {:error, %Error{details: %{reason: :unsupported_write_target}}} =
+                 Adapter.execute_write_unsafe(conn, command, [])
       end)
     end
 

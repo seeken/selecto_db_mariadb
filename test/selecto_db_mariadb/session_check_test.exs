@@ -53,11 +53,18 @@ defmodule SelectoDBMariaDB.SessionCheckTest do
     end
   end
 
-  test "system_versioning_asof must be DEFAULT" do
-    assert Session.current_rows("DEFAULT") == :ok
+  test "the settings that change a read must be the defaults" do
+    limit = 18_446_744_073_709_551_615
+    assert Session.read_settings(["DEFAULT", limit, 4]) == :ok
 
     assert {:error, %{details: %{setting: :system_versioning_asof}}} =
-             Session.current_rows("2024-01-01 00:00:00.000000")
+             Session.read_settings(["2024-01-01 00:00:00.000000", limit, 4])
+
+    assert {:error, %{details: %{setting: :sql_select_limit}}} =
+             Session.read_settings(["DEFAULT", 3, 4])
+
+    assert {:error, %{details: %{setting: :div_precision_increment}}} =
+             Session.read_settings(["DEFAULT", limit, 0])
   end
 
   test "an unexpected row shape is refused" do
