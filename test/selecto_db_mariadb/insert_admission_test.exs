@@ -24,12 +24,14 @@ defmodule SelectoDBMariaDB.InsertAdmissionTest do
 
   defp assigned(field, value), do: %{field: field, value: {:literal, value}}
 
+  @table {"TABLE_TYPE", {:ok, %{rows: [["BASE TABLE"]]}}}
+
   # Responses are matched in order by a substring of the SQL.
   defp executor(responses) do
     fn _conn, sql, params, _opts ->
       send(self(), {:sql, sql, params})
 
-      Enum.find_value(responses, {:error, :unexpected}, fn {pattern, result} ->
+      Enum.find_value([@table | responses], {:error, :unexpected}, fn {pattern, result} ->
         if String.contains?(sql, pattern), do: result
       end)
     end
