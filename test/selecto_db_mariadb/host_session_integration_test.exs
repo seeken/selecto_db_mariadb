@@ -271,7 +271,7 @@ defmodule SelectoDBMariaDB.HostSessionIntegrationTest do
     sql(conn, "INSERT INTO hs_log VALUES ('host')")
     assert {:error, %{details: %{reason: :hand_built_not_a_read}}} = read.(conn, "COMMIT")
 
-    assert {:error, %{details: %{reason: :hand_built_write}}} =
+    assert {:error, _} =
              read.(conn, "WITH x AS (SELECT 1 AS id) DELETE hs_t FROM hs_t JOIN x USING (id)")
 
     assert {:ok, %{rows: [[1]]}} =
@@ -328,14 +328,109 @@ defmodule SelectoDBMariaDB.HostSessionIntegrationTest do
       sql(conn, setup)
       sql(conn, "START TRANSACTION")
 
-      assert {:error, %{details: %{reason: :hand_built_write}}} =
-               Adapter.execute(conn, text, [], selecto_read: true),
-             text
+      # MariaDB has no such statement: its own parser says so.
+      assert {:error, _} = Adapter.execute(conn, text, [], selecto_read: true), text
 
       sql(conn, "COMMIT AND NO CHAIN NO RELEASE")
       close(conn)
       assert sql(other, "SELECT COUNT(*), SUM(v) FROM hs_t") in [[[3, 0]], [[3, Decimal.new(0)]]]
     end
+  end
+
+  test "hand-built text runs in the host's session, and a statement with a fragment does not (R71)",
+       %{other: other} do
+    conn = open()
+    read = &Adapter.execute(conn, &1, [], selecto_read: true)
+
+    domain = %{
+      name: "D",
+      source: %{
+        source_table: "hs_t",
+        primary_key: :id,
+        fields: [:id],
+        redact_fields: [],
+        columns: %{id: %{type: :integer}},
+        associations: %{}
+      },
+      schemas: %{},
+      joins: %{}
+    }
+
+    mixed = fn ->
+      domain
+      |> Selecto.configure(conn, adapter: Adapter, validate: false)
+      |> Selecto.select(["id", {:raw_sql, "1 AS one"}])
+      |> Selecto.execute()
+    end
+
+    sql(conn, "SET time_zone = '+02:00'")
+    assert {:ok, %{rows: [["+02:00"]]}} = read.("SELECT @@session.time_zone")
+    assert {:error, %{details: %{setting: :time_zone}}} = mixed.()
+    sql(conn, "SET time_zone = '+00:00'")
+
+    sql(conn, "SET sql_mode = ''")
+    assert {:ok, %{rows: [[""]]}} = read.("SELECT @@session.sql_mode")
+    assert {:error, %{details: %{setting: :sql_mode}}} = mixed.()
+    sql(conn, "SET sql_mode = DEFAULT")
+
+    sql(conn, "CREATE TEMPORARY TABLE hs_t (id INT PRIMARY KEY, org VARCHAR(20), v INT)")
+    sql(conn, "INSERT INTO hs_t VALUES (42, 't1', 0)")
+    assert {:ok, %{rows: [[42]]}} = read.("SELECT id FROM hs_t")
+    assert {:error, %{details: %{reason: :temporary_shadow}}} = mixed.()
+    sql(conn, "DROP TEMPORARY TABLE hs_t")
+
+    sql(conn, "SET NAMES latin1")
+    assert {:error, %{details: %{category: :invalid_session}}} = read.("SELECT 1")
+    sql(conn, "SET NAMES utf8mb4")
+    close(conn)
+    assert sql(other, "SELECT COUNT(*) FROM hs_t") == [[3]]
+  end
+
+  test "a read's function runs once: no EXPLAIN (R73)", %{other: other} do
+    conn = open()
+    sql(other, "DROP FUNCTION IF EXISTS hs_bump")
+
+    sql(
+      other,
+      "CREATE FUNCTION hs_bump() RETURNS INT MODIFIES SQL DATA " <>
+        "BEGIN INSERT INTO hs_log VALUES ('bump'); RETURN 1; END"
+    )
+
+    sql(conn, "START TRANSACTION")
+
+    assert {:ok, %{rows: [[1]]}} =
+             Adapter.execute(conn, "WITH c AS (SELECT hs_bump() AS a) SELECT a FROM c", [],
+               selecto_read: true
+             )
+
+    sql(conn, "COMMIT AND NO CHAIN NO RELEASE")
+    close(conn)
+    assert sql(other, "SELECT COUNT(*) FROM hs_log") == [[1]]
+    sql(other, "DROP FUNCTION hs_bump")
+  end
+
+  test "valid reads pass the write check (R73)" do
+    conn = open()
+    sql(conn, "START TRANSACTION")
+
+    for text <- [
+          "WITH c AS (SELECT id FROM hs_t) SELECT count(*) FROM c",
+          "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 3) SELECT n FROM r",
+          "WITH c AS (SELECT id FROM hs_t EXCEPT SELECT 3) SELECT id FROM c",
+          "WITH c AS (SELECT id FROM hs_t INTERSECT SELECT 1) SELECT id FROM c",
+          "EXPLAIN SELECT id FROM hs_t WHERE org = 'analyze'",
+          "EXPLAIN SELECT 1 /* analyze */"
+        ] do
+      assert {:ok, %{rows: [_ | _]}} = Adapter.execute(conn, text, [], selecto_read: true), text
+    end
+
+    sql(conn, "ROLLBACK AND NO CHAIN NO RELEASE")
+
+    for text <- ["EXPLAIN UPDATE hs_t SET v = 1", "DESC UPDATE hs_t SET v = 1"] do
+      assert {:ok, %{rows: [_ | _]}} = Adapter.execute(conn, text, [], selecto_read: true), text
+    end
+
+    close(conn)
   end
 
   test "what only reports answers as the driver does (R71)" do

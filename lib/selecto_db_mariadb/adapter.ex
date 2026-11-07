@@ -99,6 +99,8 @@ defmodule SelectoDBMariaDB.Adapter do
 
   @impl true
   def connect(connection) when is_pid(connection) or is_atom(connection), do: {:ok, connection}
+  # A connection the host already holds.
+  def connect(%DBConnection{} = connection), do: {:ok, connection}
   def connect(opts) when is_map(opts), do: connect(Map.to_list(opts))
 
   def connect(opts) when is_list(opts) do
@@ -270,7 +272,7 @@ defmodule SelectoDBMariaDB.Adapter do
   # Selecto.Executor.selecto_read?/1) first refuses a relation a TEMPORARY
   # table shadows.
   defp execute_checked(connection, query, params, opts) do
-    if Selecto.Executor.selecto_read?(opts) do
+    if Selecto.Executor.selecto_read?(opts) and not Session.host_text?(opts) do
       with :ok <- Session.refuse_temporary_shadows(connection, query, opts) do
         execute_unchecked(connection, query, params, opts)
       end

@@ -13,12 +13,12 @@
 - Reads and streams at `autocommit=0` keep the host's connection, variables and
   locks: `DBConnection.run/3` closed a connection whose status changed. They run
   as written, so their snapshot stays until the host ends it.
-- Hand-built text on a read path must be a read by its first word
-  (`hand_built_not_a_read`), and its row locks act as the driver's would: held in
-  a host transaction, ended with the read alone. Where a read runs as written the
-  server decides about
-  a WITH: it is EXPLAINed, and what is not a read or cannot be settled refuses
-  (`hand_built_write`). SHOW, EXPLAIN and DESCRIBE answer as the driver does.
+- Text wholly the host's runs in the host's session: no `time_zone`, `sql_mode` or
+  TEMPORARY refusal, only the encoding one. It must be a read by its first word
+  (`hand_built_not_a_read`), and its row locks act as the driver's would: held in a
+  host transaction, ended with the read alone. Where a read runs as written, the first word is the check, and MariaDB never EXPLAINs: that runs a table-less CTE's functions twice.
+  SHOW, EXPLAIN and DESCRIBE answer as the driver does. A statement Selecto built
+  that carries a host fragment keeps every guard.
 - The lock probe settles no default database and table-only grants through a
   table the role can see, and fails closed.
 - Selecto sends no ROLLBACK for a transaction it does not own: a failed undo in a
