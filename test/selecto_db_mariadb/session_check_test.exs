@@ -53,6 +53,13 @@ defmodule SelectoDBMariaDB.SessionCheckTest do
     end
   end
 
+  test "system_versioning_asof must be DEFAULT" do
+    assert Session.current_rows("DEFAULT") == :ok
+
+    assert {:error, %{details: %{setting: :system_versioning_asof}}} =
+             Session.current_rows("2024-01-01 00:00:00.000000")
+  end
+
   test "an unexpected row shape is refused" do
     assert refused(["UTC"]) == :session
   end

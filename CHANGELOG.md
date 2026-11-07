@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- `system_versioning_asof` joins the session check: anything but `DEFAULT` refuses
+  generated and mixed reads, streams and writes (`invalid_session`), and a write's
+  trigger that sets it is undone and refused. A post-image guard read the past and
+  passed a scoped update that moved a row out of scope. Text wholly the host's
+  still reads what the host asked for.
+- A governed write to a SEQUENCE refuses (`sequence_target`); an INSERT reset it.
 - A guard no longer passes on its own failure: a killed shadow check or lock
   probe keeps its error (only "no such table" and its kin mean absent), and an
   unreadable autocommit refuses the write. A write whose RELEASE SAVEPOINT failed
