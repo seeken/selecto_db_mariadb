@@ -8,6 +8,14 @@
   passed a scoped update that moved a row out of scope. Text wholly the host's
   still reads what the host asked for.
 - A governed write to a SEQUENCE refuses (`sequence_target`); an INSERT reset it.
+  `TABLE_TYPE` decides, so `NO_TABLE_OPTIONS` cannot hide one, and a view refuses too.
+- `sql_select_limit` and `div_precision_increment` join the session check. A limit
+  cut reads silently and a write's capture, so a trigger moving an uncaptured row
+  out of scope committed; a mis-declared upsert target passed at limit 1.
+- A statement Selecto built pins `group_concat_max_len` and fits
+  `max_recursive_iterations` to its declared depth: JSON_ARRAYAGG stopped at 5434 of
+  8000 elements and depth 2500 at 1001 rows. A result still cut, or NULL over
+  `max_allowed_packet`, fails with `result_cut`. MariaDB 10.3.4 is the floor.
 - A guard no longer passes on its own failure: a killed shadow check or lock
   probe keeps its error (only "no such table" and its kin mean absent), and an
   unreadable autocommit refuses the write. A write whose RELEASE SAVEPOINT failed

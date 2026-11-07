@@ -155,10 +155,10 @@ defmodule SelectoDBMariaDB.Adapter do
         {:error, @missing_dependency}
 
       is_pid(connection) and Process.alive?(connection) ->
-        SelectoDBMariaDB.RowStream.open(connection, statement(query), params, opts)
+        SelectoDBMariaDB.RowStream.open(connection, statement(query, opts), params, opts)
 
       is_atom(connection) and not is_nil(connection) and is_pid(Process.whereis(connection)) ->
-        SelectoDBMariaDB.RowStream.open(connection, statement(query), params, opts)
+        SelectoDBMariaDB.RowStream.open(connection, statement(query, opts), params, opts)
 
       true ->
         {:error, {:invalid_connection, connection}}
@@ -700,11 +700,15 @@ defmodule SelectoDBMariaDB.Adapter do
   # A statement on a connection whose session this call already verified.
   def execute_unchecked(connection, query, params, opts) do
     with :ok <- require_binary_protocol(opts) do
-      case MyXQL.query(resolve_connection(connection), statement(query), params, opts) do
+      connection = resolve_connection(connection)
+
+      case MyXQL.query(connection, statement(query, opts), params, opts) do
         {:ok, result} ->
           # A stored value outside the supported range is a typed error
           # (SelectoDBMariaDB.StoredValues).
-          with :ok <- StoredValues.check(result.rows), do: {:ok, normalize_result(result)}
+          with :ok <- Session.not_cut(connection, result.num_warnings, opts),
+               :ok <- StoredValues.check(result.rows),
+               do: {:ok, normalize_result(result)}
 
         {:error, reason} ->
           {:error, sanitize_error(reason)}
@@ -1585,7 +1589,11 @@ defmodule SelectoDBMariaDB.Adapter do
   defp normalize_relation_source_kind("view"), do: :view
   defp normalize_relation_source_kind(other), do: other
 
-  @no_subquery_cache "SET STATEMENT optimizer_switch='subquery_cache=off' FOR "
+  @no_subquery_cache "SET STATEMENT optimizer_switch='subquery_cache=off'"
+  # The largest the server takes; a larger value warns.
+  @group_concat_pin 1_073_741_824
+  # Selecto.Advanced.CTE's limit on max_depth.
+  @depth_limit 10_000
 
   @doc false
   # Every statement this adapter sends runs with MariaDB's subquery cache off.
@@ -1595,12 +1603,37 @@ defmodule SelectoDBMariaDB.Adapter do
   # used. SET STATEMENT applies to the one statement only, never to the
   # host's session. (Savepoint statements cannot carry it and hold no
   # subquery.)
-  def statement(query) do
+  #
+  # A statement Selecto built also pins what would cut its result silently
+  # (R74). group_concat_max_len fits anything short of the server's limit, and
+  # max_recursive_iterations fits the depth the statement declares: at the
+  # server's default of 1000 a clean chain stops early. A CTE that declares no
+  # depth keeps the session's bound. What still gets cut fails in
+  # Session.not_cut/3.
+  def statement(query, opts \\ []) do
     query = normalize_query(query)
 
     if String.starts_with?(query, @no_subquery_cache),
       do: query,
-      else: @no_subquery_cache <> query
+      else: @no_subquery_cache <> read_pins(query, opts) <> " FOR " <> query
+  end
+
+  defp read_pins(query, opts) do
+    if Selecto.Executor.selecto_read?(opts) and not Session.host_text?(opts),
+      do: ", group_concat_max_len=#{@group_concat_pin}" <> depth_pin(query),
+      else: ""
+  end
+
+  # The recursion stops at `selecto_depth < N`, which takes N iterations.
+  defp depth_pin(query) do
+    case Regex.scan(~r/\.selecto_depth < (\d+)/, query, capture: :all_but_first) do
+      [] ->
+        ""
+
+      depths ->
+        depth = depths |> Enum.map(fn [depth] -> String.to_integer(depth) end) |> Enum.max()
+        ", max_recursive_iterations=#{min(depth, @depth_limit)}"
+    end
   end
 
   defp normalize_query(query) when is_binary(query), do: query

@@ -18,6 +18,9 @@ defmodule SelectoDBMariaDB.Session do
   # - system_versioning_asof is DEFAULT. Set, every SELECT on a SYSTEM VERSIONED
   #   table reads the past while UPDATE and DELETE hit current rows: a scope, a
   #   lock or a post-image guard would prove a row that is no longer there.
+  # - sql_select_limit has no limit, or a read and a write's capture and catalog
+  #   reads would come back short with nothing to say so.
+  # - div_precision_increment is the default, or an AVG changes.
   #
   # Anything else is refused before the statement runs, with an error naming
   # only the failing setting.
@@ -37,7 +40,17 @@ defmodule SelectoDBMariaDB.Session do
   @query "SELECT @@session.time_zone, @@system_time_zone, " <>
            "@@session.character_set_client, @@session.character_set_connection, " <>
            "@@session.character_set_results, @@session.sql_mode, @@session.autocommit, " <>
-           "@@session.system_versioning_asof"
+           "@@session.system_versioning_asof, @@session.sql_select_limit, " <>
+           "@@session.div_precision_increment"
+
+  @no_select_limit 18_446_744_073_709_551_615
+  @div_precision 4
+  @undo_read_settings "SESSION system_versioning_asof = DEFAULT, " <>
+                        "SESSION sql_select_limit = DEFAULT, " <>
+                        "SESSION div_precision_increment = DEFAULT"
+  # GROUP_CONCAT or JSON_ARRAYAGG cut a row; a result over max_allowed_packet came
+  # back NULL; max_recursive_iterations cut a CTE.
+  @cut_warnings [1260, 1301, 1931]
 
   @utc_zones ["UTC", "+00:00", "Etc/UTC"]
 
@@ -591,7 +604,7 @@ defmodule SelectoDBMariaDB.Session do
   # What text wholly the host's reads first (R71): only the encoding decides.
   def host_state(conn, opts \\ []) do
     case state_row(conn, opts) do
-      {:ok, [time_zone, _, client, connection, results, sql_mode, autocommit, _asof]} ->
+      {:ok, [time_zone, _, client, connection, results, sql_mode, autocommit, _, _, _]} ->
         if Enum.all?([client, connection, results], &(&1 == "utf8mb4")),
           do: {:ok, %{time_zone: time_zone, sql_mode: sql_mode, autocommit: autocommit}},
           else: refuse(:character_set)
@@ -608,9 +621,9 @@ defmodule SelectoDBMariaDB.Session do
   # The checked session state: `%{time_zone, sql_mode, autocommit}`.
   def state(conn, opts \\ []) do
     case state_row(conn, opts) do
-      {:ok, [time_zone, _, _, _, _, sql_mode, autocommit, asof] = row} ->
+      {:ok, [time_zone, _, _, _, _, sql_mode, autocommit | settings] = row} ->
         with :ok <- check(Enum.take(row, 6)),
-             :ok <- current_rows(asof) do
+             :ok <- read_settings(settings) do
           {:ok, %{time_zone: time_zone, sql_mode: sql_mode, autocommit: autocommit}}
         end
 
@@ -641,11 +654,16 @@ defmodule SelectoDBMariaDB.Session do
   def unchanged(conn, %{time_zone: time_zone, sql_mode: sql_mode}, opts \\ []) do
     case MyXQL.query(
            conn,
-           "SELECT @@session.time_zone, @@session.sql_mode, @@session.system_versioning_asof",
+           "SELECT @@session.time_zone, @@session.sql_mode, " <>
+             "@@session.system_versioning_asof, @@session.sql_select_limit, " <>
+             "@@session.div_precision_increment",
            [],
            [query_type: :text] ++ Keyword.take(opts, [:timeout])
          ) do
-      {:ok, %MyXQL.Result{rows: [[^time_zone, ^sql_mode, "DEFAULT"]]}} ->
+      {:ok,
+       %MyXQL.Result{
+         rows: [[^time_zone, ^sql_mode, "DEFAULT", @no_select_limit, @div_precision]]
+       }} ->
         :ok
 
       # The check itself failed (a kill, a lost connection): nothing says the
@@ -657,8 +675,7 @@ defmodule SelectoDBMariaDB.Session do
         _ =
           MyXQL.query(
             conn,
-            "SET SESSION time_zone = ?, SESSION sql_mode = ?, " <>
-              "SESSION system_versioning_asof = DEFAULT",
+            "SET SESSION time_zone = ?, SESSION sql_mode = ?, " <> @undo_read_settings,
             [time_zone, sql_mode]
           )
 
@@ -747,8 +764,48 @@ defmodule SelectoDBMariaDB.Session do
   def check(_row), do: refuse(:session)
 
   @doc false
-  def current_rows("DEFAULT"), do: :ok
-  def current_rows(_asof), do: refuse(:system_versioning_asof)
+  # The settings that change what a statement Selecto built reads (R74).
+  def read_settings(["DEFAULT", @no_select_limit, @div_precision]), do: :ok
+  def read_settings([asof, _, _]) when asof != "DEFAULT", do: refuse(:system_versioning_asof)
+  def read_settings([_, limit, _]) when limit != @no_select_limit, do: refuse(:sql_select_limit)
+  def read_settings(_settings), do: refuse(:div_precision_increment)
+
+  @doc false
+  # Right after a statement Selecto built, while its warnings stand: the server
+  # says a result was cut only there (R74). Fewer warnings shown than counted
+  # cannot say it was not. Text wholly the host's reads what the host's session gives.
+  def not_cut(conn, warnings, opts \\ [])
+  def not_cut(_conn, warnings, _opts) when warnings in [0, nil], do: :ok
+
+  def not_cut(conn, warnings, opts) do
+    if Selecto.Executor.selecto_read?(opts) and not host_text?(opts) do
+      case MyXQL.query(
+             conn,
+             "SHOW WARNINGS",
+             [],
+             [query_type: :text] ++ Keyword.take(opts, [:timeout])
+           ) do
+        {:ok, %MyXQL.Result{rows: rows}} ->
+          if length(rows) < warnings or Enum.any?(rows, &(Enum.at(&1, 1) in @cut_warnings)),
+            do: cut_result(),
+            else: :ok
+
+        {:error, reason} ->
+          {:error, sanitize(reason)}
+      end
+    else
+      :ok
+    end
+  end
+
+  defp cut_result,
+    do:
+      {:error,
+       %Selecto.Error{
+         type: :query_enforcement,
+         message: "MariaDB cut this result, so it is not returned",
+         details: %{code: :query_rule_not_evaluable, reason: :result_cut, adapter: :mariadb}
+       }}
 
   defp utc?(zone, _system) when zone in @utc_zones, do: true
   defp utc?("SYSTEM", system) when system in @utc_zones, do: true

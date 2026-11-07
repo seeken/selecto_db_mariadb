@@ -57,11 +57,14 @@ defmodule SelectoDBMariaDB.RowStream do
                       max_rows: max_rows,
                       timeout: stream_timeout
                     )
-                    |> Enum.reduce_while(:ok, fn %MyXQL.Result{rows: rows, columns: columns},
-                                                 :ok ->
+                    |> Enum.reduce_while(:ok, fn %MyXQL.Result{} = result, :ok ->
+                      %{rows: rows, columns: columns, num_warnings: warnings} = result
+
                       # A stored value outside the supported range ends the
-                      # stream with a typed error (StoredValues).
-                      with :ok <-
+                      # stream with a typed error (StoredValues). The cursor's
+                      # first result carries what the statement warned of.
+                      with :ok <- Session.not_cut(checked_out, warnings, opts),
+                           :ok <-
                              if(host?, do: :ok, else: Session.unchanged(checked_out, session)),
                            :ok <- StoredValues.check(rows) do
                         send_chunk.(rows || [], columns || [])
