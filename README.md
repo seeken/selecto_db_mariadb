@@ -78,9 +78,15 @@ triggers or rules.
   time zone must be UTC (`UTC`, `+00:00`, `Etc/UTC`, or `SYSTEM` on a UTC
   server; never `GMT`). The client, connection and results character sets
   must be utf8mb4, and sql_mode must include `STRICT_TRANS_TABLES` or
-  `STRICT_ALL_TABLES`. If any check fails, the call is refused before any
-  statement runs. Set these with MyXQL's `after_connect` if the server
-  defaults differ.
+  `STRICT_ALL_TABLES`, and `system_versioning_asof` must be `DEFAULT`: set, a
+  SELECT reads the past while UPDATE and DELETE hit current rows, so a scope or
+  post-image guard would prove a row that is no longer there. If any check
+  fails, the call is refused before any statement runs. Set these with MyXQL's
+  `after_connect` if the server defaults differ. Text wholly the host's is not
+  held to this: it reads the past the host asked for.
+- A SEQUENCE is no write target: a governed write to one refuses
+  (`query_rule_not_evaluable`, `reason: :sequence_target`), since an INSERT
+  would reset it.
 - The time zone and sql_mode are compared again after every read, after
   every fetched stream batch (before its rows are handed out) and after
   every write statement: a stored function a domain view calls, or a row

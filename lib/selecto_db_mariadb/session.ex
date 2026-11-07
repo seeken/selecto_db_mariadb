@@ -15,6 +15,9 @@ defmodule SelectoDBMariaDB.Session do
   #   travels unchanged both ways.
   # - sql_mode has STRICT_TRANS_TABLES or STRICT_ALL_TABLES, so a value the
   #   column cannot hold is an error rather than a silently converted row.
+  # - system_versioning_asof is DEFAULT. Set, every SELECT on a SYSTEM VERSIONED
+  #   table reads the past while UPDATE and DELETE hit current rows: a scope, a
+  #   lock or a post-image guard would prove a row that is no longer there.
   #
   # Anything else is refused before the statement runs, with an error naming
   # only the failing setting.
@@ -33,7 +36,8 @@ defmodule SelectoDBMariaDB.Session do
 
   @query "SELECT @@session.time_zone, @@system_time_zone, " <>
            "@@session.character_set_client, @@session.character_set_connection, " <>
-           "@@session.character_set_results, @@session.sql_mode, @@session.autocommit"
+           "@@session.character_set_results, @@session.sql_mode, @@session.autocommit, " <>
+           "@@session.system_versioning_asof"
 
   @utc_zones ["UTC", "+00:00", "Etc/UTC"]
 
@@ -587,7 +591,7 @@ defmodule SelectoDBMariaDB.Session do
   # What text wholly the host's reads first (R71): only the encoding decides.
   def host_state(conn, opts \\ []) do
     case state_row(conn, opts) do
-      {:ok, [time_zone, _, client, connection, results, sql_mode, autocommit]} ->
+      {:ok, [time_zone, _, client, connection, results, sql_mode, autocommit, _asof]} ->
         if Enum.all?([client, connection, results], &(&1 == "utf8mb4")),
           do: {:ok, %{time_zone: time_zone, sql_mode: sql_mode, autocommit: autocommit}},
           else: refuse(:character_set)
@@ -604,8 +608,9 @@ defmodule SelectoDBMariaDB.Session do
   # The checked session state: `%{time_zone, sql_mode, autocommit}`.
   def state(conn, opts \\ []) do
     case state_row(conn, opts) do
-      {:ok, [time_zone, _, _, _, _, sql_mode, autocommit] = row} ->
-        with :ok <- check(Enum.take(row, 6)) do
+      {:ok, [time_zone, _, _, _, _, sql_mode, autocommit, asof] = row} ->
+        with :ok <- check(Enum.take(row, 6)),
+             :ok <- current_rows(asof) do
           {:ok, %{time_zone: time_zone, sql_mode: sql_mode, autocommit: autocommit}}
         end
 
@@ -636,11 +641,11 @@ defmodule SelectoDBMariaDB.Session do
   def unchanged(conn, %{time_zone: time_zone, sql_mode: sql_mode}, opts \\ []) do
     case MyXQL.query(
            conn,
-           "SELECT @@session.time_zone, @@session.sql_mode",
+           "SELECT @@session.time_zone, @@session.sql_mode, @@session.system_versioning_asof",
            [],
            [query_type: :text] ++ Keyword.take(opts, [:timeout])
          ) do
-      {:ok, %MyXQL.Result{rows: [[^time_zone, ^sql_mode]]}} ->
+      {:ok, %MyXQL.Result{rows: [[^time_zone, ^sql_mode, "DEFAULT"]]}} ->
         :ok
 
       # The check itself failed (a kill, a lost connection): nothing says the
@@ -650,10 +655,12 @@ defmodule SelectoDBMariaDB.Session do
 
       {:ok, _changed} ->
         _ =
-          MyXQL.query(conn, "SET SESSION time_zone = ?, SESSION sql_mode = ?", [
-            time_zone,
-            sql_mode
-          ])
+          MyXQL.query(
+            conn,
+            "SET SESSION time_zone = ?, SESSION sql_mode = ?, " <>
+              "SESSION system_versioning_asof = DEFAULT",
+            [time_zone, sql_mode]
+          )
 
         changed()
     end
@@ -738,6 +745,10 @@ defmodule SelectoDBMariaDB.Session do
   end
 
   def check(_row), do: refuse(:session)
+
+  @doc false
+  def current_rows("DEFAULT"), do: :ok
+  def current_rows(_asof), do: refuse(:system_versioning_asof)
 
   defp utc?(zone, _system) when zone in @utc_zones, do: true
   defp utc?("SYSTEM", system) when system in @utc_zones, do: true

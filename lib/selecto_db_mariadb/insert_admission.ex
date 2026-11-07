@@ -497,14 +497,33 @@ defmodule SelectoDBMariaDB.InsertAdmission do
     with {:ok, _} <- execute.(connection, "SELECT 1 FROM " <> relation <> " LIMIT 0", [], opts),
          {:ok, %{rows: [[_name, create | _]]}} when is_binary(create) <-
            execute.(connection, "SHOW CREATE TABLE " <> relation, [], opts) do
-      if Regex.match?(~r/\A\s*CREATE\s+TEMPORARY\s+TABLE/i, create),
-        do: temporary_shadow(),
-        else: :ok
+      cond do
+        Regex.match?(~r/\A\s*CREATE\s+TEMPORARY\s+TABLE/i, create) -> temporary_shadow()
+        sequence?(create) -> sequence_target()
+        true -> :ok
+      end
     else
       {:error, _} = error -> error
       _ -> :error
     end
   end
+
+  # SHOW CREATE TABLE answers for a SEQUENCE too and closes with its option; an
+  # INSERT would reset it. A comment closes in a quote, so none ends this way.
+  defp sequence?(create), do: Regex.match?(~r/\bSEQUENCE=1\s*\z/, create)
+
+  defp sequence_target,
+    do:
+      {:error,
+       Error.new(
+         :query_enforcement,
+         "MariaDB write target is a SEQUENCE",
+         details: %{
+           code: :query_rule_not_evaluable,
+           reason: :sequence_target,
+           adapter: :mariadb
+         }
+       )}
 
   defp temporary_shadow,
     do:
