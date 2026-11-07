@@ -141,9 +141,10 @@ triggers or rules.
   nothing would stop a write, the server decides: a WITH is EXPLAINed and its
   `select_type` read, and anything but a read, or a statement EXPLAIN cannot
   settle, refuses (`reason: :hand_built_write`), as does ANALYZE there.
-- Hand-built text and raw text cannot take row locks, on any route
-  (`reason: :hand_built_row_lock`): take them through your own driver. The check
-  fails closed, so a string that says FOR UPDATE refuses too.
+- A hand-built row-locking read (`FOR UPDATE`, `FOR SHARE`, `LOCK IN SHARE MODE`)
+  runs as the driver's would: in a host transaction it runs as written and the
+  lock holds to the host's end; alone it ends with the read. The check here is
+  for writes, not locks.
 - A read under `LOCK TABLES` or `FLUSH TABLES t WITH READ LOCK` runs as
   written too, because START TRANSACTION would release those locks: a writing
   view reached there at `autocommit=1` commits, as it would for the host's own

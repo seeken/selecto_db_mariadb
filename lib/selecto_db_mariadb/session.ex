@@ -166,12 +166,12 @@ defmodule SelectoDBMariaDB.Session do
       if DBConnection.status(conn) == :idle and autocommit not in [0, "0"] do
         case host_locks(conn, relations(query), opts) do
           :none ->
-            start = read_start(query, hand_built?)
-
-            case transact(conn, start, fn -> {:rollback, work.()} end, opts) do
-              {:error, %MyXQL.Error{} = error} -> {:error, sanitize(error)}
-              {:error, %DBConnection.ConnectionError{} = error} -> {:error, sanitize(error)}
-              other -> other
+            with {:ok, start} <- read_start(conn, query, {text, params}, hand_built?, opts) do
+              case transact(conn, start, fn -> {:rollback, work.()} end, opts) do
+                {:error, %MyXQL.Error{} = error} -> {:error, sanitize(error)}
+                {:error, %DBConnection.ConnectionError{} = error} -> {:error, sanitize(error)}
+                other -> other
+              end
             end
 
           held when held in [:held, :unsettled] ->
@@ -194,8 +194,7 @@ defmodule SelectoDBMariaDB.Session do
 
   # Hand-built text runs as written (R68), so its first word, past comments and
   # opening parentheses, must say it reads: COMMIT there would end the read's
-  # transaction, or the host's. An executable comment is no comment. Row locks
-  # refuse on every route (R72): hosts take them through their own driver.
+  # transaction, or the host's. An executable comment is no comment.
   defp hand_built_read(text) do
     rest = past_comments(text)
     word = first_word(rest)
@@ -207,9 +206,6 @@ defmodule SelectoDBMariaDB.Session do
       String.upcase(word) == "ANALYZE" and not analyzes_select?(rest) ->
         hand_built_refusal(:hand_built_not_a_read, "must be a read")
 
-      row_lock?(text) ->
-        hand_built_refusal(:hand_built_row_lock, "must not take row locks")
-
       true ->
         :ok
     end
@@ -218,9 +214,11 @@ defmodule SelectoDBMariaDB.Session do
   defp analyzes_select?(text),
     do: Regex.match?(~r/\AANALYZE\s+(?:FORMAT\s*=\s*\w+\s+)?\(*\s*SELECT\b/i, text)
 
-  # Words split by comments are still the words: an executable comment's text
-  # runs, and any other comment is whitespace. A string that says FOR UPDATE
-  # refuses too: this has to fail closed.
+  # Chooses the transaction, nothing more: READ ONLY refuses a locking read, so one
+  # gets a plain transaction, ended by ROLLBACK as the driver's autocommit read
+  # would end. Words split by comments are still the words: an executable
+  # comment's text runs, and any other comment is whitespace. A string that says
+  # FOR UPDATE gets the plain transaction too, and loses nothing by it.
   defp row_lock?(text) do
     bare =
       text
@@ -327,12 +325,20 @@ defmodule SelectoDBMariaDB.Session do
      }}
   end
 
-  defp read_start(_query, true), do: "START TRANSACTION READ ONLY"
+  # A plain transaction stops no write, so hand-built text gets the check a read
+  # that runs as written gets; the ROLLBACK then ends whatever a function did.
+  defp read_start(conn, _query, {text, params}, true, opts) do
+    if row_lock?(text) do
+      with :ok <- no_write(conn, text, params, opts), do: {:ok, "START TRANSACTION"}
+    else
+      {:ok, "START TRANSACTION READ ONLY"}
+    end
+  end
 
-  defp read_start(query, false) do
+  defp read_start(_conn, query, _statement, false, _opts) do
     if Regex.match?(~r/\bFOR\s+(?:UPDATE|SHARE)\b/i, IO.iodata_to_binary(query)),
-      do: "START TRANSACTION",
-      else: "START TRANSACTION READ ONLY"
+      do: {:ok, "START TRANSACTION"},
+      else: {:ok, "START TRANSACTION READ ONLY"}
   end
 
   @doc false
