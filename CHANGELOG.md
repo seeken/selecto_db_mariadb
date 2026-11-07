@@ -14,8 +14,14 @@
   locks: `DBConnection.run/3` closed a connection whose status changed. They run
   as written, so their snapshot stays until the host ends it.
 - Hand-built text on a read path must be a read by its first word
-  (`hand_built_not_a_read`); where a read runs as written, a `WITH` that says
-  INSERT, UPDATE, DELETE or REPLACE refuses (`hand_built_write`).
+  (`hand_built_not_a_read`); row locks in it refuse on every route
+  (`hand_built_row_lock`). Where a read runs as written the server decides about
+  a WITH: it is EXPLAINed, and what is not a read or cannot be settled refuses
+  (`hand_built_write`). SHOW, EXPLAIN and DESCRIBE answer as the driver does.
+- The lock probe settles no default database and table-only grants through a
+  table the role can see, and fails closed.
+- Selecto sends no ROLLBACK for a transaction it does not own: a failed undo in a
+  host's text transaction closes the held connection instead.
 - An idle read or stream at `autocommit=1` is `START TRANSACTION READ ONLY` ended by
   ROLLBACK (R55).
   A read that reaches a write refuses (`read_only_read`). Under `LOCK TABLES` a

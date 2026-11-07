@@ -145,6 +145,9 @@ defmodule SelectoDBMariaDB.Adapter do
         do: Keyword.put(opts, :selecto_session_guard, true),
         else: opts
 
+    # The text as the host wrote it: statement/1 only prefixes what is sent.
+    opts = Keyword.put(opts, :selecto_statement, {normalize_query(query), params})
+
     cond do
       not dependency_available?() ->
         {:error, @missing_dependency}
@@ -191,7 +194,7 @@ defmodule SelectoDBMariaDB.Adapter do
   defp owned_transaction(checked_out, fun, opts) do
     case {DBConnection.status(checked_out), Session.host_locks(checked_out, [], opts)} do
       {:idle, :none} -> Session.owned_transaction(checked_out, fun, opts)
-      {:idle, :held} -> {:error, host_table_locks()}
+      {:idle, held} when held in [:held, :unsettled] -> {:error, host_table_locks()}
       {:idle, {:error, _} = error} -> error
       _not_idle -> {:error, unowned_transaction()}
     end
@@ -239,7 +242,12 @@ defmodule SelectoDBMariaDB.Adapter do
   defp execute_direct(connection, query, params, opts) do
     if dependency_available?() do
       with :ok <- require_binary_protocol(opts) do
-        route(connection, query, &execute_checked(&1, query, params, opts), opts)
+        route(
+          connection,
+          query,
+          &execute_checked(&1, query, params, opts),
+          Keyword.put(opts, :selecto_statement, {normalize_query(query), params})
+        )
       end
     else
       {:error, @missing_dependency}
@@ -391,6 +399,8 @@ defmodule SelectoDBMariaDB.Adapter do
   # compares by epoch). Anything else (DATE_FORMAT(ts), ts + INTERVAL 0
   # SECOND, a derived table, a nested view) is unproven and a scope compare
   # on it refuses (column_unresolved), whatever type the view reports.
+  @unproven "selecto_unproven_view_column"
+
   defp prove_view_columns(connection, rows, types) do
     columns =
       Enum.map(rows, fn [tag, schema, table, column, type] ->
@@ -416,62 +426,22 @@ defmodule SelectoDBMariaDB.Adapter do
           {{to_string(s), to_string(t)}, to_string(d || "")}
         end)
 
-      Enum.reduce(columns, types, fn {tag, schema, table, column, reported}, acc ->
+      Enum.reduce(columns, types, fn {tag, schema, table, column, _reported}, acc ->
         case Map.fetch(definitions, {schema, table}) do
           :error ->
             acc
 
           {:ok, definition} ->
-            kind =
-              case view_column_type(connection, schema, table, definition, column) do
-                @unproven -> unproven_type(connection, schema, table, reported)
-                proven -> proven
-              end
-
+            # An unproven column refuses scope compares here, whatever the
+            # view reports for it: MariaDB's derived column types do not prove
+            # the base column's.
+            kind = view_column_type(connection, schema, table, definition, column)
             put_in(acc, [tag, String.downcase(column)], MapSet.new([kind]))
         end
       end)
     else
       [] -> types
       _error -> mark_unproven(columns, types)
-    end
-  end
-
-  @unproven "selecto_unproven_view_column"
-
-  # R40d: without a proof, only a numeric, boolean or uuid column keeps its
-  # reported type, and only when no base table the view uses has a
-  # TIMESTAMP column; temporal and text columns, or an uncertain scan,
-  # refuse.
-  @plain_reported ~w(tinyint smallint mediumint int integer bigint float double real bit bool boolean uuid)
-
-  defp unproven_type(connection, schema, view, reported) do
-    numeric? =
-      reported in @plain_reported or String.starts_with?(reported, ["decimal", "numeric"])
-
-    if numeric? and not timestamp_reachable?(connection, schema, view),
-      do: reported,
-      else: @unproven
-  end
-
-  defp timestamp_reachable?(connection, schema, view) do
-    if @view_column_usage do
-      case execute(
-             connection,
-             "SELECT COUNT(*) FROM information_schema.VIEW_TABLE_USAGE u " <>
-               "JOIN information_schema.COLUMNS c ON BINARY c.TABLE_SCHEMA = BINARY u.TABLE_SCHEMA " <>
-               "AND BINARY c.TABLE_NAME = BINARY u.TABLE_NAME " <>
-               "WHERE BINARY u.VIEW_SCHEMA = BINARY ? AND BINARY u.VIEW_NAME = BINARY ? " <>
-               "AND c.DATA_TYPE = 'timestamp'",
-             [schema, view],
-             selecto_catalog: true
-           ) do
-        {:ok, %{rows: [[0]]}} -> false
-        _ -> true
-      end
-    else
-      # MariaDB lists no view's base tables: assume one could.
-      true
     end
   end
 
@@ -1322,7 +1292,7 @@ defmodule SelectoDBMariaDB.Adapter do
 
     case Session.host_locks(connection, quoted) do
       :none -> :ok
-      :held -> {:error, host_table_locks()}
+      held when held in [:held, :unsettled] -> {:error, host_table_locks()}
       {:error, reason} -> {:error, write_error(:transaction_failed, reason)}
     end
   end

@@ -133,16 +133,29 @@ triggers or rules.
   a write it made to a non-transactional table cannot be undone by anyone.
   `autocommit=0` is a host transaction from its first statement: a read there
   opens what the host's own SELECT would, and its snapshot stays until the host
-  ends it.
+  ends it. A pool whose connections are left at `autocommit=0` therefore keeps
+  each connection's snapshot from one checkout to the next.
 - Hand-built text on a read path runs as written, but must be a read by its
-  first word (`reason: :hand_built_not_a_read`), and in a host transaction,
-  where nothing would stop it, a `WITH` that says INSERT, UPDATE, DELETE or
-  REPLACE refuses (`reason: :hand_built_write`).
+  first word (SELECT, WITH, VALUES, TABLE, SHOW, EXPLAIN, DESCRIBE, ANALYZE of a
+  select, or `reason: :hand_built_not_a_read`). In a host transaction, where
+  nothing would stop a write, the server decides: a WITH is EXPLAINed and its
+  `select_type` read, and anything but a read, or a statement EXPLAIN cannot
+  settle, refuses (`reason: :hand_built_write`), as does ANALYZE there.
+- Hand-built text and raw text cannot take row locks, on any route
+  (`reason: :hand_built_row_lock`): take them through your own driver. The check
+  fails closed, so a string that says FOR UPDATE refuses too.
 - A read under `LOCK TABLES` or `FLUSH TABLES t WITH READ LOCK` runs as
   written too, because START TRANSACTION would release those locks: a writing
   view reached there at `autocommit=1` commits, as it would for the host's own
   SELECT. Reads keep the host's connection, variables and locks. A write or
   `transaction/3` under such locks refuses (`reason: :host_table_locks`).
+- When no probe of a name can tell whether table locks are held (no default
+  database, table-only grants) a table the role can see answers; if that cannot
+  settle it either, a read runs as written and a write or `transaction/3` refuses.
+- Selecto sends no ROLLBACK or COMMIT for a transaction it does not own. A write
+  whose savepoint cannot be undone in a transaction begun with text on a held
+  connection closes that connection, so the holder's next statement fails and no
+  COMMIT reports a false OK.
 - A write or `transaction/3` on a pid or pool whose connection is in a
   transaction refuses without sending a statement
   (`reason: :unowned_transaction`). Pass the connection from
