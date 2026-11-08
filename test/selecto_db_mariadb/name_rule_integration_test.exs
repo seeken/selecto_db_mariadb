@@ -217,4 +217,134 @@ defmodule SelectoDBMariaDB.NameRuleIntegrationTest do
 
     assert refusal(statement) == {:cte_name_redefined, ["vv"]}
   end
+
+  # A CTE named like the table p, its body over r with p's columns.
+  defp fake_p(query, ctx) do
+    Selecto.with_cte(
+      query,
+      ctx.t.p,
+      fn -> q(ctx, r(ctx)) |> Selecto.select(["product_id", "title", "tenant_id"]) end,
+      columns: ["id", "name", "tenant_id"]
+    )
+  end
+
+  defp reviews_with_product(ctx, extra \\ %{}) do
+    product = Map.merge(p(ctx).source, extra)
+
+    r(ctx)
+    |> put_in([:source, :associations], %{
+      prod: %{queryable: :prod, field: :prod, owner_key: :product_id, related_key: :id}
+    })
+    |> Map.put(:schemas, %{prod: product})
+    |> Map.put(:joins, %{prod: %{type: :left, name: "prod"}})
+  end
+
+  test "only an undeclared root reads a list of its name; joined and declared tables stay tables",
+       ctx do
+    # A joined schema over table p, and a CTE named p: refused.
+    joined =
+      q(ctx, reviews_with_product(ctx)) |> fake_p(ctx) |> Selecto.select(["title", "prod.name"])
+
+    assert refusal(joined) == {:cte_name_collision, [ctx.t.p]}
+
+    # A root declaring its schema is a table: refused.
+    declared =
+      q(ctx, put_in(p(ctx), [:source, :source_schema], "public"))
+      |> fake_p(ctx)
+      |> Selecto.select(["name"])
+
+    assert refusal(declared) == {:cte_name_collision, [ctx.t.p]}
+
+    # A body rooted on a declared table named like an earlier CTE: refused.
+    body = dom("cte_cb", id: :integer, name: :string)
+
+    nested =
+      q(ctx, body)
+      |> fake_p(ctx)
+      |> Selecto.with_cte(
+        "cte_cb",
+        fn ->
+          q(ctx, put_in(p(ctx), [:source, :source_schema], "public"))
+          |> Selecto.select(["id", "name"])
+        end,
+        columns: ["id", "name"],
+        dependencies: [ctx.t.p]
+      )
+      |> Selecto.select(["name"])
+
+    assert refusal(nested) == {:cte_name_collision, [ctx.t.p]}
+
+    # An undeclared root named like its own CTE.
+    undeclared = q(ctx, p(ctx)) |> fake_p(ctx) |> Selecto.select(["name"])
+    # It reads the list (README): no adapter here can tell a table of that name.
+    assert outcome(undeclared) == [["pub-low"], ["pub-t1"], ["pub-t2"]]
+  end
+
+  defp tier(query, condition),
+    do: Selecto.case_when_select(query, [{[condition], "HIGH"}], else: "LOW", as: "tier")
+
+  test "a CASE subquery reads its table; a list named like it refuses", ctx do
+    exists =
+      q(ctx, r(ctx))
+      |> Selecto.select(["id"])
+      |> Selecto.filter({"product_id", 2})
+      |> Selecto.filter({"rating", {:>=, 4}})
+
+    for condition <- [
+          {"id", {:subquery, :in, rated(ctx)}},
+          {"id", "=", {:subquery, :any, rated(ctx)}},
+          {:exists, exists}
+        ] do
+      query = q(ctx, p(ctx)) |> values_r(ctx) |> Selecto.select(["name"]) |> tier(condition)
+      assert refusal(query) == {:cte_name_collision, [ctx.t.r]}
+    end
+
+    control =
+      q(ctx, p(ctx)) |> Selecto.select(["name"]) |> tier({"id", {:subquery, :in, rated(ctx)}})
+
+    assert outcome(control) == [["a", "HIGH"], ["b", "LOW"]]
+  end
+
+  test "raw CTEs: unreferenced, joined, and named like a table read", ctx do
+    plain = q(ctx, p(ctx)) |> Selecto.with_ctes([{:raw_cte, "raw_one AS (SELECT 1 AS v)", []}])
+    assert outcome(Selecto.select(plain, ["name"])) == [["a"], ["b"]]
+
+    joined =
+      q(ctx, p(ctx))
+      |> Selecto.with_ctes([{:raw_cte, "raw_two (rid, v) AS (SELECT 1, 7)", []}])
+      |> Selecto.join(:rw,
+        source: "raw_two",
+        source_kind: :cte,
+        type: :left,
+        owner_key: :id,
+        related_key: :rid,
+        fields: %{"v" => %{type: :integer}}
+      )
+      |> Selecto.select(["name", "rw.v"])
+
+    assert outcome(joined) == [["a", 7], ["b", nil]]
+
+    # A raw CTE named like a table a filter subquery reads refuses.
+    named =
+      q(ctx, p(ctx))
+      |> Selecto.with_ctes([{:raw_cte, "#{ctx.t.r} AS (SELECT 2 AS product_id)", []}])
+      |> Selecto.filter({"id", {:subquery, :in, rated(ctx)}})
+      |> Selecto.select(["name"])
+
+    assert refusal(named) == {:cte_name_collision, [ctx.t.r]}
+  end
+
+  test "an embedded query missing its required tenant refuses typed", ctx do
+    inner =
+      q(ctx, Map.put(dom(ctx.t.r, @rf, %{tenant_field: :tenant_id}), :tenant_required, true))
+      |> Selecto.select(["product_id"])
+
+    query =
+      q(ctx, p(ctx))
+      |> Selecto.filter({"id", {:subquery, :in, inner}})
+      |> Selecto.select(["name"])
+
+    assert {:error, %Selecto.Error{details: %{code: :tenant_scope_missing}}} =
+             Selecto.execute(query)
+  end
 end
