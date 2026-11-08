@@ -2,20 +2,16 @@
 
 ## Unreleased
 
-- Under `WITH RECURSIVE` a CTE body that reads a table named like a CTE the
-  statement defines after it refuses (`cte_name_collision`): MariaDB showed the
-  body the later CTE, so it read that CTE's rows instead of the table.
-- `nested_cte_shadowing` compares a body's own lists only with the `WITH` it sits
-  in. A body two levels down whose own CTE was named like a root CTE was refused,
-  though MariaDB reads the body's own.
+- CTE and VALUES names follow Selecto's single rule: a name that is also a
+  relation the statement reads anywhere refuses (`cte_name_collision`), and a
+  name defined twice with different lists refuses (`cte_name_redefined`). It
+  replaces this adapter's `nested_cte_shadowing` check, which missed a later
+  CTE seen from a body's subquery or nested body under `WITH RECURSIVE`, and a
+  root's closure CTE read by a CTE body's closure join with the same id. Bodies
+  whose own CTE is named like a different one of the root now refuse
+  (`cte_name_redefined`) even two levels down, where MariaDB read the body's own.
 - A values-backed schema with a long id answers: its generated CTE name passed 64
-  characters and the read failed. Generated names are now reserved
-  (`__selecto_...`) and bounded.
-- A CTE body that defines its own CTE or VALUES list named like one an enclosing
-  `WITH` already defines refuses (`nested_cte_shadowing`): MariaDB lets the
-  enclosing one win, so the body read the outer rows. Under `WITH RECURSIVE` the
-  statement's later CTEs count too; a list identical to the enclosing one is
-  allowed.
+  characters and the read failed. Generated names are bounded.
 - `system_versioning_asof` joins the session check: anything but `DEFAULT` refuses
   generated and mixed reads, streams and writes (`invalid_session`), and a write's
   trigger that sets it is undone and refused. A post-image guard read the past and

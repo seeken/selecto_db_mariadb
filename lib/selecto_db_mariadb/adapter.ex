@@ -294,88 +294,14 @@ defmodule SelectoDBMariaDB.Adapter do
                       "CONCAT(DATA_TYPE, '(', NUMERIC_PRECISION, ',', NUMERIC_SCALE, ')') " <>
                       "ELSE DATA_TYPE END AS DATA_TYPE"
 
-  def prepare_read(%{domain: domain} = selecto, connection) when is_map(domain) do
-    with :ok <- nested_cte_shadowing(selecto) do
-      prepare_storage_types(selecto, domain, connection)
-    end
-  end
+  # A CTE or VALUES name MariaDB would scope differently from MySQL (an enclosing
+  # name winning over a body's own, a later CTE seen under WITH RECURSIVE)
+  # never reaches here: Selecto.Executor.prepare_read/1 refuses a name defined
+  # twice with different lists, or named like a relation the statement reads.
+  def prepare_read(%{domain: domain} = selecto, connection) when is_map(domain),
+    do: prepare_storage_types(selecto, domain, connection)
 
   def prepare_read(selecto, _connection), do: {:ok, selecto}
-
-  # MariaDB lets a name from an enclosing WITH win over a CTE or VALUES list of
-  # the same name that a CTE body defines in a WITH of its own (11.4: `WITH x AS
-  # (SELECT 1 v), y AS (WITH x AS (SELECT 2 v) SELECT v FROM x) SELECT v FROM y`
-  # gives 1). Such a body is refused rather than read the outer one. A derived
-  # table (a subquery join) shadows as written and is left alone.
-  # A body's list identical to the enclosing one of that name reads the same rows
-  # either way, and is allowed. Under WITH RECURSIVE MariaDB shows a body the
-  # statement's later CTEs too, so they count as enclosing there. Only the WITH
-  # the body sits in counts.
-  defp nested_cte_shadowing(selecto) do
-    selecto
-    |> Selecto.Executor.read_scopes()
-    |> Enum.filter(&(&1.kind in [:cte_body, :recursive_part] and Map.has_key?(&1, :cte_spec)))
-    |> Enum.flat_map(fn %{query: body, enclosing: [parent | _], cte_spec: spec} ->
-      # Only the WITH the body sits in counts (raw MariaDB 11.4: a depth-3 body's
-      # own CTE wins over the root's), at the body's position there.
-      visible =
-        if recursive_with?(parent), do: list_names(parent), else: parent_names(parent, spec)
-
-      enclosing_lists = lists(parent)
-
-      for list <- lists(body),
-          name = list_name(list),
-          name in visible,
-          list not in enclosing_lists,
-          do: name
-    end)
-    |> case do
-      [] ->
-        :ok
-
-      names ->
-        {:error,
-         %Selecto.Error{
-           type: :query_enforcement,
-           message:
-             "MariaDB does not let a CTE body's own CTE or VALUES list shadow an " <>
-               "enclosing one of the same name",
-           details: %{
-             code: :query_rule_not_evaluable,
-             reason: :nested_cte_shadowing,
-             relations: Enum.uniq(names),
-             adapter: :mariadb
-           }
-         }}
-    end
-  end
-
-  defp lists(query) do
-    set = Map.get(query, :set) || %{}
-    List.wrap(Map.get(set, :ctes)) ++ List.wrap(Map.get(set, :values_clauses))
-  end
-
-  defp list_name(%{name: name}) when not is_nil(name), do: to_string(name)
-  defp list_name(%{alias: name}) when not is_nil(name), do: to_string(name)
-  defp list_name(_list), do: nil
-
-  defp parent_names(parent, spec) do
-    values = List.wrap(Map.get(Map.get(parent, :set) || %{}, :values_clauses))
-
-    (values ++ Selecto.Builder.Sql.visible_ctes(parent, spec))
-    |> Enum.map(&list_name/1)
-    |> Enum.reject(&is_nil/1)
-  end
-
-  defp list_names(query), do: query |> lists() |> Enum.map(&list_name/1) |> Enum.reject(&is_nil/1)
-
-  defp recursive_with?(query),
-    do:
-      query
-      |> Map.get(:set, %{})
-      |> Map.get(:ctes)
-      |> List.wrap()
-      |> Enum.any?(&match?(%{type: :recursive}, &1))
 
   defp prepare_storage_types(selecto, domain, connection) do
     domains = [domain | Enum.map(Selecto.Executor.set_operands(selecto), &Map.get(&1, :domain))]

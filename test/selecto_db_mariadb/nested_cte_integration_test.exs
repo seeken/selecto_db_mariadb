@@ -1,6 +1,7 @@
 defmodule SelectoDBMariaDB.NestedCteIntegrationTest do
   # MariaDB lets a name from an enclosing WITH win over a CTE a body defines in a
-  # WITH of its own; the body is refused rather than read the outer one.
+  # WITH of its own; a name defined twice with different lists is refused rather
+  # than read the outer one.
   use ExUnit.Case, async: false
 
   alias SelectoDBMariaDB.Adapter
@@ -103,8 +104,7 @@ defmodule SelectoDBMariaDB.NestedCteIntegrationTest do
   end
 
   test "a body's own CTE named like an enclosing one refuses; another name answers", %{conn: conn} do
-    assert {:error,
-            %Selecto.Error{details: %{reason: :nested_cte_shadowing, relations: ["allp"]}}} =
+    assert {:error, %Selecto.Error{details: %{reason: :cte_name_redefined, relations: ["allp"]}}} =
              Selecto.execute(query(conn, "allp"))
 
     assert {:ok, {[["r1", "a"], ["r2", nil]], _, _}} = Selecto.execute(query(conn, "onlya"))
