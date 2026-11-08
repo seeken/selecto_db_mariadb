@@ -295,6 +295,47 @@ defmodule SelectoDBMariaDB.Adapter do
                       "ELSE DATA_TYPE END AS DATA_TYPE"
 
   def prepare_read(%{domain: domain} = selecto, connection) when is_map(domain) do
+    with :ok <- nested_cte_shadowing(selecto) do
+      prepare_storage_types(selecto, domain, connection)
+    end
+  end
+
+  def prepare_read(selecto, _connection), do: {:ok, selecto}
+
+  # MariaDB lets a name from an enclosing WITH win over a CTE or VALUES list of
+  # the same name that a CTE body defines in a WITH of its own (11.4: `WITH x AS
+  # (SELECT 1 v), y AS (WITH x AS (SELECT 2 v) SELECT v FROM x) SELECT v FROM y`
+  # gives 1). Such a body is refused rather than read the outer one. A derived
+  # table (a subquery join) shadows as written and is left alone.
+  defp nested_cte_shadowing(selecto) do
+    selecto
+    |> Selecto.Executor.read_scopes()
+    |> Enum.filter(&(&1.kind in [:cte_body, :recursive_part]))
+    |> Enum.flat_map(fn %{query: query, outer: outer} ->
+      query |> Selecto.Executor.defined_names() |> Enum.filter(&(&1 in outer))
+    end)
+    |> case do
+      [] ->
+        :ok
+
+      names ->
+        {:error,
+         %Selecto.Error{
+           type: :query_enforcement,
+           message:
+             "MariaDB does not let a CTE body's own CTE or VALUES list shadow an " <>
+               "enclosing one of the same name",
+           details: %{
+             code: :query_rule_not_evaluable,
+             reason: :nested_cte_shadowing,
+             relations: Enum.uniq(names),
+             adapter: :mariadb
+           }
+         }}
+    end
+  end
+
+  defp prepare_storage_types(selecto, domain, connection) do
     domains = [domain | Enum.map(Selecto.Executor.set_operands(selecto), &Map.get(&1, :domain))]
 
     names = domains |> Enum.reduce([], &collect_relations/2) |> Enum.uniq()
@@ -384,8 +425,6 @@ defmodule SelectoDBMariaDB.Adapter do
         end
     end
   end
-
-  def prepare_read(selecto, _connection), do: {:ok, selecto}
 
   # MySQL lists a view's base tables in information_schema.VIEW_TABLE_USAGE;
   # MariaDB has no such table (the shape test alone proves the column).

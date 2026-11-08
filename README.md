@@ -205,6 +205,14 @@ triggers or rules.
   retry them. Zero or out-of-range stored dates fail the read as a query
   error with SQLSTATE `22008` (category `:datetime_field_overflow`).
 
+### Nested CTEs
+
+MariaDB resolves a name from an enclosing `WITH` before a CTE or VALUES list of
+the same name that a CTE body defines in a `WITH` of its own (`WITH x AS (SELECT
+1 v), y AS (WITH x AS (SELECT 2 v) SELECT v FROM x) SELECT v FROM y` gives 1).
+Such a body refuses (`query_rule_not_evaluable`, `reason: :nested_cte_shadowing`);
+give its CTE another name. A subquery join's own `WITH` shadows as written.
+
 ## Write previews
 
 A write preview's `params` are the logical parameters: each value once, as
