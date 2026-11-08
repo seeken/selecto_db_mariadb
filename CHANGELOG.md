@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- A CTE body that defines its own CTE or VALUES list named like one an enclosing
+  `WITH` already defines refuses (`nested_cte_shadowing`): MariaDB lets the
+  enclosing one win, so the body read the outer rows.
 - `system_versioning_asof` joins the session check: anything but `DEFAULT` refuses
   generated and mixed reads, streams and writes (`invalid_session`), and a write's
   trigger that sets it is undone and refused. A post-image guard read the past and
