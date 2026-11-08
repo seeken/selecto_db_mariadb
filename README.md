@@ -210,8 +210,11 @@ triggers or rules.
 MariaDB resolves a name from an enclosing `WITH` before a CTE or VALUES list of
 the same name that a CTE body defines in a `WITH` of its own (`WITH x AS (SELECT
 1 v), y AS (WITH x AS (SELECT 2 v) SELECT v FROM x) SELECT v FROM y` gives 1).
-Such a body refuses (`query_rule_not_evaluable`, `reason: :nested_cte_shadowing`);
-give its CTE another name. A subquery join's own `WITH` shadows as written.
+Under `WITH RECURSIVE` it also shows a body the statement's later CTEs. Such a
+body refuses (`query_rule_not_evaluable`, `reason: :nested_cte_shadowing`) unless
+its list is identical to the enclosing one (same rows either way); give its CTE
+another name. A subquery join's own `WITH` shadows as written. A values-backed
+schema's generated CTE is named by its rows, so it cannot be hidden this way.
 
 ## Write previews
 

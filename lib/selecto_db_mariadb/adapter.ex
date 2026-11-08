@@ -307,12 +307,23 @@ defmodule SelectoDBMariaDB.Adapter do
   # (SELECT 1 v), y AS (WITH x AS (SELECT 2 v) SELECT v FROM x) SELECT v FROM y`
   # gives 1). Such a body is refused rather than read the outer one. A derived
   # table (a subquery join) shadows as written and is left alone.
+  # A body's list identical to the enclosing one of that name reads the same rows
+  # either way, and is allowed. Under WITH RECURSIVE MariaDB shows a body the
+  # statement's later CTEs too, so they count as enclosing there.
   defp nested_cte_shadowing(selecto) do
     selecto
     |> Selecto.Executor.read_scopes()
     |> Enum.filter(&(&1.kind in [:cte_body, :recursive_part]))
-    |> Enum.flat_map(fn %{query: query, outer: outer} ->
-      query |> Selecto.Executor.defined_names() |> Enum.filter(&(&1 in outer))
+    |> Enum.flat_map(fn %{query: body, outer: outer, enclosing: enclosing} ->
+      [parent | _] = enclosing
+      visible = if recursive_with?(parent), do: outer ++ list_names(parent), else: outer
+      enclosing_lists = Enum.flat_map(enclosing, &lists/1)
+
+      for list <- lists(body),
+          name = list_name(list),
+          name in visible,
+          list not in enclosing_lists,
+          do: name
     end)
     |> case do
       [] ->
@@ -334,6 +345,25 @@ defmodule SelectoDBMariaDB.Adapter do
          }}
     end
   end
+
+  defp lists(query) do
+    set = Map.get(query, :set) || %{}
+    List.wrap(Map.get(set, :ctes)) ++ List.wrap(Map.get(set, :values_clauses))
+  end
+
+  defp list_name(%{name: name}) when not is_nil(name), do: to_string(name)
+  defp list_name(%{alias: name}) when not is_nil(name), do: to_string(name)
+  defp list_name(_list), do: nil
+
+  defp list_names(query), do: query |> lists() |> Enum.map(&list_name/1) |> Enum.reject(&is_nil/1)
+
+  defp recursive_with?(query),
+    do:
+      query
+      |> Map.get(:set, %{})
+      |> Map.get(:ctes)
+      |> List.wrap()
+      |> Enum.any?(&match?(%{type: :recursive}, &1))
 
   defp prepare_storage_types(selecto, domain, connection) do
     domains = [domain | Enum.map(Selecto.Executor.set_operands(selecto), &Map.get(&1, :domain))]
