@@ -309,15 +309,19 @@ defmodule SelectoDBMariaDB.Adapter do
   # table (a subquery join) shadows as written and is left alone.
   # A body's list identical to the enclosing one of that name reads the same rows
   # either way, and is allowed. Under WITH RECURSIVE MariaDB shows a body the
-  # statement's later CTEs too, so they count as enclosing there.
+  # statement's later CTEs too, so they count as enclosing there. Only the WITH
+  # the body sits in counts.
   defp nested_cte_shadowing(selecto) do
     selecto
     |> Selecto.Executor.read_scopes()
-    |> Enum.filter(&(&1.kind in [:cte_body, :recursive_part]))
-    |> Enum.flat_map(fn %{query: body, outer: outer, enclosing: enclosing} ->
-      [parent | _] = enclosing
-      visible = if recursive_with?(parent), do: outer ++ list_names(parent), else: outer
-      enclosing_lists = Enum.flat_map(enclosing, &lists/1)
+    |> Enum.filter(&(&1.kind in [:cte_body, :recursive_part] and Map.has_key?(&1, :cte_spec)))
+    |> Enum.flat_map(fn %{query: body, enclosing: [parent | _], cte_spec: spec} ->
+      # Only the WITH the body sits in counts (raw MariaDB 11.4: a depth-3 body's
+      # own CTE wins over the root's), at the body's position there.
+      visible =
+        if recursive_with?(parent), do: list_names(parent), else: parent_names(parent, spec)
+
+      enclosing_lists = lists(parent)
 
       for list <- lists(body),
           name = list_name(list),
@@ -354,6 +358,14 @@ defmodule SelectoDBMariaDB.Adapter do
   defp list_name(%{name: name}) when not is_nil(name), do: to_string(name)
   defp list_name(%{alias: name}) when not is_nil(name), do: to_string(name)
   defp list_name(_list), do: nil
+
+  defp parent_names(parent, spec) do
+    values = List.wrap(Map.get(Map.get(parent, :set) || %{}, :values_clauses))
+
+    (values ++ Selecto.Builder.Sql.visible_ctes(parent, spec))
+    |> Enum.map(&list_name/1)
+    |> Enum.reject(&is_nil/1)
+  end
 
   defp list_names(query), do: query |> lists() |> Enum.map(&list_name/1) |> Enum.reject(&is_nil/1)
 
