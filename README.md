@@ -211,18 +211,24 @@ MariaDB scopes CTE names differently from MySQL: a name from an enclosing `WITH`
 wins over a CTE or VALUES list of the same name that a CTE body defines itself
 (`WITH x AS (SELECT 1 v), y AS (WITH x AS (SELECT 2 v) SELECT v FROM x) SELECT v
 FROM y` gives 1), and under `WITH RECURSIVE` a body sees the statement's later
-CTEs from any position inside it. Selecto does not model this. It refuses, on
-every adapter, a statement in which a CTE or VALUES name defined anywhere is also
-a relation read anywhere in it (`query_rule_not_evaluable`,
-`reason: :cte_name_collision`), or one name is defined twice with different
-lists (`reason: :cte_name_redefined`), so no query can read another list, or a
-list for a table. Identical copies of a list are one list. Rename the CTE.
+CTEs from any position inside it. Selecto does not model this; one rule holds on
+every adapter. A name a query reads is a reference to a list where the statement
+makes it one (a domain rooted on a CTE or VALUES list its own query defines, a
+CTE body's domain rooted on a list visible where the body sits, an ad-hoc join
+naming a visible list) and a table everywhere else, including filter subqueries
+and a domain's declared non-association joins. A table named like a list
+defined anywhere in the statement refuses (`query_rule_not_evaluable`,
+`reason: :cte_name_collision`), and one name defined twice with different lists
+refuses (`reason: :cte_name_redefined`), so no query can read another list, or
+a list for a table. Identical copies of a list are one list. Rename the CTE.
 Selecto's generated CTEs (values-backed schemas, hierarchy joins) are named
 `__selecto_...` by their content, within 64 characters.
 
 MariaDB does not parse a `WITH` inside a set operand, so a union member that
-defines its own CTE, or whose closure or hierarchy join generates one, fails as
-a query error (1064).
+defines its own CTE or VALUES list, or whose closure or hierarchy join or
+values-backed schema generates one, fails as a query error (1064). Other
+adapters keep such a list private to its member, so two members may define one
+name differently there.
 
 ## Write previews
 

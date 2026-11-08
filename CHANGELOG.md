@@ -2,11 +2,13 @@
 
 ## Unreleased
 
-- CTE and VALUES names follow Selecto's single rule: a name that is also a
-  relation the statement reads anywhere refuses (`cte_name_collision`), and a
-  name defined twice with different lists refuses (`cte_name_redefined`). It
-  replaces this adapter's `nested_cte_shadowing` check, which missed a later
-  CTE seen from a body's subquery or nested body under `WITH RECURSIVE`, and a
+- CTE and VALUES names follow Selecto's single rule: a table read anywhere in
+  the statement (filter subqueries and declared non-association joins included)
+  named like a list defined anywhere refuses (`cte_name_collision`), and a name
+  defined twice with different lists refuses (`cte_name_redefined`) unless the
+  two sit in different set members. A domain rooted on a CTE reads the CTE. It
+  replaces this adapter's `nested_cte_shadowing` check, which missed a later CTE
+  seen from a body's subquery or nested body under `WITH RECURSIVE`, and a
   root's closure CTE read by a CTE body's closure join with the same id. Bodies
   whose own CTE is named like a different one of the root now refuse
   (`cte_name_redefined`) even two levels down, where MariaDB read the body's own.
