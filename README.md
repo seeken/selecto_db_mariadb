@@ -210,11 +210,19 @@ triggers or rules.
 MariaDB resolves a name from an enclosing `WITH` before a CTE or VALUES list of
 the same name that a CTE body defines in a `WITH` of its own (`WITH x AS (SELECT
 1 v), y AS (WITH x AS (SELECT 2 v) SELECT v FROM x) SELECT v FROM y` gives 1).
-Under `WITH RECURSIVE` it also shows a body the statement's later CTEs. Such a
-body refuses (`query_rule_not_evaluable`, `reason: :nested_cte_shadowing`) unless
-its list is identical to the enclosing one (same rows either way); give its CTE
-another name. A subquery join's own `WITH` shadows as written. A values-backed
-schema's generated CTE is named by its rows, so it cannot be hidden this way.
+Only the `WITH` the body sits in counts: a body nested one level deeper reads its
+own CTE over the root's. Under `WITH RECURSIVE` MariaDB also shows a body the
+statement's later CTEs. Such a body refuses (`query_rule_not_evaluable`,
+`reason: :nested_cte_shadowing`) unless its list is identical to the enclosing
+one (same rows either way); give its CTE another name. A subquery join's own
+`WITH` shadows as written. Selecto's generated CTEs (values-backed schemas,
+hierarchy joins) take reserved `__selecto_` names, within 64 characters, so they
+cannot be hidden this way.
+
+The same visibility reaches a body's tables: under `WITH RECURSIVE` a body that
+reads a table named like a CTE the statement defines after it would read that
+CTE, so it refuses (`reason: :cte_name_collision`). Without `RECURSIVE` the body
+reads the table, as on MySQL.
 
 ## Write previews
 

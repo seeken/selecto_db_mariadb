@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Under `WITH RECURSIVE` a CTE body that reads a table named like a CTE the
+  statement defines after it refuses (`cte_name_collision`): MariaDB showed the
+  body the later CTE, so it read that CTE's rows instead of the table.
+- `nested_cte_shadowing` compares a body's own lists only with the `WITH` it sits
+  in. A body two levels down whose own CTE was named like a root CTE was refused,
+  though MariaDB reads the body's own.
+- A values-backed schema with a long id answers: its generated CTE name passed 64
+  characters and the read failed. Generated names are now reserved
+  (`__selecto_...`) and bounded.
 - A CTE body that defines its own CTE or VALUES list named like one an enclosing
   `WITH` already defines refuses (`nested_cte_shadowing`): MariaDB lets the
   enclosing one win, so the body read the outer rows. Under `WITH RECURSIVE` the

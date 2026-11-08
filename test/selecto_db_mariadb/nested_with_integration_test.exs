@@ -40,7 +40,9 @@ defmodule SelectoDBMariaDB.NestedWithIntegrationTest do
           "INSERT INTO r VALUES (1, 1, 'pub-t1'), (2, 1, 'pub-t2'), (3, 2, 'pub-low')",
           "INSERT INTO c2 VALUES (1, 'TBL-C2'), (2, 'TBL-C2b')",
           "INSERT INTO it VALUES (1, 'A'), (2, 'B')",
-          "INSERT INTO sh VALUES (1, 'A'), (2, 'B')"
+          "INSERT INTO sh VALUES (1, 'A'), (2, 'B')",
+          "CREATE TABLE lk (product_id INT, label VARCHAR(20))",
+          "INSERT INTO lk VALUES (1, 'TBL-LK')"
         ],
         do: MyXQL.query!(ddl, sql, [], query_type: :text)
 
@@ -84,7 +86,32 @@ defmodule SelectoDBMariaDB.NestedWithIntegrationTest do
     Enum.sort(rows)
   end
 
-  defp values_domain(table, prefix) do
+  defp walk(query, conn) do
+    Selecto.with_recursive_cte(query, "walk",
+      base_query: fn -> q(conn, p()) |> Selecto.select(["id"]) |> Selecto.filter({"id", 1}) end,
+      recursive_query: fn _ref ->
+        q(conn, p())
+        |> Selecto.join(:w,
+          source: "walk",
+          type: :inner,
+          owner_key: :id,
+          related_key: :wid,
+          fields: %{"wid" => %{type: :integer}}
+        )
+        |> Selecto.select(["id"])
+        |> Selecto.filter({"id", 999})
+      end,
+      columns: ["wid"],
+      join: [
+        owner_key: :id,
+        related_key: :wid,
+        type: :left,
+        fields: %{"wid" => %{type: :integer}}
+      ]
+    )
+  end
+
+  defp values_domain(table, prefix, id \\ :status) do
     %{
       name: table,
       source: %{
@@ -94,11 +121,11 @@ defmodule SelectoDBMariaDB.NestedWithIntegrationTest do
         redact_fields: [],
         columns: %{id: %{type: :integer}, sid: %{type: :string}},
         associations: %{
-          status: %{queryable: :status, field: :status, owner_key: :sid, related_key: :id}
+          id => %{queryable: id, field: id, owner_key: :sid, related_key: :id}
         }
       },
       schemas: %{
-        status: %{
+        id => %{
           primary_key: :id,
           fields: [:id, :name],
           columns: %{id: %{type: :string}, name: %{type: :string}},
@@ -106,7 +133,7 @@ defmodule SelectoDBMariaDB.NestedWithIntegrationTest do
           associations: %{}
         }
       },
-      joins: %{status: %{type: :left}}
+      joins: %{id => %{type: :left}}
     }
   end
 
@@ -223,5 +250,125 @@ defmodule SelectoDBMariaDB.NestedWithIntegrationTest do
       |> Selecto.select(["name", "cv.lab"])
 
     assert rows(query) == [["a", "OUTER-V"], ["b", nil]]
+  end
+
+  test "a values-backed schema with a long id answers", %{conn: conn} do
+    id = String.to_atom("status_" <> String.duplicate("y", 39))
+    query = q(conn, values_domain("it", "Item", id)) |> Selecto.select(["id", "#{id}.name"])
+
+    assert rows(query) == [[1, "Item-A"], [2, "Item-B"]]
+  end
+
+  test "under WITH RECURSIVE a body reading a table named like a later CTE refuses",
+       %{conn: conn} do
+    label = %{"label" => %{type: :string}}
+
+    lk =
+      Selecto.Advanced.CTE.create_cte(
+        "lk",
+        fn -> q(conn, p()) |> Selecto.select(["id", "name"]) end,
+        columns: ["product_id", "label"]
+      )
+
+    body = fn ->
+      q(conn, p())
+      |> Selecto.join(:lkj,
+        source: "lk",
+        type: :left,
+        owner_key: :id,
+        related_key: :product_id,
+        fields: label
+      )
+      |> Selecto.select(["id", "lkj.label"])
+    end
+
+    query =
+      q(conn, p())
+      |> Selecto.with_cte("cb", body,
+        columns: ["rid", "clab"],
+        join: [owner_key: :id, related_key: :rid, fields: %{"clab" => %{type: :string}}]
+      )
+      |> Selecto.with_ctes([lk])
+      |> Selecto.join(:lkm,
+        source: "lk",
+        source_kind: :cte,
+        type: :left,
+        owner_key: :id,
+        related_key: :product_id,
+        fields: label
+      )
+      |> Selecto.select(["name", "cb.clab", "lkm.label"])
+
+    assert rows(query) == [["a", "TBL-LK", "a"], ["b", nil, "b"]]
+
+    assert {:error, %Selecto.Error{details: %{reason: :cte_name_collision, relations: ["lk"]}}} =
+             Selecto.execute(walk(query, conn))
+  end
+
+  test "a depth-3 body's own CTE named like a root CTE reads its own", %{conn: conn} do
+    label = %{"label" => %{type: :string}}
+
+    own =
+      Selecto.Advanced.CTE.create_cte(
+        "c2",
+        fn ->
+          q(conn, p()) |> Selecto.filter({"tenant_id", 1}) |> Selecto.select(["id", "name"])
+        end,
+        columns: ["product_id", "label"]
+      )
+
+    all =
+      Selecto.Advanced.CTE.create_cte(
+        "c2",
+        fn -> q(conn, p()) |> Selecto.select(["id", "name"]) end,
+        columns: ["product_id", "label"]
+      )
+
+    dd = fn ->
+      q(conn, r())
+      |> Selecto.with_ctes([own])
+      |> Selecto.join(:c2j,
+        source: "c2",
+        source_kind: :cte,
+        type: :inner,
+        owner_key: :product_id,
+        related_key: :product_id,
+        fields: label
+      )
+      |> Selecto.select(["id", "c2j.label"])
+    end
+
+    cb = fn ->
+      q(conn, r())
+      |> Selecto.with_cte("dd", dd,
+        columns: ["did", "dl"],
+        join: [
+          owner_key: :id,
+          related_key: :did,
+          type: :inner,
+          fields: %{"dl" => %{type: :string}}
+        ]
+      )
+      |> Selecto.select(["id", "dd.dl"])
+    end
+
+    query =
+      q(conn, r())
+      |> Selecto.with_ctes([all])
+      |> Selecto.with_cte("cb", cb,
+        columns: ["rid", "clab"],
+        join: [owner_key: :id, related_key: :rid, fields: %{"clab" => %{type: :string}}]
+      )
+      |> Selecto.join(:c2m,
+        source: "c2",
+        source_kind: :cte,
+        type: :left,
+        owner_key: :product_id,
+        related_key: :product_id,
+        fields: label
+      )
+      |> Selecto.select(["title", "cb.clab", "c2m.label"])
+
+    assert rows(query) == [["pub-low", nil, "b"], ["pub-t1", "a", "a"], ["pub-t2", "a", "a"]]
   end
 end
