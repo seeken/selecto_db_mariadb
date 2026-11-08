@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Only a query's root reads a CTE or VALUES list of its name, and only when its
+  domain declares no `source_schema`; joined schemas, through tables and
+  declared tables stay tables (`cte_name_collision`). A root named like one of
+  its own lists reads the list, even where a table of that name exists. CASE
+  subqueries count like filter subqueries; a raw CTE counts by the name its text
+  starts with, and no longer raises `BadMapError`. An embedded query missing its
+  required tenant refuses `tenant_scope_missing` instead of raising.
 - CTE and VALUES names follow Selecto's single rule: a table read anywhere in
   the statement (filter subqueries and declared non-association joins included)
   named like a list defined anywhere refuses (`cte_name_collision`), and a name
