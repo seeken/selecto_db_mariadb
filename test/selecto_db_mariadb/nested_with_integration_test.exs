@@ -259,7 +259,7 @@ defmodule SelectoDBMariaDB.NestedWithIntegrationTest do
     assert rows(query) == [[1, "Item-A"], [2, "Item-B"]]
   end
 
-  test "under WITH RECURSIVE a body reading a table named like a later CTE refuses",
+  test "a body reading a table named like a later CTE refuses, with or without RECURSIVE",
        %{conn: conn} do
     label = %{"label" => %{type: :string}}
 
@@ -299,13 +299,13 @@ defmodule SelectoDBMariaDB.NestedWithIntegrationTest do
       )
       |> Selecto.select(["name", "cb.clab", "lkm.label"])
 
-    assert rows(query) == [["a", "TBL-LK", "a"], ["b", nil, "b"]]
-
-    assert {:error, %Selecto.Error{details: %{reason: :cte_name_collision, relations: ["lk"]}}} =
-             Selecto.execute(walk(query, conn))
+    for q <- [query, walk(query, conn)] do
+      assert {:error, %Selecto.Error{details: %{reason: :cte_name_collision, relations: ["lk"]}}} =
+               Selecto.execute(q)
+    end
   end
 
-  test "a depth-3 body's own CTE named like a root CTE reads its own", %{conn: conn} do
+  test "a depth-3 body's own CTE named like a different root CTE refuses", %{conn: conn} do
     label = %{"label" => %{type: :string}}
 
     own =
@@ -369,6 +369,65 @@ defmodule SelectoDBMariaDB.NestedWithIntegrationTest do
       )
       |> Selecto.select(["title", "cb.clab", "c2m.label"])
 
-    assert rows(query) == [["pub-low", nil, "b"], ["pub-t1", "a", "a"], ["pub-t2", "a", "a"]]
+    assert {:error, %Selecto.Error{details: %{reason: :cte_name_redefined, relations: ["c2"]}}} =
+             Selecto.execute(query)
+  end
+
+  # Union shapes: a CTE whose body is a set operation, one whose member defines
+  # its own CTE, and a top-level union member carrying a WITH.
+  defp union_body(conn, member_cte?) do
+    fn ->
+      left = q(conn, p()) |> Selecto.filter({"id", 1}) |> Selecto.select(["id", "name"])
+
+      right =
+        if member_cte? do
+          own =
+            Selecto.Advanced.CTE.create_cte(
+              "pc",
+              fn ->
+                q(conn, p()) |> Selecto.filter({"id", 2}) |> Selecto.select(["id", "name"])
+              end,
+              columns: ["pid", "pname"]
+            )
+
+          q(conn, p())
+          |> Selecto.with_ctes([own])
+          |> Selecto.join(:pcj,
+            source: "pc",
+            source_kind: :cte,
+            type: :inner,
+            owner_key: :id,
+            related_key: :pid,
+            fields: %{"pname" => %{type: :string}}
+          )
+          |> Selecto.select(["id", "pcj.pname"])
+        else
+          q(conn, p()) |> Selecto.filter({"id", 2}) |> Selecto.select(["id", "name"])
+        end
+
+      Selecto.union(left, right, all: true)
+    end
+  end
+
+  defp union_cte(conn, member_cte?) do
+    q(conn, p())
+    |> Selecto.with_cte("u", union_body(conn, member_cte?),
+      columns: ["uid", "uname"],
+      join: [owner_key: :id, related_key: :uid, fields: %{"uname" => %{type: :string}}]
+    )
+    |> Selecto.select(["name", "u.uname"])
+  end
+
+  test "a CTE whose body is a union answers", %{conn: conn} do
+    assert rows(union_cte(conn, false)) == [["a", "a"], ["b", "b"]]
+  end
+
+  # Known (LOW): MariaDB does not parse a WITH inside a set operand, so a union
+  # member that defines its own CTE fails as a query error (1064).
+  test "a union member defining its own CTE fails on MariaDB, in a CTE body or at the top",
+       %{conn: conn} do
+    for query <- [union_cte(conn, true), union_body(conn, true).()] do
+      assert {:error, %Selecto.Error{type: :query_error}} = Selecto.execute(query)
+    end
   end
 end

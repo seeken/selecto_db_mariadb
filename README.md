@@ -205,24 +205,24 @@ triggers or rules.
   retry them. Zero or out-of-range stored dates fail the read as a query
   error with SQLSTATE `22008` (category `:datetime_field_overflow`).
 
-### Nested CTEs
+### CTE and VALUES names
 
-MariaDB resolves a name from an enclosing `WITH` before a CTE or VALUES list of
-the same name that a CTE body defines in a `WITH` of its own (`WITH x AS (SELECT
-1 v), y AS (WITH x AS (SELECT 2 v) SELECT v FROM x) SELECT v FROM y` gives 1).
-Only the `WITH` the body sits in counts: a body nested one level deeper reads its
-own CTE over the root's. Under `WITH RECURSIVE` MariaDB also shows a body the
-statement's later CTEs. Such a body refuses (`query_rule_not_evaluable`,
-`reason: :nested_cte_shadowing`) unless its list is identical to the enclosing
-one (same rows either way); give its CTE another name. A subquery join's own
-`WITH` shadows as written. Selecto's generated CTEs (values-backed schemas,
-hierarchy joins) take reserved `__selecto_` names, within 64 characters, so they
-cannot be hidden this way.
+MariaDB scopes CTE names differently from MySQL: a name from an enclosing `WITH`
+wins over a CTE or VALUES list of the same name that a CTE body defines itself
+(`WITH x AS (SELECT 1 v), y AS (WITH x AS (SELECT 2 v) SELECT v FROM x) SELECT v
+FROM y` gives 1), and under `WITH RECURSIVE` a body sees the statement's later
+CTEs from any position inside it. Selecto does not model this. It refuses, on
+every adapter, a statement in which a CTE or VALUES name defined anywhere is also
+a relation read anywhere in it (`query_rule_not_evaluable`,
+`reason: :cte_name_collision`), or one name is defined twice with different
+lists (`reason: :cte_name_redefined`), so no query can read another list, or a
+list for a table. Identical copies of a list are one list. Rename the CTE.
+Selecto's generated CTEs (values-backed schemas, hierarchy joins) are named
+`__selecto_...` by their content, within 64 characters.
 
-The same visibility reaches a body's tables: under `WITH RECURSIVE` a body that
-reads a table named like a CTE the statement defines after it would read that
-CTE, so it refuses (`reason: :cte_name_collision`). Without `RECURSIVE` the body
-reads the table, as on MySQL.
+MariaDB does not parse a `WITH` inside a set operand, so a union member that
+defines its own CTE, or whose closure or hierarchy join generates one, fails as
+a query error (1064).
 
 ## Write previews
 
