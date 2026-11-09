@@ -687,4 +687,40 @@ defmodule SelectoDBMariaDB.NameRuleIntegrationTest do
              inspect(text)
     end
   end
+
+  test "placeholder-like text in a raw CTE's literals is text without params, nested too", ctx do
+    lit = "why?"
+
+    inner =
+      q(ctx, dom("pa", pid: :integer, v: :string))
+      |> Selecto.with_ctes([
+        {:raw_cte, "pa AS (SELECT 1 AS pid, '#{lit}' AS v /* #{lit} */ -- #{lit}\n)", []}
+      ])
+      |> Selecto.select(["pid", "v"])
+      |> Selecto.filter({"pid", 1})
+
+    assert outcome(inner) == [[1, lit]]
+
+    nested =
+      q(ctx, p(ctx))
+      |> Selecto.DynamicJoin.join_subquery(:sq, inner, on: [%{left: "id", right: "pid"}])
+      |> Selecto.select(["name", "sq.v"])
+      |> Selecto.filter({"name", "a"})
+
+    assert outcome(nested) == [["a", lit]]
+
+    # A nested raw filter with the same text beside a bound param.
+    sub =
+      q(ctx, p(ctx))
+      |> Selecto.filter({:raw_sql_filter, ["selecto_root.name <> '#{lit}'"]})
+      |> Selecto.filter({"id", 1})
+      |> Selecto.select(["id"])
+
+    filtered =
+      q(ctx, p(ctx))
+      |> Selecto.filter({"id", {:subquery, :in, sub}})
+      |> Selecto.select(["name"])
+
+    assert outcome(filtered) == [["a"]]
+  end
 end
