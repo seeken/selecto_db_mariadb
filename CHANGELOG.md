@@ -5,13 +5,13 @@
 - A raw CTE's text must be plain definitions, comments allowed; every name it
   defines counts (several in one text, comments before them, backtick or
   double-quoted names), and text that does not parse refuses `raw_cte_unparsed`.
-  A plain CTE or VALUES list name (letters, digits, underscores, not reserved)
-  is written unquoted in its definition and every root and join naming it, so a
+  A plain CTE or VALUES list name (letters, digits, underscores, and in any case
+  not a word any supported dialect reserves) is written unquoted in its definition and every root and join naming it, so a
   mixed-case list root reads its list and host SQL naming it unquoted reads it
   too. Raw text may be iodata with `{:param, value}` markers; text this adapter
   would lex differently refuses `raw_cte_unparsed` (see the README). A query
   member the read does not use no longer makes every read refuse
-  `tenant_scope_missing`.
+  `tenant_scope_missing`. Raw text with `/*M!` comments refuses `raw_cte_unparsed`. A raw CTE whose params do not match its placeholders refuses `raw_cte_params_mismatch` instead of raising.
 - Only a query's root reads a CTE or VALUES list of its name, and only when its
   domain declares no `source_schema`; joined schemas, through tables and
   declared tables stay tables (`cte_name_collision`). A root named like one of
