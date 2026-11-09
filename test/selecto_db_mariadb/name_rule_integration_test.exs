@@ -811,4 +811,67 @@ defmodule SelectoDBMariaDB.NameRuleIntegrationTest do
     literal = outer.({:exists, "SELECT 1 FROM p x WHERE x.name <> 'why?' -- why?\n"})
     assert outcome(literal) == [["a"], ["b"]]
   end
+
+  test "a set member's or CTE body's placeholder its own params do not bind refuses typed", ctx do
+    left = q(ctx, p(ctx)) |> Selecto.filter({"tenant_id", 1}) |> Selecto.select(["id"])
+
+    unbound =
+      q(ctx, p(ctx))
+      |> Selecto.filter({:raw_sql_filter, "CAST(? AS CHAR) = '1'"})
+      |> Selecto.select(["id"])
+
+    body = fn ->
+      q(ctx, p(ctx))
+      |> Selecto.filter({:raw_sql_filter, "CAST(? AS CHAR) = '1'"})
+      |> Selecto.select(["id", "name"])
+    end
+
+    over_cte =
+      q(ctx, dom("nr_c25", id: :integer, name: :string))
+      |> Selecto.filter({"name", {:!=, "zz"}})
+      |> Selecto.with_cte("nr_c25", body, columns: ["id", "name"])
+      |> Selecto.select(["id"])
+
+    marked =
+      q(ctx, p(ctx))
+      |> Selecto.filter({"tenant_id", 1})
+      |> Selecto.filter(
+        {:exists,
+         ["SELECT 1 FROM p x WHERE x.name <> ", {:param, "zz"}, " AND CAST(? AS CHAR) = '1'"]}
+      )
+      |> Selecto.select(["id"])
+
+    for query <- [
+          Selecto.union(left, unbound, all: true),
+          Selecto.intersect(left, unbound),
+          Selecto.except(left, unbound),
+          over_cte,
+          marked
+        ] do
+      assert {:error, %Selecto.Error{details: %{reason: reason}}} = Selecto.execute(query)
+      assert reason in [:placeholder_count_mismatch, :placeholder_unsupported]
+    end
+
+    # A marker-bearing fragment without raw placeholders answers.
+    clean =
+      q(ctx, p(ctx))
+      |> Selecto.filter({:exists, ["SELECT 1 FROM p x WHERE x.name <> ", {:param, "zz"}]})
+      |> Selecto.select(["id"])
+
+    assert outcome(clean) == [[1], [2]]
+  end
+
+  test "a LATERAL join the adapter cannot render refuses typed", ctx do
+    query =
+      q(ctx, p(ctx))
+      |> Selecto.lateral_join(
+        :left,
+        fn _parent -> q(ctx, p(ctx)) |> Selecto.select(["id"]) |> Selecto.limit(1) end,
+        "lat"
+      )
+      |> Selecto.select(["id"])
+
+    assert {:error, %Selecto.Error{details: %{reason: :lateral_unsupported}}} =
+             Selecto.execute(query)
+  end
 end

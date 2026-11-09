@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- A LATERAL join MariaDB cannot render refuses typed (`lateral_unsupported`) instead of raising.
 - A nested fragment holding a `?` without params refuses typed
   (`placeholder_count_mismatch`) instead of binding a value of the statement
   around it.
