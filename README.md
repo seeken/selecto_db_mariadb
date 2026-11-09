@@ -226,10 +226,13 @@ unless the two sit in different set members. A raw CTE's text
 `name [(columns)] AS [NOT] [MATERIALIZED] (...)` definitions, comments allowed;
 every name it defines counts, and other text refuses (`raw_cte_unparsed`). Names
 compare case-insensitively on every adapter, which over-refuses where a dialect
-keeps case. A root named like one of its own lists reads the list here, even
-where a table of that name exists: rename one of them. Identical copies of a
-list are one list. Selecto's generated CTEs (values-backed schemas, hierarchy
-joins) are named `__selecto_...` by their content, within 64 characters.
+keeps case. On MySQL and MariaDB raw text is also refused with `#` comments,
+`--` not followed by whitespace, `/*!` comments, "double quotes" (ANSI_QUOTES is
+not known), dollar quotes and nested block comments. A root named like one of
+its own lists reads the list here, even where a table of that name exists:
+rename one of them. Identical copies of a list are one list. Selecto's generated
+CTEs (values-backed schemas, hierarchy joins) are named `__selecto_...` by their
+content, within 64 characters.
 
 MariaDB does not parse a `WITH` inside a set operand, so a union member that
 defines its own CTE or VALUES list, or whose closure or hierarchy join or
