@@ -625,4 +625,66 @@ defmodule SelectoDBMariaDB.NameRuleIntegrationTest do
     assert refusal(named |> Selecto.select(["name"]) |> Selecto.filter({"lkd.label", "x"})) ==
              {:cte_name_collision, [ctx.t.lk]}
   end
+
+  test "a list named with a word only another dialect reserves reads as host text names it",
+       ctx do
+    listed =
+      q(ctx, p(ctx))
+      |> Selecto.with_values([[1]], columns: ["pid"], as: "Plan")
+      |> Selecto.filter({:raw_sql_filter, ["selecto_root.id IN (SELECT pid FROM Plan)"]})
+      |> Selecto.select(["name"])
+
+    assert outcome(listed) == [["a"]]
+
+    raw =
+      q(ctx, p(ctx))
+      |> Selecto.with_ctes([{:raw_cte, "Plan AS (SELECT 1 AS id, 'RAW' AS v)", []}])
+      |> Selecto.join(:mj,
+        source: "Plan",
+        type: :left,
+        owner_key: :id,
+        related_key: :id,
+        fields: %{"v" => %{type: :string}}
+      )
+      |> Selecto.select(["name", "mj.v"])
+
+    assert outcome(raw) == [["a", "RAW"], ["b", nil]]
+  end
+
+  test "a raw CTE with params inside a subquery join binds them", ctx do
+    inner =
+      q(ctx, dom("pa", pid: :integer, label: :string))
+      |> Selecto.with_ctes([
+        {:raw_cte, "pa AS (SELECT CAST(? AS SIGNED) AS pid, 'P' AS label)", [1]}
+      ])
+      |> Selecto.select(["pid", "label"])
+
+    query =
+      q(ctx, p(ctx))
+      |> Selecto.DynamicJoin.join_subquery(:sq, inner, on: [%{left: "id", right: "pid"}])
+      |> Selecto.select(["name", "sq.label"])
+
+    assert outcome(query) == [["a", "P"], ["b", nil]]
+  end
+
+  test "a raw CTE placeholder its params do not bind refuses typed", ctx do
+    one = "CAST(? AS SIGNED)"
+    two = String.replace("CAST(? AS SIGNED)", "?", "??")
+
+    for {text, params} <- [
+          {"pa AS (SELECT #{one} AS pid, #{two} AS label)", [5]},
+          {"pa AS (SELECT 7 AS pid, #{one} AS label)", []},
+          {["pa AS (SELECT ", {:param, 5}, " AS pid, 'P' AS label)"], [6]}
+        ] do
+      query =
+        q(ctx, dom("pa", pid: :integer, label: :string))
+        |> Selecto.with_ctes([{:raw_cte, text, params}])
+        |> Selecto.select(["pid", "label"])
+        |> Selecto.filter({"label", "OUTER"})
+
+      assert {:error, %Selecto.Error{details: %{reason: :raw_cte_params_mismatch}}} =
+               Selecto.execute(query),
+             inspect(text)
+    end
+  end
 end
