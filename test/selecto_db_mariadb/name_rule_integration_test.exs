@@ -765,4 +765,23 @@ defmodule SelectoDBMariaDB.NameRuleIntegrationTest do
       GenServer.stop(c)
     end
   end
+
+  test "a nested fragment's refusal comes back typed from every execute entry point", ctx do
+    refused =
+      q(ctx, p(ctx))
+      |> Selecto.filter(
+        {:exists, "SELECT 1 FROM p x WHERE 'it\\'s' <> x.name AND x.name = ?", ["a"]}
+      )
+      |> Selecto.select(["name"])
+
+    for result <- [
+          Selecto.execute(refused),
+          Selecto.execute_one(refused),
+          Selecto.execute_with_metadata(refused),
+          Selecto.execute_count_with_metadata(refused),
+          Selecto.execute_stream(refused)
+        ] do
+      assert {:error, %Selecto.Error{details: %{reason: :placeholder_ambiguous}}} = result
+    end
+  end
 end
