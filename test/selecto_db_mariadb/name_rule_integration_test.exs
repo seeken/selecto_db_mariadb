@@ -44,7 +44,7 @@ defmodule SelectoDBMariaDB.NameRuleIntegrationTest do
       MyXQL.query!(a, "DROP DATABASE IF EXISTS `#{db}`", [], query_type: :text)
     end)
 
-    %{conn: conn, t: %{p: "p", r: "r", lk: "lk"}}
+    %{conn: conn, db: db, t: %{p: "p", r: "r", lk: "lk"}}
   end
 
   # Shared shapes: filter subqueries, declared non-association joins, domains
@@ -722,5 +722,47 @@ defmodule SelectoDBMariaDB.NameRuleIntegrationTest do
       |> Selecto.select(["name"])
 
     assert outcome(filtered) == [["a"]]
+  end
+
+  defp nested_filter(query_fun, raw) do
+    sub =
+      query_fun.()
+      |> Selecto.filter({:raw_sql_filter, [raw]})
+      |> Selecto.filter({"id", 1})
+      |> Selecto.select(["id"])
+
+    query_fun.()
+    |> Selecto.filter({"id", {:subquery, :in, sub}})
+    |> Selecto.select(["name"])
+  end
+
+  test "under NO_BACKSLASH_ESCAPES, a nested fragment's backslash literal refuses typed", ctx do
+    {:ok, c} =
+      MyXQL.start_link(
+        Keyword.merge(opts(),
+          database: ctx.db,
+          pool_size: 1,
+          after_connect: fn conn ->
+            MyXQL.query!(
+              conn,
+              "SET SESSION sql_mode = CONCAT(@@session.sql_mode, ',NO_BACKSLASH_ESCAPES')",
+              [],
+              query_type: :text
+            )
+          end
+        )
+      )
+
+    try do
+      {:ok, conn} = @adapter.connect(c)
+      products = fn -> Selecto.configure(p(ctx), conn, adapter: @adapter, validate: false) end
+
+      assert {:error, %Selecto.Error{details: %{reason: :placeholder_ambiguous}}} =
+               Selecto.execute(nested_filter(products, ~S[selecto_root.name <> 'C:\']))
+
+      assert outcome(nested_filter(products, "selecto_root.name <> 'why?'")) == [["a"]]
+    after
+      GenServer.stop(c)
+    end
   end
 end
