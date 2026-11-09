@@ -431,4 +431,98 @@ defmodule SelectoDBMariaDB.NameRuleIntegrationTest do
 
     assert refusal(quoted) == {:invalid_identifier, [bad]}
   end
+
+  test "a raw CTE's iodata text with parameters is read and runs", ctx do
+    raw = {:raw_cte, ["x14 AS (SELECT ", {:param, 1}, " AS pid)"], []}
+
+    query =
+      q(ctx, p(ctx))
+      |> Selecto.with_ctes([raw])
+      |> Selecto.join(:xj,
+        source: "x14",
+        source_kind: :cte,
+        type: :left,
+        owner_key: :id,
+        related_key: :pid,
+        fields: %{"pid" => %{type: :integer}}
+      )
+      |> Selecto.select(["name", "xj.pid"])
+
+    assert outcome(query) == [["a", 1], ["b", nil]]
+  end
+
+  test "a mixed-case list named unquoted in host SQL reads the list", ctx do
+    list = "MixF"
+
+    query =
+      q(ctx, p(ctx))
+      |> Selecto.with_values([[1]], columns: ["pid"], as: list)
+      |> Selecto.filter({:raw_sql_filter, ["selecto_root.id IN (SELECT pid FROM #{list})"]})
+      |> Selecto.select(["name"])
+
+    assert outcome(query) == [["a"]]
+
+    # A raw CTE's unquoted mixed-case name and an ad-hoc join spelled the same
+    # read one list.
+    raw = {:raw_cte, "MixR AS (SELECT 1 AS id, 'RAWR' AS v)", []}
+
+    joined =
+      q(ctx, p(ctx))
+      |> Selecto.with_ctes([raw])
+      |> Selecto.join(:mj,
+        source: "MixR",
+        type: :left,
+        owner_key: :id,
+        related_key: :id,
+        fields: %{"v" => %{type: :string}}
+      )
+      |> Selecto.select(["name", "mj.v"])
+
+    assert outcome(joined) == [["a", "RAWR"], ["b", nil]]
+  end
+
+  test "a $ inside a raw CTE's identifier does not hide the next definition", ctx do
+    text = "x AS (SELECT 1 AS a$q$), #{ctx.t.r} AS (#{raw_r(ctx)})"
+
+    query =
+      q(ctx, p(ctx))
+      |> Selecto.with_ctes([{:raw_cte, text, []}])
+      |> Selecto.filter({"id", {:subquery, :in, rated(ctx)}})
+      |> Selecto.select(["name"])
+
+    assert refusal(query) == {:cte_name_collision, [ctx.t.r]}
+  end
+
+  test "an ad-hoc join on a list whose name an identifier cannot hold refuses typed", ctx do
+    query =
+      q(ctx, p(ctx))
+      |> Selecto.with_values([[1, "V"]], columns: ["id", "v"], as: "v$x")
+      |> Selecto.join(:vj,
+        source: "v$x",
+        type: :left,
+        owner_key: :id,
+        related_key: :id,
+        fields: %{"v" => %{type: :string}}
+      )
+      |> Selecto.select(["name", "vj.v"])
+
+    assert refusal(query) == {:invalid_identifier, ["v$x"]}
+  end
+
+  test "raw text MySQL would read differently refuses", ctx do
+    for text <- [
+          ~S[r2 AS (SELECT "x" AS v)],
+          "r2 AS (SELECT 1 AS v) # c",
+          "r2 AS (SELECT 1 --c\n AS v)",
+          "/*! r2 AS */ r3 AS (SELECT 1 AS v)",
+          ~S[r2 AS (SELECT $t$ x $t$ AS v)]
+        ] do
+      query =
+        q(ctx, p(ctx)) |> Selecto.with_ctes([{:raw_cte, text, []}]) |> Selecto.select(["name"])
+
+      assert {:error, %Selecto.Error{details: %{reason: :raw_cte_unparsed}}} =
+               Selecto.execute(query),
+             text
+    end
+  end
 end
