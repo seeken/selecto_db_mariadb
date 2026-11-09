@@ -525,4 +525,70 @@ defmodule SelectoDBMariaDB.NameRuleIntegrationTest do
              text
     end
   end
+
+  test "a list named with a word any supported dialect reserves reads its rows", ctx do
+    for name <- ~w(With Desc Window To Lateral Rank Rows Groups) do
+      joined =
+        q(ctx, p(ctx))
+        |> Selecto.with_values([[1, "V"]], columns: ["id", "v"], as: name)
+        |> Selecto.join(:vj,
+          source: name,
+          type: :left,
+          owner_key: :id,
+          related_key: :id,
+          fields: %{"v" => %{type: :string}}
+        )
+        |> Selecto.select(["name", "vj.v"])
+
+      assert outcome(joined) == [["a", "V"], ["b", nil]], name
+
+      rooted =
+        q(ctx, dom(name, id: :integer, v: :string))
+        |> Selecto.with_values([[1, "V"]], columns: ["id", "v"], as: name)
+        |> Selecto.select(["v"])
+
+      assert outcome(rooted) == [["V"]], name
+
+      cte =
+        q(ctx, p(ctx))
+        |> Selecto.with_cte(name, fn -> q(ctx, p(ctx)) |> Selecto.select(["id", "name"]) end,
+          columns: ["id", "v"]
+        )
+        |> Selecto.join(:cj,
+          source: name,
+          type: :left,
+          owner_key: :id,
+          related_key: :id,
+          fields: %{"v" => %{type: :string}}
+        )
+        |> Selecto.select(["name", "cj.v"])
+
+      assert outcome(cte) == [["a", "a"], ["b", "b"]], name
+    end
+  end
+
+  test "a non-ASCII identifier before $$ does not hide the next definition", ctx do
+    text = "x AS (SELECT 1 AS ä$$), #{ctx.t.r} AS (#{raw_r(ctx)}), y AS (SELECT 2 AS ö$$)"
+
+    query =
+      q(ctx, p(ctx))
+      |> Selecto.with_ctes([{:raw_cte, text, []}])
+      |> Selecto.filter({"id", {:subquery, :in, rated(ctx)}})
+      |> Selecto.select(["name"])
+
+    assert refusal(query) == {:cte_name_collision, [ctx.t.r]}
+  end
+
+  test "a MariaDB executable comment in a raw CTE's text refuses", ctx do
+    for open <- ["/*M!", "/*M!100100"] do
+      text = "x AS (SELECT 1 AS v) #{open} , #{ctx.t.r} AS (#{raw_r(ctx)}) */"
+
+      query =
+        q(ctx, p(ctx)) |> Selecto.with_ctes([{:raw_cte, text, []}]) |> Selecto.select(["name"])
+
+      assert {:error, %Selecto.Error{details: %{reason: :raw_cte_unparsed}}} =
+               Selecto.execute(query),
+             open
+    end
+  end
 end

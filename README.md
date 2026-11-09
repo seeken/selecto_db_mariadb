@@ -227,8 +227,11 @@ unless the two sit in different set members. A raw CTE's text
 every name it defines counts, and other text refuses (`raw_cte_unparsed`). Names
 compare case-insensitively on every adapter, which over-refuses where a dialect
 keeps case. On MySQL and MariaDB raw text is also refused with `#` comments,
-`--` not followed by whitespace, `/*!` comments, "double quotes" (ANSI_QUOTES is
-not known), dollar quotes and nested block comments. A root named like one of
+`--` not followed by whitespace, `/*!` and `/*M!` comments, "double quotes"
+(ANSI_QUOTES is not known), dollar quotes and nested block comments. A raw CTE
+whose params do not match its placeholders refuses (`raw_cte_params_mismatch`).
+A list named with a word any supported dialect reserves (`Rank`, `Rows`,
+`Groups`, `With`, ...) is quoted. A root named like one of
 its own lists reads the list here, even where a table of that name exists:
 rename one of them. Identical copies of a list are one list. Selecto's generated
 CTEs (values-backed schemas, hierarchy joins) are named `__selecto_...` by their
