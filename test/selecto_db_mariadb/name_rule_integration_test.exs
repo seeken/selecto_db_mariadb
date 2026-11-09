@@ -784,4 +784,31 @@ defmodule SelectoDBMariaDB.NameRuleIntegrationTest do
       assert {:error, %Selecto.Error{details: %{reason: :placeholder_ambiguous}}} = result
     end
   end
+
+  test "a nested placeholder its own params do not bind refuses typed; one in a literal answers",
+       ctx do
+    outer = fn filter ->
+      q(ctx, p(ctx))
+      |> Selecto.filter({"name", {:!=, "zz"}})
+      |> Selecto.filter(filter)
+      |> Selecto.select(["name"])
+    end
+
+    inner =
+      q(ctx, p(ctx))
+      |> Selecto.filter({:raw_sql_filter, ["selecto_root.name = ?"]})
+      |> Selecto.select(["id"])
+
+    for query <- [
+          outer.({:exists, "SELECT 1 FROM p x WHERE x.name = ?"}),
+          outer.({:exists, "SELECT 1 FROM p x WHERE x.name = ?", []}),
+          outer.({"id", {:subquery, :in, inner}})
+        ] do
+      assert {:error, %Selecto.Error{details: %{reason: reason}}} = Selecto.execute(query)
+      assert reason in [:placeholder_count_mismatch, :placeholder_unsupported]
+    end
+
+    literal = outer.({:exists, "SELECT 1 FROM p x WHERE x.name <> 'why?' -- why?\n"})
+    assert outcome(literal) == [["a"], ["b"]]
+  end
 end

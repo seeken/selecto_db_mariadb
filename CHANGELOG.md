@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- A nested fragment holding a `?` without params refuses typed
+  (`placeholder_count_mismatch`) instead of binding a value of the statement
+  around it.
 - A raw CTE's text must be plain definitions, comments allowed; every name it
   defines counts (several in one text, comments before them, backtick or
   double-quoted names), and text that does not parse refuses `raw_cte_unparsed`.
