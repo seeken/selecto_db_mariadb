@@ -11,7 +11,7 @@
   too. Raw text may be iodata with `{:param, value}` markers; text this adapter
   would lex differently refuses `raw_cte_unparsed` (see the README). A query
   member the read does not use no longer makes every read refuse
-  `tenant_scope_missing`. Raw text with `/*M!` comments refuses `raw_cte_unparsed`. A raw CTE whose params do not match its placeholders refuses `raw_cte_params_mismatch` instead of raising.
+  `tenant_scope_missing`. Raw text with `/*M!` comments refuses `raw_cte_unparsed`. A raw CTE's `?` placeholders must match its params one to one (none without params, none in a string or comment, no params beside `{:param, value}` markers), or it refuses `raw_cte_params_mismatch` instead of raising or binding a value of the statement around it; a raw CTE inside a subquery join is read in this dialect.
 - Only a query's root reads a CTE or VALUES list of its name, and only when its
   domain declares no `source_schema`; joined schemas, through tables and
   declared tables stay tables (`cte_name_collision`). A root named like one of
