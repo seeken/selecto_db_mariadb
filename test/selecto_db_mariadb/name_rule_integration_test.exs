@@ -347,4 +347,88 @@ defmodule SelectoDBMariaDB.NameRuleIntegrationTest do
     assert {:error, %Selecto.Error{details: %{code: :tenant_scope_missing}}} =
              Selecto.execute(query)
   end
+
+  defp raw_r(ctx),
+    do: "SELECT 2 AS id, 2 AS product_id, 5 AS rating, 'RAW' AS title, 1 AS tenant_id"
+
+  defp raw_p(_ctx), do: "SELECT 1 AS id, 'RAWP' AS name, 1 AS tenant_id"
+
+  defp raw_texts(name, body) do
+    [
+      "/* c */ #{name} AS (#{body})",
+      "-- c\n #{name} AS (#{body})",
+      "x13 AS (SELECT 1 AS v), #{name} AS (#{body})",
+      "`#{name}` AS (#{body})"
+    ]
+  end
+
+  test "every name a raw CTE's text defines counts; unreadable text refuses", ctx do
+    for text <- raw_texts(ctx.t.r, raw_r(ctx)) do
+      query =
+        q(ctx, p(ctx))
+        |> Selecto.with_ctes([{:raw_cte, text, []}])
+        |> Selecto.filter({"id", {:subquery, :in, rated(ctx)}})
+        |> Selecto.select(["name"])
+
+      assert refusal(query) == {:cte_name_collision, [ctx.t.r]}, text
+    end
+
+    for text <- raw_texts(ctx.t.p, raw_p(ctx)) do
+      query =
+        q(ctx, reviews_with_product(ctx))
+        |> Selecto.with_ctes([{:raw_cte, text, []}])
+        |> Selecto.select(["title", "prod.name"])
+
+      assert refusal(query) == {:cte_name_collision, [ctx.t.p]}, text
+    end
+
+    two = "x13 AS (SELECT 1 AS v), #{ctx.t.r} AS (#{raw_r(ctx)})"
+
+    rooted =
+      q(ctx, r(ctx)) |> Selecto.with_ctes([{:raw_cte, two, []}]) |> Selecto.select(["title"])
+
+    # The root reads its own raw list (README).
+    assert outcome(rooted) == [["RAW"]]
+
+    unreadable = q(ctx, p(ctx)) |> Selecto.with_ctes([{:raw_cte, "SELECT 1", []}])
+
+    assert {:error, %Selecto.Error{details: %{reason: :raw_cte_unparsed}}} =
+             Selecto.execute(Selecto.select(unreadable, ["name"]))
+  end
+
+  test "a query member the read does not use is not checked", ctx do
+    member =
+      q(ctx, Map.put(dom(ctx.t.r, @rf, %{tenant_field: :tenant_id}), :tenant_required, true))
+      |> Selecto.select(["product_id"])
+
+    domain = Map.put(p(ctx), :query_members, %{unused: %{query: member}})
+    assert outcome(q(ctx, domain) |> Selecto.select(["name"])) == [["a"], ["b"]]
+  end
+
+  test "a mixed-case list root reads its list; a name an identifier cannot hold refuses", ctx do
+    mixed =
+      q(ctx, dom("MixedList", id: :integer, name: :string))
+      |> Selecto.with_values([[1, "M"]], columns: ["id", "name"], as: "MixedList")
+      |> Selecto.select(["name"])
+
+    assert outcome(mixed) == [["M"]]
+
+    cte =
+      q(ctx, dom("MixedCte", id: :integer, name: :string))
+      |> Selecto.with_cte("MixedCte", fn -> q(ctx, p(ctx)) |> Selecto.select(["id", "name"]) end,
+        columns: ["id", "name"]
+      )
+      |> Selecto.select(["name"])
+
+    assert outcome(cte) == [["a"], ["b"]]
+
+    bad = ~S[bad"name]
+
+    quoted =
+      q(ctx, dom(bad, id: :integer, name: :string))
+      |> Selecto.with_values([[1, "M"]], columns: ["id", "name"], as: bad)
+      |> Selecto.select(["name"])
+
+    assert refusal(quoted) == {:invalid_identifier, [bad]}
+  end
 end

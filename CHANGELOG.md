@@ -2,12 +2,17 @@
 
 ## Unreleased
 
+- A raw CTE's text must be plain definitions, comments allowed; every name it
+  defines counts (several in one text, comments before them, backtick or
+  double-quoted names), and text that does not parse refuses `raw_cte_unparsed`.
+  A mixed-case CTE or VALUES list name reads its list (it is quoted like the
+  root naming it). A query member the read does not use no longer makes every
+  read refuse `tenant_scope_missing`.
 - Only a query's root reads a CTE or VALUES list of its name, and only when its
   domain declares no `source_schema`; joined schemas, through tables and
   declared tables stay tables (`cte_name_collision`). A root named like one of
   its own lists reads the list, even where a table of that name exists. CASE
-  subqueries count like filter subqueries; a raw CTE counts by the name its text
-  starts with, and no longer raises `BadMapError`. An embedded query missing its
+  subqueries count like filter subqueries; a raw CTE no longer raises `BadMapError`. An embedded query missing its
   required tenant refuses `tenant_scope_missing` instead of raising.
 - CTE and VALUES names follow Selecto's single rule: a table read anywhere in
   the statement (filter subqueries and declared non-association joins included)
