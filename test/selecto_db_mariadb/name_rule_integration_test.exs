@@ -591,4 +591,38 @@ defmodule SelectoDBMariaDB.NameRuleIntegrationTest do
              open
     end
   end
+
+  test "an unused declared join reads nothing: a missing table or a list named like it", ctx do
+    join = fn source ->
+      %{
+        non_assoc: true,
+        source: source,
+        type: :left,
+        owner_key: :id,
+        related_key: :product_id,
+        fields: %{"label" => %{type: :string}}
+      }
+    end
+
+    domain =
+      put_in(p(ctx), [:joins], %{
+        gone: Map.put(join.("nr_gone_#{System.unique_integer([:positive])}"), :name, "gone"),
+        lkd: Map.put(join.(ctx.t.lk), :name, "lkd")
+      })
+
+    query = q(ctx, domain)
+    assert outcome(Selecto.select(query, ["name"])) == [["a"], ["b"]]
+    assert outcome(Selecto.select(query, ["name", "lkd.label"])) == [["a", "TBL-LK"], ["b", nil]]
+
+    named =
+      Selecto.with_values(query, [[1, "V"]], columns: ["product_id", "label"], as: ctx.t.lk)
+
+    assert outcome(Selecto.select(named, ["name"])) == [["a"], ["b"]]
+
+    assert refusal(Selecto.select(named, ["name", "lkd.label"])) ==
+             {:cte_name_collision, [ctx.t.lk]}
+
+    assert refusal(named |> Selecto.select(["name"]) |> Selecto.filter({"lkd.label", "x"})) ==
+             {:cte_name_collision, [ctx.t.lk]}
+  end
 end
