@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- A failure while a stream is enumerated (a refused stored value, a server
+  error, a timeout) raises `Selecto.Error.Refused` typed as the non-stream
+  read would return it, instead of a RuntimeError carrying only a message.
 - A NaN or infinite Decimal param refuses typed (`parameter_unbindable`)
   instead of being sent as text, which MariaDB compares as 0.
 - A LATERAL join MariaDB cannot render refuses typed (`lateral_unsupported`) instead of raising.

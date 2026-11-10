@@ -204,9 +204,8 @@ defmodule SelectoDBMariaDB.RowStream do
         raise_error({:stream_producer_exit, reason})
     after
       receive_timeout ->
-        raise Selecto.Error.to_exception(
-                Selecto.Error.timeout_error("MariaDB stream timed out waiting for rows")
-              )
+        raise Selecto.Error.Refused,
+              Selecto.Error.timeout_error("MariaDB stream timed out waiting for rows")
     end
   end
 
@@ -220,8 +219,15 @@ defmodule SelectoDBMariaDB.RowStream do
           await_ack(parent, parent_monitor_ref, ref, idle_timeout)
         end)
       rescue
+        # The raw failure, normalized where it is returned or raised as the
+        # non-stream path normalizes it (Selecto.Error.stream_failure/2): the
+        # server's error and a lost connection are returned there, anything
+        # else (a parameter MyXQL cannot encode) is raised there.
+        error in [MyXQL.Error, DBConnection.ConnectionError] ->
+          {:producer_failed, error}
+
         exception ->
-          {:producer_failed, SelectoDBMariaDB.Adapter.normalize_error(exception)}
+          {:producer_failed, {:adapter_raised, exception}}
       catch
         :throw, {:selecto_stream_cancelled, ^ref} ->
           {:consumer_cancelled, ref}
@@ -281,8 +287,8 @@ defmodule SelectoDBMariaDB.RowStream do
     end
   end
 
-  defp raise_error(%Selecto.Error{} = error), do: raise(Selecto.Error.to_exception(error))
-
+  # Raised while the stream is enumerated: the Selecto.Error the non-stream
+  # path returns for the same failure, as Selecto.Error.Refused.
   defp raise_error(reason),
-    do: raise(Selecto.Error.to_exception(SelectoDBMariaDB.Adapter.normalize_error(reason)))
+    do: Selecto.Error.raise_stream_failure!(SelectoDBMariaDB.Adapter, reason)
 end

@@ -903,4 +903,42 @@ defmodule SelectoDBMariaDB.NameRuleIntegrationTest do
 
     assert {:ok, {[[2]], _, _}} = Selecto.execute(read)
   end
+
+  test "a failure while a stream is enumerated raises typed; one at open returns typed", ctx do
+    # A zero date stored under a non-strict session: the second batch's
+    # stored value refuses (StoredValues) after the first row was read.
+    {:ok, raw} = MyXQL.start_link(Keyword.put(opts(), :database, ctx.db))
+    MyXQL.query!(raw, "SET SESSION sql_mode = ''", [], query_type: :text)
+    MyXQL.query!(raw, "ALTER TABLE p ADD COLUMN d DATE", [], query_type: :text)
+
+    MyXQL.query!(raw, "UPDATE p SET d = IF(id = 1, '2024-01-01', '0000-00-00')", [],
+      query_type: :text
+    )
+
+    GenServer.stop(raw)
+
+    dated = dom(ctx.t.p, @pf ++ [d: :date])
+    read = q(ctx, dated) |> Selecto.select(["id", "d"]) |> Selecto.order_by("id")
+    assert_stream_raises_as_execute(read, max_rows: 1)
+
+    # A parameter MyXQL cannot encode fails while the cursor opens, before any
+    # stream is returned: the same error execute returns.
+    bad = q(ctx, p(ctx)) |> Selecto.filter({"name", {1, 2}}) |> Selecto.select(["id"])
+    assert {:error, %Selecto.Error{} = error} = Selecto.execute(bad)
+    assert {:error, ^error} = Selecto.execute_stream(bad)
+  end
+
+  # Enumerating a stream raises Selecto.Error.Refused carrying the error the
+  # non-stream entry points return for the same failure.
+  defp assert_stream_raises_as_execute(read, opts \\ []) do
+    assert {:error, %Selecto.Error{} = error} = Selecto.execute(read)
+    assert {:ok, stream} = Selecto.execute_stream(read, opts)
+
+    refused = assert_raise Selecto.Error.Refused, fn -> Enum.to_list(stream) end
+
+    assert {refused.type, refused.message, refused.details} ==
+             {error.type, error.message, error.details}
+
+    error
+  end
 end
