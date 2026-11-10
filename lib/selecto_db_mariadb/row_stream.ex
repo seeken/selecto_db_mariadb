@@ -219,12 +219,12 @@ defmodule SelectoDBMariaDB.RowStream do
           await_ack(parent, parent_monitor_ref, ref, idle_timeout)
         end)
       rescue
-        # The raw failure, normalized where it is returned or raised as the
-        # non-stream path normalizes it (Selecto.Error.stream_failure/2): the
-        # server's error and a lost connection are returned there, anything
-        # else (a parameter MyXQL cannot encode) is raised there.
+        # The failure as the non-stream path returns it, normalized where it
+        # is returned or raised (Selecto.Error.stream_failure/2): the server's
+        # error and a lost connection come back sanitized there, anything else
+        # (a parameter MyXQL cannot encode) is raised there.
         error in [MyXQL.Error, DBConnection.ConnectionError] ->
-          {:producer_failed, error}
+          {:producer_failed, SelectoDBMariaDB.Adapter.normalize_error(error)}
 
         exception ->
           {:producer_failed, {:adapter_raised, exception}}
