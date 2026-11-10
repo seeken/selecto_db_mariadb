@@ -271,6 +271,13 @@ defmodule SelectoDBMariaDB.WriteCompiler do
     do: compile_predicate_list(predicates, " OR ", opts, offset)
 
   def compile_predicate({:not, predicate}, opts, offset) do
+    # A negated IN is the read's NOT IN: its operands take the inequality
+    # class, as the read renders them.
+    opts =
+      if match?({:in, {:field, _}, _}, predicate),
+        do: Keyword.put(opts, :in_class, :inequality),
+        else: opts
+
     with {:ok, compiled} <- compile_predicate(predicate, opts, offset) do
       {:ok, %{text: "NOT (#{compiled.text})", params: compiled.params}}
     end
@@ -342,7 +349,7 @@ defmodule SelectoDBMariaDB.WriteCompiler do
           |> Enum.reduce_while({:ok, []}, fn compiled, {:ok, operands} ->
             case Selecto.Builder.TypedOperator.write_operand(
                    @adapter,
-                   :equality,
+                   Keyword.get(opts, :in_class, :equality),
                    compiled.params,
                    compiled.text
                  ) do

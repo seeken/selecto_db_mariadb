@@ -492,6 +492,36 @@ defmodule SelectoDBMariaDB.DecimalOperandIntegrationTest do
     assert wrong == []
   end
 
+  test "a negated IN write predicate renders its operands as the read's NOT IN does", ctx do
+    # 43 fraction digits: equal to no stored value. MariaDB's read renders
+    # NOT IN with a bare `?` (exact for <> and NOT IN); a write must not
+    # refuse it as an equality.
+    wide = %Decimal{
+      sign: 1,
+      coef: 3_333_330_000_000_000_000_000_000_000_000_000_000_001,
+      exp: -43
+    }
+
+    MyXQL.query!(ctx.raw, "UPDATE wt SET n = 0", [], query_type: :text)
+
+    {:ok, update} =
+      Selecto.Write.Command.new(%{
+        operation: :update,
+        relation: :wt,
+        assignments: [%{field: :n, value: {:literal, 1}}],
+        predicate: {:not, {:in, {:field, :d}, [{:literal, wide}]}},
+        expected_cardinality: :many
+      })
+
+    assert {:ok, _} = @adapter.execute_write_unsafe(ctx.conn, update, [])
+
+    touched =
+      MyXQL.query!(ctx.raw, "SELECT id FROM wt WHERE n = 1 ORDER BY id", [], query_type: :text).rows
+      |> List.flatten()
+
+    assert touched == Enum.map(@jc, &elem(&1, 0))
+  end
+
   test "an indexed column keeps its index for = and range comparisons", ctx do
     q = Selecto.configure(domain(), ctx.conn, adapter: @adapter, validate: false)
 
