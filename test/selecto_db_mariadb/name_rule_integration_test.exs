@@ -941,4 +941,140 @@ defmodule SelectoDBMariaDB.NameRuleIntegrationTest do
 
     error
   end
+
+  defp typed_columns(ctx) do
+    {:ok, raw} = MyXQL.start_link(Keyword.put(opts(), :database, ctx.db))
+
+    MyXQL.query!(
+      raw,
+      "ALTER TABLE p ADD COLUMN price DECIMAL(10,2), ADD COLUMN score DOUBLE, " <>
+        "ADD COLUMN d DATE, ADD COLUMN u CHAR(36)",
+      [],
+      query_type: :text
+    )
+
+    MyXQL.query!(
+      raw,
+      "UPDATE p SET price = id + 0.5, score = id + 0.5, d = '2024-01-01', " <>
+        "u = IF(id = 1, '2b2b2b2b-2b2b-4b2b-8b2b-2b2b2b2b2b2b', '33333333-3333-4333-8333-333333333333')",
+      [],
+      query_type: :text
+    )
+
+    GenServer.stop(raw)
+    dom(ctx.t.p, @pf ++ [price: :decimal, score: :float, d: :date, u: :uuid])
+  end
+
+  test "a value the dialect cannot bind faithfully refuses typed instead of answering", ctx do
+    typed = typed_columns(ctx)
+    read = fn filter -> q(ctx, typed) |> Selecto.filter(filter) |> Selecto.select(["id"]) end
+
+    # DECIMAL(65,30) holds none of these: -1e400 flipped sign, -1e-50 and
+    # 1e-31 rounded; a year past 9999 and a float special have no value here.
+    for filter <- [
+          {"price", {:>=, Decimal.new("-1e400")}},
+          {"price", {:>=, Decimal.new("-1e-50")}},
+          {"price", {:in, [Decimal.new("1e-31")]}},
+          {"d", {:>=, Date.new!(10_000, 1, 1)}},
+          {"score", {:>=, :"-inf"}}
+        ] do
+      assert {:error, %Selecto.Error{details: %{reason: :parameter_unbindable}}} =
+               Selecto.execute(read.(filter)),
+             inspect(filter)
+    end
+
+    # Text in a numeric field, a Decimal no double holds, text with a NUL.
+    for filter <- [
+          {"price", {:>=, "NaN"}},
+          {"price", "abc"},
+          {"score", Decimal.new("1e-400")},
+          {"name", "b" <> <<0>>}
+        ] do
+      assert {:error, %Selecto.Error{details: %{reason: :invalid_filter_value}}} =
+               Selecto.execute(read.(filter)),
+             inspect(filter)
+    end
+
+    assert {:ok, {[[1]], _, _}} = Selecto.execute(read.({"price", {:<, "2"}}))
+  end
+
+  test "a UUID given in another text form compares as its canonical form", ctx do
+    typed = typed_columns(ctx)
+    read = fn value -> q(ctx, typed) |> Selecto.filter({"u", value}) |> Selecto.select(["id"]) end
+
+    for value <- [
+          "2b2b2b2b-2b2b-4b2b-8b2b-2b2b2b2b2b2b",
+          "2B2B2B2B-2B2B-4B2B-8B2B-2B2B2B2B2B2B",
+          "2b2b2b2b2b2b4b2b8b2b2b2b2b2b2b2b"
+        ] do
+      assert {:ok, {[[1]], _, _}} = Selecto.execute(read.(value)), value
+    end
+
+    for value <- ["2b2b2b2b-2b2b-4b2b-8b2b-2b2b2b2b2b2b ", "not-a-uuid"] do
+      assert {:error, %Selecto.Error{details: %{reason: :invalid_filter_value}}} =
+               Selecto.execute(read.(value)),
+             value
+    end
+  end
+
+  test "a write of a value the dialect cannot bind faithfully refuses before it runs", ctx do
+    _typed = typed_columns(ctx)
+
+    for {field, value} <- [
+          {:price, Decimal.new("NaN")},
+          {:price, Decimal.new("Infinity")},
+          {:price, Decimal.new("-1e400")},
+          {:price, Decimal.new("1e-50")},
+          {:d, Date.new!(10_000, 1, 1)}
+        ] do
+      {:ok, insert} =
+        Selecto.Write.Command.new(%{
+          operation: :insert,
+          relation: :p,
+          assignments: [
+            %{field: :id, value: {:literal, 90}},
+            %{field: field, value: {:literal, value}}
+          ]
+        })
+
+      assert {:error, %Selecto.Write.Error{type: :invalid_value, details: details}} =
+               @adapter.execute_write_unsafe(ctx.conn, insert, []),
+             inspect(value)
+
+      assert details.reason == :parameter_unbindable
+    end
+
+    assert {:ok, %{rows: [[2]]}} = @adapter.execute(ctx.conn, "SELECT COUNT(*) FROM p", [], [])
+  end
+
+  test "a stream halts early, re-enumerates, and enumerates in another process", ctx do
+    read = q(ctx, p(ctx)) |> Selecto.select(["id"]) |> Selecto.order_by("id")
+    assert {:ok, stream} = Selecto.execute_stream(read, max_rows: 1)
+    ids = fn s -> Enum.map(s, fn {[id], _columns, _aliases} -> id end) end
+
+    assert ids.(Enum.take(stream, 1)) == [1]
+    assert ids.(stream) == [1, 2]
+    assert ids.(stream) == [1, 2]
+
+    assert {:ok, other} = Selecto.execute_stream(read, max_rows: 1)
+    assert Task.await(Task.async(fn -> ids.(other) end), 10_000) == [1, 2]
+    assert Task.await(Task.async(fn -> ids.(Enum.take(other, 1)) end), 10_000) == [1]
+    assert ids.(other) == [1, 2]
+
+    # The connection is free again afterwards.
+    assert {:ok, {[[1], [2]], _, _}} = Selecto.execute(read)
+  end
+
+  test "a statement failing as its cursor opens returns the error execute returns", ctx do
+    # A scalar subquery returning two rows fails as the server materializes the cursor.
+    read =
+      q(ctx, p(ctx))
+      |> Selecto.filter(
+        {:raw_sql_filter, "id = (SELECT r.product_id FROM r WHERE r.product_id = 1)"}
+      )
+      |> Selecto.select(["id"])
+
+    assert {:error, %Selecto.Error{details: %{code: 1242}} = error} = Selecto.execute(read)
+    assert {:error, ^error} = Selecto.execute_stream(read)
+  end
 end
