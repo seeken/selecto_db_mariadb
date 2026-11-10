@@ -874,4 +874,33 @@ defmodule SelectoDBMariaDB.NameRuleIntegrationTest do
     assert {:error, %Selecto.Error{details: %{reason: :lateral_unsupported}}} =
              Selecto.execute(query)
   end
+
+  test "a NaN or infinite decimal refuses typed instead of comparing as 0", ctx do
+    {:ok, _} = @adapter.execute(ctx.conn, "ALTER TABLE p ADD COLUMN price DECIMAL(10,2)", [], [])
+    {:ok, _} = @adapter.execute(ctx.conn, "UPDATE p SET price = id + 0.5", [], [])
+    priced = dom(ctx.t.p, @pf ++ [price: :decimal])
+
+    for value <- ["NaN", "Infinity", "-Infinity"] do
+      read =
+        q(ctx, priced)
+        |> Selecto.filter({"price", {:>=, Decimal.new(value)}})
+        |> Selecto.select(["id"])
+
+      for result <- [
+            Selecto.execute(read),
+            Selecto.execute_with_metadata(read),
+            Selecto.Executor.execute(read),
+            Selecto.execute_stream(read)
+          ] do
+        assert {:error, %Selecto.Error{details: %{reason: :parameter_unbindable}}} = result
+      end
+    end
+
+    read =
+      q(ctx, priced)
+      |> Selecto.filter({"price", {:>=, Decimal.new("2")}})
+      |> Selecto.select(["id"])
+
+    assert {:ok, {[[2]], _, _}} = Selecto.execute(read)
+  end
 end
