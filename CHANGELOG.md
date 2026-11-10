@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- A NaN or infinite Decimal param refuses typed (`parameter_unbindable`)
+  instead of being sent as text, which MariaDB compares as 0.
 - A LATERAL join MariaDB cannot render refuses typed (`lateral_unsupported`) instead of raising.
 - A nested fragment holding a `?` without params refuses typed
   (`placeholder_count_mismatch`) instead of binding a value of the statement

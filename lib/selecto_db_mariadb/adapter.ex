@@ -815,6 +815,21 @@ defmodule SelectoDBMariaDB.Adapter do
   @impl true
   def placeholder(_index), do: "?"
 
+  # MySQL and MariaDB have no NaN or infinite DECIMAL: MyXQL would send such a
+  # Decimal as text, which compares as 0. It refuses typed instead.
+  @impl true
+  def parameter_placeholder(_index, %Decimal{coef: coef}) when not is_integer(coef) do
+    Selecto.Builder.ScopeRefusal.unsupported!(
+      Selecto.Error.validation_error("MariaDB cannot bind a NaN or infinite decimal parameter", %{
+        adapter: :mariadb,
+        unsupported_feature: :decimal_non_finite
+      }),
+      :parameter_unbindable
+    )
+  end
+
+  def parameter_placeholder(index, _value), do: placeholder(index)
+
   @impl true
   def quote_identifier(identifier) when is_binary(identifier) do
     escaped = String.replace(identifier, "`", "``")

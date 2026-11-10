@@ -307,7 +307,8 @@ defmodule SelectoDBMariaDB.SessionCheckIntegrationTest do
           assert {:error, %Selecto.Error{type: :query_enforcement, details: ^refusal}} =
                    Adapter.execute(conn, loop, [], opts)
 
-          assert {:error, %Selecto.Error{details: ^refusal}} = Adapter.stream(conn, loop, [], opts)
+          assert {:error, %Selecto.Error{details: ^refusal}} =
+                   Adapter.stream(conn, loop, [], opts)
         end
 
         # The host's own text reads what its session gives.

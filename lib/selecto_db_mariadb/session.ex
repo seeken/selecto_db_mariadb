@@ -791,8 +791,8 @@ defmodule SelectoDBMariaDB.Session do
         {:ok, %MyXQL.Result{rows: rows}} ->
           if warnings >= @warning_cap or length(rows) < warnings or
                Enum.any?(rows, &(Enum.at(&1, 1) in @cut_warnings)),
-            do: cut_result(),
-            else: :ok
+             do: cut_result(),
+             else: :ok
 
         {:error, reason} ->
           {:error, sanitize(reason)}
