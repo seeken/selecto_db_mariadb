@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- A negated IN write predicate (the read's NOT IN) renders its Decimal
+  operands with the inequality class, as the read does: a Decimal of more than
+  38 fraction digits stays bare there (exact) instead of refusing.
 - Write predicates render a Decimal operand as reads do (`(? + 0)` to 38
   fraction digits; a wider one refuses in = and IN), so a write touches the
   rows its read returns.
