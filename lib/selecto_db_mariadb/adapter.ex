@@ -820,10 +820,40 @@ defmodule SelectoDBMariaDB.Adapter do
   # `p = 1.5050000001` matched 1.505), as it was before this rendering;
   # `(? + 0)` compares exactly under every operator on INT, BIGINT UNSIGNED,
   # BIT, DECIMAL, DOUBLE and VARCHAR columns, indexed or not (a YEAR column
-  # converts the value to a year under either). Only Selecto's own generated
-  # comparisons are rendered so; host SQL text binds its params as written.
+  # converts the value to a year under either), for a value of at most 38
+  # fraction digits: the sum keeps at most 38, so one with more compares as
+  # another number. Such a value stays bare, which compares exactly in <>,
+  # NOT IN and range comparisons; in = and IN an indexed key would round it,
+  # so it refuses typed (no column MariaDB can index holds it exactly). Only
+  # Selecto's own generated comparisons are rendered so; host SQL text binds
+  # its params as written.
   @impl true
-  def comparison_operand(param, _class), do: ["(", param, " + 0)"]
+  def comparison_operand({:param, %Decimal{} = value} = param, class) do
+    cond do
+      fraction_digits(value) <= 38 ->
+        ["(", param, " + 0)"]
+
+      class == :equality ->
+        Selecto.SQL.ParamValues.refusal!(
+          :mariadb,
+          "cannot compare a decimal of more than 38 fraction digits for equality",
+          :decimal_range
+        )
+
+      true ->
+        param
+    end
+  end
+
+  defp fraction_digits(%Decimal{coef: coef, exp: exp}) when is_integer(coef) and coef != 0 do
+    {_coef, exp} = strip_zeros(coef, exp)
+    max(-exp, 0)
+  end
+
+  defp fraction_digits(_value), do: 0
+
+  defp strip_zeros(coef, exp) when rem(coef, 10) == 0, do: strip_zeros(div(coef, 10), exp + 1)
+  defp strip_zeros(coef, exp), do: {coef, exp}
 
   # A value MariaDB would get wrong (a NaN or infinite Decimal, which MyXQL
   # sends as text compared as 0; a Decimal past 81 integer digits or 72 after

@@ -154,9 +154,22 @@ defmodule SelectoDBMariaDB.DecimalOperandIntegrationTest do
     "2000.5"
   ]
 
+  # More than 34 digits (Decimal.new parses at most 34): 43, 52 and 38
+  # fraction digits.
+  @wide [
+    %Decimal{sign: 1, coef: 3_333_330_000_000_000_000_000_000_000_000_000_000_001, exp: -43},
+    %Decimal{
+      sign: -1,
+      coef: 6_666_660_000_000_000_000_000_000_000_000_000_000_000_000_000_001,
+      exp: -52
+    },
+    %Decimal{sign: 1, coef: 199_999_999_999_999_999_999_999_999_999_999_999_999, exp: -38}
+  ]
+
   defp conditions do
     vs =
-      Enum.map(@values, &Decimal.new/1) ++ [Decimal.div(1, 3), Decimal.new(3), Decimal.new(2003)]
+      Enum.map(@values, &Decimal.new/1) ++
+        @wide ++ [Decimal.div(1, 3), Decimal.new(3), Decimal.new(2003)]
 
     for v <- vs,
         cond <- [
@@ -184,6 +197,20 @@ defmodule SelectoDBMariaDB.DecimalOperandIntegrationTest do
   defp checked?(:b, {op, _vs} = cond) when op in [:in, :not_in], do: true or integral?(cond)
   defp checked?(_field, _cond), do: true
 
+  # MariaDB keeps at most 38 fraction digits in `(? + 0)`, and an indexed key
+  # rounds a bare value in = and IN: such a value refuses there, typed.
+  defp refusable?({op, _} = cond) when op in [:=, :in],
+    do: true and Enum.any?(cond_values(cond), &wide?(&1))
+
+  defp refusable?(_cond), do: false
+
+  defp wide?(%Decimal{coef: 0}), do: false
+
+  defp wide?(%Decimal{coef: coef, exp: exp}) do
+    zeros = coef |> Integer.digits() |> Enum.reverse() |> Enum.take_while(&(&1 == 0)) |> length()
+    -(exp + zeros) > 38
+  end
+
   defp four_digit?(cond), do: Enum.all?(cond_values(cond), &(Decimal.compare(&1, 1901) != :lt))
 
   defp cond_values({_op, %Decimal{} = v}), do: [v]
@@ -202,14 +229,17 @@ defmodule SelectoDBMariaDB.DecimalOperandIntegrationTest do
         acc ->
           want = for id <- @rows, holds?(stored(field, id), cond), do: id
 
-          {:ok, {rows, _, _}} =
-            q
-            |> Selecto.filter(filter(field, cond))
-            |> Selecto.select(["id"])
-            |> Selecto.execute()
+          case q
+               |> Selecto.filter(filter(field, cond))
+               |> Selecto.select(["id"])
+               |> Selecto.execute() do
+            {:ok, {rows, _, _}} ->
+              got = rows |> List.flatten() |> Enum.sort()
+              if got == want, do: acc, else: [{field, cond, length(got), length(want)} | acc]
 
-          got = rows |> List.flatten() |> Enum.sort()
-          if got == want, do: acc, else: [{field, cond, length(got), length(want)} | acc]
+            {:error, %Selecto.Error{details: %{reason: :parameter_unbindable}}} = refused ->
+              if refusable?(cond), do: acc, else: [{field, cond, refused} | acc]
+          end
       end
 
     assert wrong == []
