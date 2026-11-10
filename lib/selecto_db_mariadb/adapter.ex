@@ -815,6 +815,16 @@ defmodule SelectoDBMariaDB.Adapter do
   @impl true
   def placeholder(_index), do: "?"
 
+  # Measured live on MariaDB 11.4: a bare Decimal compared with an indexed
+  # INT or DECIMAL column is rounded into the key (`i = 1.5` matched 2,
+  # `p = 1.5050000001` matched 1.505), as it was before this rendering;
+  # `(? + 0)` compares exactly under every operator on INT, BIGINT UNSIGNED,
+  # BIT, DECIMAL, DOUBLE and VARCHAR columns, indexed or not (a YEAR column
+  # converts the value to a year under either). Only Selecto's own generated
+  # comparisons are rendered so; host SQL text binds its params as written.
+  @impl true
+  def comparison_operand(param, _class), do: ["(", param, " + 0)"]
+
   # A value MariaDB would get wrong (a NaN or infinite Decimal, which MyXQL
   # sends as text compared as 0; a Decimal past 81 integer digits or 72 after
   # the point; a year outside 0..9999, stored as a zero date; a float special
@@ -823,7 +833,7 @@ defmodule SelectoDBMariaDB.Adapter do
   @param_rules [decimal: :mysql, years: true, float_atoms: true]
   # Writes refuse only what no column stores: the server rounds a value to its
   # column's scale.
-  @write_rules [decimal: :finite, years: true, float_atoms: true]
+  @write_rules [decimal: :finite, years: true, float_atoms: true, uuid_text: true]
 
   @impl true
   def parameter_placeholder(index, value) do

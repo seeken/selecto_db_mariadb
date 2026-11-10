@@ -2,13 +2,21 @@
 
 ## Unreleased
 
+- A Decimal in one of Selecto's own comparisons (every operator, IN and
+  BETWEEN) renders as `(? + 0)`. MariaDB rounded a bare Decimal into an
+  indexed INT or DECIMAL key (`i = 1.5` matched 2, `p = 1.5050000001` matched
+  1.505), before this branch too; `(? + 0)` compares exactly on indexed and
+  plain INT, BIGINT UNSIGNED, BIT, DECIMAL, DOUBLE and VARCHAR columns. Host
+  SQL text (EXISTS strings, raw CTEs, `{:param, _}` markers) binds as written.
 - The value rules refuse only what MariaDB gets wrong (a Decimal past nine
   9-digit words); writes refuse only NaN/infinite Decimals and years past
-  9999, and year 0 binds.
+  9999, and year 0 binds. Text written to a `:uuid` field must read as a
+  UUID, as a filter's must (`invalid_value`, `parameter_unbindable`).
 - A value MariaDB cannot bind faithfully refuses typed (`parameter_unbindable`)
   in reads and writes before it runs: a NaN or infinite Decimal (stored as
-  0), a Decimal outside DECIMAL(65,30), a date or datetime outside the years 1
-  to 9999 (stored as 0000-00-00), and a float special atom. Streams enumerate
+  0), a Decimal past nine 9-digit words (reads only), a date or datetime
+  outside the years 0 to 9999 (stored as 0000-00-00), and a float special
+  atom. Streams enumerate
   in any process, again, and after a halt (see selecto_db_mysql).
 - A failure while a stream is enumerated (a refused stored value, a server
   error, a timeout) raises `Selecto.Error.Refused` typed as the non-stream
