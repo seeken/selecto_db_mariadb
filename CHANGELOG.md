@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- The value rules refuse only what MariaDB gets wrong (a Decimal past nine
+  9-digit words); writes refuse only NaN/infinite Decimals and years past
+  9999, and year 0 binds.
 - A value MariaDB cannot bind faithfully refuses typed (`parameter_unbindable`)
   in reads and writes before it runs: a NaN or infinite Decimal (stored as
   0), a Decimal outside DECIMAL(65,30), a date or datetime outside the years 1
