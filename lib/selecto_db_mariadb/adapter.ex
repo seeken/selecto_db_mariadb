@@ -1012,7 +1012,7 @@ defmodule SelectoDBMariaDB.Adapter do
   @impl Selecto.DB.WriteAdapter
   def execute_write_unsafe(connection, %Command{} = command, opts) do
     with :ok <- Command.validate(command),
-         :ok <- Selecto.SQL.ParamValues.write_refusal(command, @write_rules, :mariadb) do
+         :ok <- Selecto.SQL.ParamValues.write_refusal(command, @write_rules, :mariadb, opts) do
       with_write_transaction(connection, [command.relation], fn tx, mode ->
         with {:ok, session} <- verify_write_session(tx, mode),
              opts = Keyword.put(opts, :selecto_session, session),
@@ -1026,7 +1026,7 @@ defmodule SelectoDBMariaDB.Adapter do
 
   def execute_write_unsafe(connection, %Batch{} = batch, opts) do
     with :ok <- Batch.validate(batch),
-         :ok <- Selecto.SQL.ParamValues.write_refusal(batch, @write_rules, :mariadb) do
+         :ok <- Selecto.SQL.ParamValues.write_refusal(batch, @write_rules, :mariadb, opts) do
       relations = Enum.map(batch.commands, & &1.relation)
 
       with_write_transaction(connection, relations, fn tx, mode ->

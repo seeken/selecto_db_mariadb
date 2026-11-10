@@ -1,5 +1,6 @@
 defmodule SelectoDBMariaDB.WriteCompiler do
   @moduledoc false
+  @adapter SelectoDBMariaDB.Adapter
 
   alias Selecto.Write.{Batch, Command, Error, Preview}
 
@@ -314,16 +315,16 @@ defmodule SelectoDBMariaDB.WriteCompiler do
       case compile_value(value, opts, next) do
         {:ok, compiled} ->
           {:cont,
-           {:ok, [compiled.text | texts], params ++ compiled.params,
-            next + length(compiled.params)}}
+           {:ok, [compiled | texts], params ++ compiled.params, next + length(compiled.params)}}
 
         {:error, _} = error ->
           {:halt, error}
       end
     end)
     |> case do
-      {:ok, texts, params, _next} ->
-        texts = Enum.reverse(texts)
+      {:ok, compiled_values, params, _next} ->
+        compiled_values = Enum.reverse(compiled_values)
+        texts = Enum.map(compiled_values, & &1.text)
         column = quote_field(field, opts)
 
         if mode = exact_field?(field, opts) do
@@ -337,7 +338,29 @@ defmodule SelectoDBMariaDB.WriteCompiler do
              params: params ++ exact_binds(params)
            }}
         else
-          {:ok, %{text: "#{column} IN (#{Enum.join(texts, ", ")})", params: params}}
+          compiled_values
+          |> Enum.reduce_while({:ok, []}, fn compiled, {:ok, operands} ->
+            case Selecto.Builder.TypedOperator.write_operand(
+                   @adapter,
+                   :equality,
+                   compiled.params,
+                   compiled.text
+                 ) do
+              {:ok, operand} -> {:cont, {:ok, [operand | operands]}}
+              {:error, _} = error -> {:halt, error}
+            end
+          end)
+          |> case do
+            {:ok, operands} ->
+              {:ok,
+               %{
+                 text: "#{column} IN (#{operands |> Enum.reverse() |> Enum.join(", ")})",
+                 params: params
+               }}
+
+            error ->
+              error
+          end
         end
 
       error ->
@@ -429,7 +452,17 @@ defmodule SelectoDBMariaDB.WriteCompiler do
            params: compiled.params ++ exact_binds(compiled.params)
          }}
       else
-        {:ok, %{text: "#{column} #{operator_text} #{compiled.text}", params: compiled.params}}
+        # The operand renders as the same read filter renders it, so the
+        # write touches the rows the read returns.
+        with {:ok, operand} <-
+               Selecto.Builder.TypedOperator.write_operand(
+                 @adapter,
+                 Selecto.Builder.TypedOperator.write_class(operator),
+                 compiled.params,
+                 compiled.text
+               ) do
+          {:ok, %{text: "#{column} #{operator_text} #{operand}", params: compiled.params}}
+        end
       end
     end
   end
