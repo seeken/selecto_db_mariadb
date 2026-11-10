@@ -23,6 +23,14 @@ defmodule SelectoDBMariaDB.DecimalOperandIntegrationTest do
   end
 
   @rows for id <- 1..200, do: id
+  @jc [
+    {1, "0.000000", 0},
+    {2, "-0.000001", 1},
+    {3, "0.000001", 2},
+    {4, "1.500000", 2},
+    {5, "2.000000", 3},
+    {6, "-2.000000", -1}
+  ]
   defp i_of(id), do: rem(id, 5)
   defp d_of(id), do: Decimal.mult(Decimal.new(rem(id, 7) - 3), Decimal.new("0.333333"))
 
@@ -54,6 +62,45 @@ defmodule SelectoDBMariaDB.DecimalOperandIntegrationTest do
 
     MyXQL.query!(raw, "INSERT INTO dfx VALUES " <> values, [], query_type: :text)
     MyXQL.query!(raw, "ANALYZE TABLE dfx", [], query_type: :text)
+
+    MyXQL.query!(
+      raw,
+      "CREATE TABLE jc (id INT PRIMARY KEY, pid INT, d DECIMAL(12,6), i INT, KEY kd (d), KEY ki (i))",
+      [],
+      query_type: :text
+    )
+
+    MyXQL.query!(raw, "CREATE TABLE jp (id INT PRIMARY KEY)", [], query_type: :text)
+
+    jc_values =
+      Enum.map_join(@jc, ", ", fn {id, d, i} -> "(#{id}, #{id}, #{d}, #{i})" end)
+
+    MyXQL.query!(raw, "INSERT INTO jc VALUES " <> jc_values, [], query_type: :text)
+
+    MyXQL.query!(
+      raw,
+      "INSERT INTO jp VALUES " <> Enum.map_join(@jc, ", ", fn {id, _, _} -> "(#{id})" end),
+      [],
+      query_type: :text
+    )
+
+    MyXQL.query!(raw, "ANALYZE TABLE jc", [], query_type: :text)
+
+    MyXQL.query!(
+      raw,
+      "CREATE TABLE wt (id INT PRIMARY KEY, d DECIMAL(12,6), i INT, n INT DEFAULT 0, KEY kd (d), KEY ki (i))",
+      [],
+      query_type: :text
+    )
+
+    MyXQL.query!(
+      raw,
+      "INSERT INTO wt (id, d, i) VALUES " <>
+        Enum.map_join(@jc, ", ", fn {id, d, i} -> "(#{id}, #{d}, #{i})" end),
+      [],
+      query_type: :text
+    )
+
     {:ok, conn} = @adapter.connect(Keyword.put(opts(), :database, db))
 
     on_exit(fn ->
@@ -281,6 +328,168 @@ defmodule SelectoDBMariaDB.DecimalOperandIntegrationTest do
              ])
              |> Selecto.filter({:raw_sql_filter, "selecto_root.id IN (SELECT rid FROM hc)"})
            ) == want
+  end
+
+  test "a join_parameterize filter compares as a WHERE filter does", ctx do
+    parent = %{
+      name: "jp",
+      source: %{
+        source_table: "jp",
+        primary_key: :id,
+        fields: [:id],
+        redact_fields: [],
+        columns: %{id: %{type: :integer}},
+        associations: %{c: %{field: :c, queryable: :c, owner_key: :id, related_key: :pid}}
+      },
+      schemas: %{
+        c: %{
+          source_table: "jc",
+          primary_key: :id,
+          fields: [:id, :pid, :d, :i],
+          redact_fields: [],
+          columns: %{
+            id: %{type: :integer},
+            pid: %{type: :integer},
+            d: %{type: :decimal},
+            i: %{type: :integer}
+          },
+          associations: %{}
+        }
+      },
+      joins: %{
+        c: %{
+          name: "C",
+          type: :left,
+          source: "jc",
+          on: [%{left: "id", right: "pid"}],
+          fields: %{id: %{type: :integer}, d: %{type: :decimal}, i: %{type: :integer}},
+          filters: %{"d" => %{type: "decimal"}, "i" => %{type: "integer"}}
+        }
+      }
+    }
+
+    stored = Map.new(@jc, fn {id, d, i} -> {id, %{d: Decimal.new(d), i: Decimal.new(i)}} end)
+    far = Decimal.new(100)
+
+    wrong =
+      for {col, v} <- [
+            {:d, Decimal.new("-0.0000004")},
+            {:d, Decimal.new("1.5000004")},
+            {:d, Decimal.new("1.4999996")},
+            {:i, Decimal.new("1.5")},
+            {:i, Decimal.new("0.5")}
+          ],
+          f <- [
+            {:gt, v},
+            {:gte, v},
+            {:lt, v},
+            {:lte, v},
+            {:not_eq, v},
+            {:between, v, far},
+            {:in, [v]},
+            v
+          ],
+          reduce: [] do
+        acc ->
+          want =
+            for {id, m} <- stored,
+                (case f do
+                   {:between, lo, hi} ->
+                     Decimal.compare(m[col], lo) != :lt and Decimal.compare(m[col], hi) != :gt
+
+                   {:in, vs} ->
+                     Enum.any?(vs, &(Decimal.compare(m[col], &1) == :eq))
+
+                   {op, x} ->
+                     c = Decimal.compare(m[col], x)
+
+                     case op do
+                       :gt -> c == :gt
+                       :gte -> c != :lt
+                       :lt -> c == :lt
+                       :lte -> c != :gt
+                       :not_eq -> c != :eq
+                     end
+
+                   x ->
+                     Decimal.compare(m[col], x) == :eq
+                 end),
+                do: id
+
+          {:ok, {rows, _, _}} =
+            Selecto.configure(parent, ctx.conn, adapter: @adapter, validate: false)
+            |> Selecto.join_parameterize(:c, "x", [{col, f}])
+            |> Selecto.filter({"c:x.id", :not_null})
+            |> Selecto.select(["id"])
+            |> Selecto.execute()
+
+          got = rows |> List.flatten() |> Enum.sort()
+          if got == Enum.sort(want), do: acc, else: [{col, f, got, Enum.sort(want)} | acc]
+      end
+
+    assert wrong == []
+  end
+
+  test "a write predicate touches the rows the same read returns", ctx do
+    stored = Map.new(@jc, fn {id, d, i} -> {id, %{d: Decimal.new(d), i: Decimal.new(i)}} end)
+
+    wrong =
+      for {col, v} <- [
+            {:d, Decimal.new("-0.0000004")},
+            {:d, Decimal.new("1.5000004")},
+            {:d, Decimal.new("1.4999996")},
+            {:i, Decimal.new("1.5")}
+          ],
+          op <- [:eq, :neq, :gt, :gte, :lt, :lte, :in],
+          reduce: [] do
+        acc ->
+          MyXQL.query!(ctx.raw, "UPDATE wt SET n = 0", [], query_type: :text)
+
+          predicate =
+            if op == :in,
+              do: {:in, {:field, col}, [{:literal, v}]},
+              else: {op, {:field, col}, {:literal, v}}
+
+          {:ok, update} =
+            Selecto.Write.Command.new(%{
+              operation: :update,
+              relation: :wt,
+              assignments: [%{field: :n, value: {:literal, 1}}],
+              predicate: predicate,
+              expected_cardinality: :many
+            })
+
+          result = @adapter.execute_write_unsafe(ctx.conn, update, [])
+
+          touched =
+            MyXQL.query!(ctx.raw, "SELECT id FROM wt WHERE n = 1 ORDER BY id", [],
+              query_type: :text
+            ).rows
+            |> List.flatten()
+
+          want =
+            for {id, m} <- Enum.sort(stored),
+                (
+                  c = Decimal.compare(m[col], v)
+
+                  case op do
+                    :eq -> c == :eq
+                    :in -> c == :eq
+                    :neq -> c != :eq
+                    :gt -> c == :gt
+                    :gte -> c != :lt
+                    :lt -> c == :lt
+                    :lte -> c != :gt
+                  end
+                ),
+                do: id
+
+          if match?({:ok, _}, result) and touched == want,
+            do: acc,
+            else: [{col, op, v, result, touched, want} | acc]
+      end
+
+    assert wrong == []
   end
 
   test "an indexed column keeps its index for = and range comparisons", ctx do

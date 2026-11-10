@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Write predicates render a Decimal operand as reads do (`(? + 0)` to 38
+  fraction digits; a wider one refuses in = and IN), so a write touches the
+  rows its read returns.
+- A :uuid field over BINARY(16) storage reads and writes its 16 raw bytes as
+  given again; the :uuid write rule also checks context values.
 - A Decimal in one of Selecto's own comparisons (every operator, IN and
   BETWEEN) renders as `(? + 0)`. MariaDB rounded a bare Decimal into an
   indexed INT or DECIMAL key (`i = 1.5` matched 2, `p = 1.5050000001` matched
