@@ -969,12 +969,18 @@ defmodule SelectoDBMariaDB.NameRuleIntegrationTest do
     typed = typed_columns(ctx)
     read = fn filter -> q(ctx, typed) |> Selecto.filter(filter) |> Selecto.select(["id"]) end
 
-    # DECIMAL(65,30) holds none of these: -1e400 flipped sign, -1e-50 and
-    # 1e-31 rounded; a year past 9999 and a float special have no value here.
+    # The server reads a decimal into nine 9-digit words: -1e400 compared as
+    # positive, and 30 integer digits with 46 after the point are cut. A year
+    # past 9999 and a float special have no value here.
+    cut = %Decimal{
+      sign: 1,
+      coef: String.to_integer(String.duplicate("1", 30) <> String.duplicate("0", 45) <> "4"),
+      exp: -46
+    }
+
     for filter <- [
           {"price", {:>=, Decimal.new("-1e400")}},
-          {"price", {:>=, Decimal.new("-1e-50")}},
-          {"price", {:in, [Decimal.new("1e-31")]}},
+          {"price", {:>=, cut}},
           {"d", {:>=, Date.new!(10_000, 1, 1)}},
           {"score", {:>=, :"-inf"}}
         ] do
@@ -996,19 +1002,41 @@ defmodule SelectoDBMariaDB.NameRuleIntegrationTest do
     end
 
     assert {:ok, {[[1]], _, _}} = Selecto.execute(read.({"price", {:<, "2"}}))
+
+    # Everything else answers exactly, as it did: Decimal.div results, values
+    # past 30 places, and negative values that round to zero at the column's
+    # scale (MySQL compared -0.0000005 against DECIMAL(10,2) as 0).
+    rows = fn filter ->
+      {:ok, {rows, _, _}} = Selecto.execute(read.(filter))
+      rows |> List.flatten() |> Enum.sort()
+    end
+
+    assert rows.({"price", {:>, Decimal.div(1, 3)}}) == [1, 2]
+    assert rows.({"price", {:<, Decimal.div(5, 3)}}) == [1]
+    assert rows.({"price", {:>, Decimal.new("-0.0000005")}}) == [1, 2]
+    assert rows.({"price", {:>=, Decimal.new("-1e-50")}}) == [1, 2]
+    assert rows.({"price", {:in, [Decimal.new("1e-31"), Decimal.new("1.5")]}}) == [1]
+
+    assert rows.(
+             {"price",
+              %Decimal{sign: 1, coef: 15_000_000_000_000_000_000_000_000_000_000_004, exp: -34}}
+           ) == []
   end
 
   test "a UUID given in another text form compares as its canonical form", ctx do
     typed = typed_columns(ctx)
     read = fn value -> q(ctx, typed) |> Selecto.filter({"u", value}) |> Selecto.select(["id"]) end
 
+    # A UUID binds as given: the column's collation decides the case (this
+    # one ignores it); 32-hex text is not the dashed text stored.
     for value <- [
           "2b2b2b2b-2b2b-4b2b-8b2b-2b2b2b2b2b2b",
-          "2B2B2B2B-2B2B-4B2B-8B2B-2B2B2B2B2B2B",
-          "2b2b2b2b2b2b4b2b8b2b2b2b2b2b2b2b"
+          "2B2B2B2B-2B2B-4B2B-8B2B-2B2B2B2B2B2B"
         ] do
       assert {:ok, {[[1]], _, _}} = Selecto.execute(read.(value)), value
     end
+
+    assert {:ok, {[], _, _}} = Selecto.execute(read.("2b2b2b2b2b2b4b2b8b2b2b2b2b2b2b2b"))
 
     for value <- ["2b2b2b2b-2b2b-4b2b-8b2b-2b2b2b2b2b2b ", "not-a-uuid"] do
       assert {:error, %Selecto.Error{details: %{reason: :invalid_filter_value}}} =
@@ -1023,8 +1051,6 @@ defmodule SelectoDBMariaDB.NameRuleIntegrationTest do
     for {field, value} <- [
           {:price, Decimal.new("NaN")},
           {:price, Decimal.new("Infinity")},
-          {:price, Decimal.new("-1e400")},
-          {:price, Decimal.new("1e-50")},
           {:d, Date.new!(10_000, 1, 1)}
         ] do
       {:ok, insert} =
@@ -1045,6 +1071,36 @@ defmodule SelectoDBMariaDB.NameRuleIntegrationTest do
     end
 
     assert {:ok, %{rows: [[2]]}} = @adapter.execute(ctx.conn, "SELECT COUNT(*) FROM p", [], [])
+
+    # A finite value writes as it did: the server rounds it to the column's
+    # scale (Decimal.div(1, 3) into DECIMAL(10,2) is 0.33), and year 0 is a date.
+    for {id, field, value} <- [
+          {91, :price, Decimal.div(1, 3)},
+          {92, :price, Decimal.new("1e-50")},
+          {93, :d, ~D[0000-01-01]}
+        ] do
+      {:ok, insert} =
+        Selecto.Write.Command.new(%{
+          operation: :insert,
+          relation: :p,
+          assignments: [
+            %{field: :id, value: {:literal, id}},
+            %{field: field, value: {:literal, value}}
+          ]
+        })
+
+      assert {:ok, _} = @adapter.execute_write_unsafe(ctx.conn, insert, []), inspect(value)
+    end
+
+    assert {:ok, %{rows: [["0.33", "0.00", "0000-01-01"]]}} =
+             @adapter.execute(
+               ctx.conn,
+               "SELECT (SELECT CAST(price AS CHAR) FROM p WHERE id = 91), " <>
+                 "(SELECT CAST(price AS CHAR) FROM p WHERE id = 92), " <>
+                 "(SELECT CAST(d AS CHAR) FROM p WHERE id = 93)",
+               [],
+               []
+             )
   end
 
   test "a stream halts early, re-enumerates, and enumerates in another process", ctx do

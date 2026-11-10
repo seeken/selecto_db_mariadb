@@ -815,11 +815,15 @@ defmodule SelectoDBMariaDB.Adapter do
   @impl true
   def placeholder(_index), do: "?"
 
-  # A value MySQL and MariaDB cannot bind faithfully (a NaN or infinite
-  # Decimal, which MyXQL sends as text compared as 0; a Decimal outside
-  # DECIMAL(65,30); a year outside 1..9999; a float special atom) refuses
-  # typed (Selecto.SQL.ParamValues), in reads here and in writes.
+  # A value MariaDB would get wrong (a NaN or infinite Decimal, which MyXQL
+  # sends as text compared as 0; a Decimal past 81 integer digits or 72 after
+  # the point; a year outside 0..9999, stored as a zero date; a float special
+  # atom) refuses typed (Selecto.SQL.ParamValues), in reads here and in
+  # writes.
   @param_rules [decimal: :mysql, years: true, float_atoms: true]
+  # Writes refuse only what no column stores: the server rounds a value to its
+  # column's scale.
+  @write_rules [decimal: :finite, years: true, float_atoms: true]
 
   @impl true
   def parameter_placeholder(index, value) do
@@ -968,7 +972,7 @@ defmodule SelectoDBMariaDB.Adapter do
   @impl Selecto.DB.WriteAdapter
   def execute_write_unsafe(connection, %Command{} = command, opts) do
     with :ok <- Command.validate(command),
-         :ok <- Selecto.SQL.ParamValues.write_refusal(command, @param_rules, :mariadb) do
+         :ok <- Selecto.SQL.ParamValues.write_refusal(command, @write_rules, :mariadb) do
       with_write_transaction(connection, [command.relation], fn tx, mode ->
         with {:ok, session} <- verify_write_session(tx, mode),
              opts = Keyword.put(opts, :selecto_session, session),
@@ -982,7 +986,7 @@ defmodule SelectoDBMariaDB.Adapter do
 
   def execute_write_unsafe(connection, %Batch{} = batch, opts) do
     with :ok <- Batch.validate(batch),
-         :ok <- Selecto.SQL.ParamValues.write_refusal(batch, @param_rules, :mariadb) do
+         :ok <- Selecto.SQL.ParamValues.write_refusal(batch, @write_rules, :mariadb) do
       relations = Enum.map(batch.commands, & &1.relation)
 
       with_write_transaction(connection, relations, fn tx, mode ->
