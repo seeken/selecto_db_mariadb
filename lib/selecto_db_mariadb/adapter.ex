@@ -815,20 +815,17 @@ defmodule SelectoDBMariaDB.Adapter do
   @impl true
   def placeholder(_index), do: "?"
 
-  # MySQL and MariaDB have no NaN or infinite DECIMAL: MyXQL would send such a
-  # Decimal as text, which compares as 0. It refuses typed instead.
-  @impl true
-  def parameter_placeholder(_index, %Decimal{coef: coef}) when not is_integer(coef) do
-    Selecto.Builder.ScopeRefusal.unsupported!(
-      Selecto.Error.validation_error("MariaDB cannot bind a NaN or infinite decimal parameter", %{
-        adapter: :mariadb,
-        unsupported_feature: :decimal_non_finite
-      }),
-      :parameter_unbindable
-    )
-  end
+  # A value MySQL and MariaDB cannot bind faithfully (a NaN or infinite
+  # Decimal, which MyXQL sends as text compared as 0; a Decimal outside
+  # DECIMAL(65,30); a year outside 1..9999; a float special atom) refuses
+  # typed (Selecto.SQL.ParamValues), in reads here and in writes.
+  @param_rules [decimal: :mysql, years: true, float_atoms: true]
 
-  def parameter_placeholder(index, _value), do: placeholder(index)
+  @impl true
+  def parameter_placeholder(index, value) do
+    Selecto.SQL.ParamValues.refuse!(value, @param_rules, :mariadb)
+    placeholder(index)
+  end
 
   @impl true
   def quote_identifier(identifier) when is_binary(identifier) do
@@ -970,7 +967,8 @@ defmodule SelectoDBMariaDB.Adapter do
   """
   @impl Selecto.DB.WriteAdapter
   def execute_write_unsafe(connection, %Command{} = command, opts) do
-    with :ok <- Command.validate(command) do
+    with :ok <- Command.validate(command),
+         :ok <- Selecto.SQL.ParamValues.write_refusal(command, @param_rules, :mariadb) do
       with_write_transaction(connection, [command.relation], fn tx, mode ->
         with {:ok, session} <- verify_write_session(tx, mode),
              opts = Keyword.put(opts, :selecto_session, session),
@@ -983,7 +981,8 @@ defmodule SelectoDBMariaDB.Adapter do
   end
 
   def execute_write_unsafe(connection, %Batch{} = batch, opts) do
-    with :ok <- Batch.validate(batch) do
+    with :ok <- Batch.validate(batch),
+         :ok <- Selecto.SQL.ParamValues.write_refusal(batch, @param_rules, :mariadb) do
       relations = Enum.map(batch.commands, & &1.relation)
 
       with_write_transaction(connection, relations, fn tx, mode ->

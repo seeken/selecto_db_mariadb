@@ -102,19 +102,16 @@ defmodule SelectoDBMariaDB.RowStream do
           )
         end)
 
-      parent = self()
-      ref = make_ref()
-
-      task =
-        Selecto.TaskSupervisor.async(fn ->
-          run_producer(parent, ref, producer, receive_timeout)
-        end)
-
-      state = %{task: task, ref: ref, monitor_ref: task.ref}
+      # The cursor opens here, so a failure before the first rows returns
+      # typed and the columns are known. Its first rows serve the opening
+      # process's first enumeration; any other enumeration (another process,
+      # a second pass, one after a halt) runs the statement again with a
+      # producer of its own (resource/5).
+      state = start_producer(producer, receive_timeout)
 
       case first_message(state, receive_timeout) do
         {:chunk, rows, columns} ->
-          {:ok, resource(state, rows, receive_timeout, queue_timeout), columns}
+          {:ok, resource(state, rows, producer, receive_timeout, queue_timeout), columns}
 
         {:done, columns} ->
           stop(state, queue_timeout)
@@ -166,10 +163,25 @@ defmodule SelectoDBMariaDB.RowStream do
     end
   end
 
-  defp resource(state, first_rows, receive_timeout, queue_timeout) do
+  defp start_producer(producer, receive_timeout) do
+    parent = self()
+    ref = make_ref()
+
+    task =
+      Selecto.TaskSupervisor.async(fn ->
+        run_producer(parent, ref, producer, receive_timeout)
+      end)
+
+    %{task: task, ref: ref, monitor_ref: task.ref, owner: parent}
+  end
+
+  defp resource(state, first_rows, producer, receive_timeout, queue_timeout) do
     Stream.resource(
-      fn -> {state, first_rows} end,
+      fn -> enumeration(state, first_rows, producer, receive_timeout, queue_timeout) end,
       fn
+        {state, :done} ->
+          {:halt, {state, nil}}
+
         {state, rows} when is_list(rows) ->
           {rows, {state, nil}}
 
@@ -179,6 +191,66 @@ defmodule SelectoDBMariaDB.RowStream do
       end,
       fn {state, _pending} -> stop(state, queue_timeout) end
     )
+  end
+
+  # The opening process's first enumeration takes the cursor already open;
+  # every other one opens its own, owned by the enumerating process.
+  defp enumeration(state, first_rows, producer, receive_timeout, queue_timeout) do
+    if self() == state.owner and claim(state) do
+      {state, first_rows}
+    else
+      # The opening cursor, still unclaimed, holds the connection: it closes
+      # first, so this enumeration's own cursor can check the connection out.
+      retire_unclaimed(state, receive_timeout)
+      fresh = start_producer(producer, receive_timeout)
+
+      case first_message(fresh, receive_timeout) do
+        {:chunk, rows, _columns} ->
+          {fresh, rows}
+
+        {:done, _columns} ->
+          {fresh, :done}
+
+        {:error, reason} ->
+          stop(fresh, queue_timeout)
+          raise_error(reason)
+      end
+    end
+  end
+
+  defp retire_unclaimed(%{task: task, ref: ref}, receive_timeout) do
+    monitor = Process.monitor(task.pid)
+    send(task.pid, {ref, :retire_unclaimed, self()})
+
+    receive do
+      {^ref, :retired, true} ->
+        receive do
+          {:DOWN, ^monitor, :process, _pid, _reason} -> :ok
+        after
+          receive_timeout -> Process.demonitor(monitor, [:flush])
+        end
+
+      {^ref, :retired, false} ->
+        Process.demonitor(monitor, [:flush])
+
+      {:DOWN, ^monitor, :process, _pid, _reason} ->
+        :ok
+    end
+  end
+
+  # The open cursor answers one claim; a finished or cancelled one, none.
+  defp claim(%{task: task, ref: ref}) do
+    monitor = Process.monitor(task.pid)
+    send(task.pid, {ref, :claim, self()})
+
+    receive do
+      {^ref, :claimed, granted?} ->
+        Process.demonitor(monitor, [:flush])
+        granted?
+
+      {:DOWN, ^monitor, :process, _pid, _reason} ->
+        false
+    end
   end
 
   defp next_chunk(state, receive_timeout) do
@@ -258,6 +330,22 @@ defmodule SelectoDBMariaDB.RowStream do
       {^ref, :ack} ->
         :ok
 
+      # The open cursor's first rows go to one enumeration of the opening
+      # process (resource/5); a later claim is refused.
+      {^ref, :claim, from} ->
+        send(from, {ref, :claimed, from == parent and Process.put({ref, :claimed}, true) == nil})
+        await_ack(parent, parent_monitor_ref, ref, idle_timeout)
+
+      # Another enumeration needs the connection: an unclaimed cursor closes.
+      {^ref, :retire_unclaimed, from} ->
+        if Process.get({ref, :claimed}) do
+          send(from, {ref, :retired, false})
+          await_ack(parent, parent_monitor_ref, ref, idle_timeout)
+        else
+          send(from, {ref, :retired, true})
+          throw({:selecto_stream_cancelled, ref})
+        end
+
       {^ref, :cancel} ->
         throw({:selecto_stream_cancelled, ref})
 
@@ -272,11 +360,27 @@ defmodule SelectoDBMariaDB.RowStream do
 
   defp stop(state, queue_timeout) do
     send(state.task.pid, {state.ref, :cancel})
+
     # Let the producer deallocate its cursor and check the connection in; an
-    # immediate kill would make DBConnection drop the connection.
-    _ = Task.yield(state.task, queue_timeout) || Task.shutdown(state.task, :brutal_kill)
-    Process.demonitor(state.monitor_ref, [:flush])
-    drain(state.ref)
+    # immediate kill would make DBConnection drop the connection. Only the
+    # owner may yield a task; any other process waits for it to end.
+    if self() == state.owner do
+      _ = Task.yield(state.task, queue_timeout) || Task.shutdown(state.task, :brutal_kill)
+      Process.demonitor(state.monitor_ref, [:flush])
+      drain(state.ref)
+    else
+      monitor = Process.monitor(state.task.pid)
+
+      receive do
+        {:DOWN, ^monitor, :process, _pid, _reason} -> :ok
+      after
+        queue_timeout ->
+          Process.exit(state.task.pid, :kill)
+          Process.demonitor(monitor, [:flush])
+      end
+    end
+
+    :ok
   end
 
   defp drain(ref) do

@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- A value MariaDB cannot bind faithfully refuses typed (`parameter_unbindable`)
+  in reads and writes before it runs: a NaN or infinite Decimal (stored as
+  0), a Decimal outside DECIMAL(65,30), a date or datetime outside the years 1
+  to 9999 (stored as 0000-00-00), and a float special atom. Streams enumerate
+  in any process, again, and after a halt (see selecto_db_mysql).
 - A failure while a stream is enumerated (a refused stored value, a server
   error, a timeout) raises `Selecto.Error.Refused` typed as the non-stream
   read would return it, instead of a RuntimeError carrying only a message.
