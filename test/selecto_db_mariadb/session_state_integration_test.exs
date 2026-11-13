@@ -15,7 +15,7 @@ defmodule SelectoDBMariaDB.SessionStateIntegrationTest do
   @moduletag :mariadb
   @moduletag timeout: 120_000
 
-  defp domain(table, required_filters \\ []) do
+  defp domain(table, required_filters) do
     %{
       name: table,
       source: %{
@@ -38,7 +38,7 @@ defmodule SelectoDBMariaDB.SessionStateIntegrationTest do
     }
   end
 
-  defp read(conn, table, required_filters \\ [], select \\ ["id", "note"]) do
+  defp read(conn, table, required_filters, select) do
     domain(table, required_filters)
     |> update_in([:source, :fields], &(&1 ++ [:k]))
     |> put_in([:source, :columns, :k], %{type: :integer})
@@ -51,8 +51,6 @@ defmodule SelectoDBMariaDB.SessionStateIntegrationTest do
 
   defp rows({:ok, {rows, _columns, _aliases}}), do: rows
   defp rows({:error, %{details: %{reason: reason}}}), do: reason
-
-  defp zone(conn), do: query!(conn, "SELECT @@session.time_zone")
 
   defp timestamp_table!(conn) do
     ddl!(
@@ -79,19 +77,6 @@ defmodule SelectoDBMariaDB.SessionStateIntegrationTest do
 
   @scope [{"ts", {:lt, "2024-01-01 00:00:00"}}]
 
-  test "a view function that switches time_zone refuses the read and restores the session" do
-    with_database(fn conn ->
-      timestamp_table!(conn)
-      function_view!(conn, "IF i = 1 THEN SET time_zone = '-05:00'; END IF;")
-      before = zone(conn)
-
-      # The function runs for the selected view column `k`.
-      assert rows(read(conn, "tzv", @scope, ["id", "note", "k"])) == :session_state_changed
-      assert zone(conn) == before
-      assert rows(read(conn, "tzb", @scope)) == [[1, "in"], [3, "in3"]]
-    end)
-  end
-
   test "a time_zone switch and back inside one read cannot widen a TIMESTAMP scope" do
     with_database(fn conn ->
       timestamp_table!(conn)
@@ -103,25 +88,6 @@ defmodule SelectoDBMariaDB.SessionStateIntegrationTest do
       )
 
       assert rows(read(conn, "tzv", @scope, ["id", "note", "k"])) == [[1, "in", 1], [3, "in3", 3]]
-    end)
-  end
-
-  test "a trigger's time_zone switch refuses the write and restores the session" do
-    with_database(fn conn ->
-      timestamp_table!(conn)
-
-      ddl!(
-        conn,
-        "CREATE TRIGGER tzt BEFORE UPDATE ON tzb FOR EACH ROW BEGIN SET time_zone = '-05:00'; END"
-      )
-
-      before = zone(conn)
-
-      assert {:error, %Error{details: %{reason: :session_state_changed}}} =
-               Adapter.execute_write_unsafe(conn, update("tzb", 1, "w"), [])
-
-      assert zone(conn) == before
-      assert query!(conn, "SELECT note FROM tzb WHERE id = 1") == [["in"]]
     end)
   end
 

@@ -28,13 +28,9 @@ defmodule SelectoDBMariaDB.Session do
   #
   # The check also returns the session's time_zone and sql_mode (and
   # autocommit), the settings literal and TIMESTAMP interpretation depend on.
-  # A stored function a domain view calls, or a row trigger of a write, can
-  # SET them mid-statement and leave them changed (items 59, 62): every read,
-  # every stream batch and every write statement compares them again after
-  # it; a change restores the values seen before (session variables are not
-  # transactional) and refuses with `session_state_changed`, discarding the
-  # rows. A change made and undone inside one statement cannot be seen by
-  # the compare; TIMESTAMP scope comparisons are zone-independent instead
+  # Nothing is compared after a statement: a stored function or trigger that
+  # SETs them mid-statement is the host's own code (planted code is outside
+  # the threat model). TIMESTAMP scope comparisons stay zone-independent
   # (item 62a, `UNIX_TIMESTAMP(col)`).
 
   @query "SELECT @@session.time_zone, @@system_time_zone, " <>
@@ -45,9 +41,6 @@ defmodule SelectoDBMariaDB.Session do
 
   @no_select_limit 18_446_744_073_709_551_615
   @div_precision 4
-  @undo_read_settings "SESSION system_versioning_asof = DEFAULT, " <>
-                        "SESSION sql_select_limit = DEFAULT, " <>
-                        "SESSION div_precision_increment = DEFAULT"
   # GROUP_CONCAT or JSON_ARRAYAGG cut a row; a result over max_allowed_packet came
   # back NULL; max_recursive_iterations cut a CTE.
   @cut_warnings [1260, 1301, 1931]
@@ -90,10 +83,8 @@ defmodule SelectoDBMariaDB.Session do
     checkout(
       conn,
       fn checked_out ->
-        with {:ok, before} <- state(checked_out, opts),
-             {:ok, _} = result <- fun.(checked_out),
-             :ok <- unchanged(checked_out, before, opts) do
-          result
+        with {:ok, _before} <- state(checked_out, opts) do
+          fun.(checked_out)
         end
       end,
       opts
@@ -108,11 +99,11 @@ defmodule SelectoDBMariaDB.Session do
     checkout(
       conn,
       fn checked_out ->
-        with {:ok, before} <- state(checked_out, opts) do
+        with {:ok, _before} <- state(checked_out, opts) do
           if DBConnection.status(checked_out) == :idle do
-            ended(checked_out, fn -> checked(checked_out, before, fun, opts) end, opts)
+            ended(checked_out, fn -> fun.(checked_out) end, opts)
           else
-            checked(checked_out, before, fun, opts)
+            fun.(checked_out)
           end
         end
       end,
@@ -132,13 +123,7 @@ defmodule SelectoDBMariaDB.Session do
           end
         else
           with {:ok, before} <- state(checked_out, opts) do
-            guarded_read(
-              checked_out,
-              query,
-              before,
-              fn -> checked(checked_out, before, fun, opts) end,
-              opts
-            )
+            guarded_read(checked_out, query, before, fn -> fun.(checked_out) end, opts)
           end
         end
       end,
@@ -155,13 +140,6 @@ defmodule SelectoDBMariaDB.Session do
     do:
       Keyword.get(opts, :selecto_generated) != true and
         Keyword.get(opts, :selecto_raw_sql) != true
-
-  defp checked(conn, before, fun, opts) do
-    with {:ok, _} = result <- fun.(conn),
-         :ok <- unchanged(conn, before, opts) do
-      result
-    end
-  end
 
   @doc false
   # How a Selecto read runs on a checked-out connection.
@@ -651,61 +629,12 @@ defmodule SelectoDBMariaDB.Session do
   end
 
   @doc false
-  # Compares the session with `before` after a statement; on a change the
-  # values seen before are restored and the statement refused.
-  def unchanged(conn, %{time_zone: time_zone, sql_mode: sql_mode}, opts \\ []) do
-    case MyXQL.query(
-           conn,
-           "SELECT @@session.time_zone, @@session.sql_mode, " <>
-             "@@session.system_versioning_asof, @@session.sql_select_limit, " <>
-             "@@session.div_precision_increment",
-           [],
-           [query_type: :text] ++ Keyword.take(opts, [:timeout])
-         ) do
-      {:ok,
-       %MyXQL.Result{
-         rows: [[^time_zone, ^sql_mode, "DEFAULT", @no_select_limit, @div_precision]]
-       }} ->
-        :ok
-
-      # The check itself failed (a kill, a lost connection): nothing says the
-      # session changed, and the failure is what the caller is told.
-      {:error, reason} ->
-        {:error, sanitize(reason)}
-
-      {:ok, _changed} ->
-        _ =
-          MyXQL.query(
-            conn,
-            "SET SESSION time_zone = ?, SESSION sql_mode = ?, " <> @undo_read_settings,
-            [time_zone, sql_mode]
-          )
-
-        changed()
-    end
-  end
-
-  @doc false
   def relations(query) do
     ~r/\b(?:from|join)\s*(?:\(\s*)*((?:`(?:[^`]|``)+`|[A-Za-z_][A-Za-z0-9_$]*)(?:\s*\.\s*(?:`(?:[^`]|``)+`|[A-Za-z_][A-Za-z0-9_$]*))?)/i
     |> Regex.scan(IO.iodata_to_binary(query), capture: :all_but_first)
     |> Enum.map(fn [relation] -> String.replace(relation, ~r/\s+/, "") end)
     |> Enum.uniq()
   end
-
-  @doc false
-  def changed,
-    do:
-      {:error,
-       %Selecto.Error{
-         type: :query_enforcement,
-         message: "MariaDB statement changed the session's time_zone or sql_mode",
-         details: %{
-           code: :query_rule_violation,
-           reason: :session_state_changed,
-           adapter: :mariadb
-         }
-       }}
 
   @doc false
   # The decision on one row of the session query; pure, for unit tests.

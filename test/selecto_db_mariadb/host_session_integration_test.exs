@@ -751,26 +751,6 @@ defmodule SelectoDBMariaDB.HostSessionIntegrationTest do
     close(conn)
   end
 
-  test "a session check that fails is not a session change", %{other: other} do
-    conn = open()
-    {:ok, session} = Session.state(conn)
-    victim = id(conn)
-
-    result =
-      try do
-        DBConnection.run(conn, fn checked_out ->
-          sql(other, "KILL CONNECTION #{victim}")
-          Process.sleep(100)
-          throw({:checked, Session.unchanged(checked_out, session)})
-        end)
-      catch
-        :throw, {:checked, value} -> value
-      end
-
-    assert {:error, %Selecto.Error{type: :connection_error}} = result
-    close(conn)
-  end
-
   test "a kill storm reaches the host as what it is and leaves no transaction",
        %{other: other} do
     conn = open()
@@ -794,11 +774,6 @@ defmodule SelectoDBMariaDB.HostSessionIntegrationTest do
 
     :atomics.put(stop, 1, 1)
     Task.await(killer, 5_000)
-
-    refute Enum.any?(
-             results,
-             &match?({:error, %{details: %{reason: :session_state_changed}}}, &1)
-           )
 
     for result <- results do
       assert match?({:ok, _}, result) or
