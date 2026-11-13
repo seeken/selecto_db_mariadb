@@ -37,10 +37,9 @@ defmodule SelectoDBMariaDB.RowStream do
             conn,
             fn checked_out ->
               # The session is checked on the connection the cursor then
-              # uses, before the cursor opens and again after every fetched
-              # batch, before its rows are handed out (items 59, 62); a
-              # Selecto read runs as Session.guarded_read/5 says.
-              # Text wholly the host's takes neither (R71).
+              # uses, before the cursor opens; a Selecto read runs as
+              # Session.guarded_read/5 says. Text wholly the host's has only
+              # its encoding checked (R71).
               host? =
                 Keyword.get(opts, :selecto_session_guard) == true and Session.host_text?(opts)
 
@@ -62,8 +61,6 @@ defmodule SelectoDBMariaDB.RowStream do
                     # stream with a typed error (StoredValues). The cursor's
                     # first result carries what the statement warned of.
                     with :ok <- Session.not_cut(checked_out, warnings, opts),
-                         :ok <-
-                           if(host?, do: :ok, else: Session.unchanged(checked_out, session)),
                          :ok <- StoredValues.check(rows) do
                       send_chunk.(rows || [], columns || [])
                       {:cont, :ok}

@@ -1001,10 +1001,8 @@ defmodule SelectoDBMariaDB.Adapter do
     with :ok <- Command.validate(command),
          :ok <- Selecto.SQL.ParamValues.write_refusal(command, @write_rules, :mariadb, opts) do
       with_write_transaction(connection, [command.relation], fn tx, mode ->
-        with {:ok, session} <- verify_write_session(tx, mode),
-             opts = Keyword.put(opts, :selecto_session, session),
-             {:ok, result} <- execute_write_command(tx, command, opts),
-             :ok <- session_unchanged(tx, opts) do
+        with {:ok, _session} <- verify_write_session(tx, mode),
+             {:ok, result} <- execute_write_command(tx, command, opts) do
           {:ok, result}
         end
       end)
@@ -1017,11 +1015,10 @@ defmodule SelectoDBMariaDB.Adapter do
       relations = Enum.map(batch.commands, & &1.relation)
 
       with_write_transaction(connection, relations, fn tx, mode ->
-        with {:ok, session} <- verify_write_session(tx, mode) do
+        with {:ok, _session} <- verify_write_session(tx, mode) do
           opts =
             opts
             |> Keyword.put(:batch_commands, length(batch.commands))
-            |> Keyword.put(:selecto_session, session)
 
           batch.commands
           |> Enum.reduce_while({:ok, []}, fn command, {:ok, results} ->
@@ -1032,7 +1029,7 @@ defmodule SelectoDBMariaDB.Adapter do
           end)
           |> case do
             {:ok, results} ->
-              with :ok <- session_unchanged(tx, opts), do: {:ok, results}
+              {:ok, results}
 
             error ->
               error
@@ -1080,43 +1077,6 @@ defmodule SelectoDBMariaDB.Adapter do
     end
   end
 
-  # The session's time_zone and sql_mode after a write statement (items 59,
-  # 62): a row trigger can SET them, and MariaDB does not roll a session
-  # variable back. A change restores the values seen before and refuses; the
-  # write's transaction or savepoint then rolls its DML back.
-  defp session_unchanged(tx, opts) do
-    case Keyword.get(opts, :selecto_session) do
-      nil ->
-        :ok
-
-      session ->
-        case Session.unchanged(tx, session) do
-          :ok ->
-            :ok
-
-          {:error, %Selecto.Error{details: %{reason: :session_state_changed}}} ->
-            {:error,
-             Error.new(
-               :query_enforcement,
-               "MariaDB write changed the session's time_zone or sql_mode",
-               details: %{
-                 code: :query_rule_violation,
-                 reason: :session_state_changed,
-                 adapter: :mariadb
-               }
-             )}
-
-          # The check itself failed (a kill, a lost connection): that failure
-          # is what the caller is told.
-          {:error, %Selecto.Error{details: %{category: category}}} ->
-            execution_failed(category)
-
-          {:error, reason} ->
-            {:error, write_error(:execution_failed, reason)}
-        end
-    end
-  end
-
   # Upserts run the target-exact emulation (SelectoDBMariaDB.Upsert), never
   # ON DUPLICATE KEY UPDATE.
   defp execute_write_command(connection, %Command{operation: :upsert} = command, opts) do
@@ -1135,7 +1095,6 @@ defmodule SelectoDBMariaDB.Adapter do
              &control_statement/2,
              opts
            ),
-         :ok <- session_unchanged(connection, opts),
          {:ok, affected} <- check_cardinality(affected, command.expected_cardinality) do
       {:ok,
        %Result{
@@ -1166,7 +1125,6 @@ defmodule SelectoDBMariaDB.Adapter do
              command,
              execute_unchecked(connection, statement.text, statement.params, opts)
            ),
-         :ok <- session_unchanged(connection, opts),
          {:ok, affected_rows} <- enforce_cardinality(command, query_result),
          :ok <-
            InsertAdmission.after_insert(

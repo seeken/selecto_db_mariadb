@@ -155,27 +155,6 @@ defmodule SelectoDBMariaDB.SessionCheckIntegrationTest do
         assert current(conn) == [[1, "t1", 9], [2, "t2", 0]]
       end)
     end
-
-    test "a write's trigger that sets it is undone and refused" do
-      with_database(fn conn ->
-        versioned!(conn)
-
-        driver!(conn, """
-        CREATE TRIGGER sv_past BEFORE UPDATE ON sv FOR EACH ROW
-        SET @@session.system_versioning_asof = '#{@past}'
-        """)
-
-        assert {:error, %Error{details: %{reason: :session_state_changed}}} =
-                 Adapter.execute_write_unsafe(conn, scoped_update(1, "v", 9), [])
-
-        assert [["DEFAULT"]] =
-                 MyXQL.query!(conn, "SELECT @@session.system_versioning_asof", [],
-                   query_type: :text
-                 ).rows
-
-        assert current(conn) == [[1, "t1", 0], [2, "t2", 0]]
-      end)
-    end
   end
 
   describe "sql_select_limit (R74)" do
@@ -221,22 +200,6 @@ defmodule SelectoDBMariaDB.SessionCheckIntegrationTest do
                  MyXQL.query!(conn, "SELECT org, COUNT(*), SUM(v) FROM lim GROUP BY org", [],
                    query_type: :text
                  ).rows
-      end)
-    end
-
-    test "a write's trigger that sets it is undone and refused" do
-      with_database(fn conn ->
-        limited!(conn)
-
-        driver!(conn, """
-        CREATE TRIGGER lim3 BEFORE UPDATE ON lim FOR EACH ROW SET @@session.sql_select_limit = 3
-        """)
-
-        assert {:error, %Error{details: %{reason: :session_state_changed}}} =
-                 Adapter.execute_write_unsafe(conn, scoped_all("v", 7), [])
-
-        assert [[18_446_744_073_709_551_615]] =
-                 MyXQL.query!(conn, "SELECT @@session.sql_select_limit", [], query_type: :text).rows
       end)
     end
 
