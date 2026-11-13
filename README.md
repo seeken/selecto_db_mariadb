@@ -61,9 +61,9 @@ keys that are not the whole single-column primary key, guarded inserts on a
 table with a BEFORE INSERT trigger, and scoped upserts on a table with any
 INSERT or UPDATE trigger. Every governed write needs an InnoDB table and is
 refused up front otherwise: MEMORY, MyISAM and Aria cannot roll back a
-refused or failing write. A TEMPORARY table shadowing the target is refused
-for every write: information_schema does not list it, so no engine, key or
-trigger check could see it.
+refused or failing write. A TEMPORARY table of the target's name is the
+host's own session state and is not checked for: the engine, key and
+trigger checks read the base table's catalog entries.
 
 **Row-level triggers that modify other rows are allowed, and their effects
 on those rows are the schema owner's responsibility.** The check proves the
@@ -71,6 +71,24 @@ rows the statement itself wrote. A row-level trigger (AFTER INSERT, AFTER
 UPDATE or AFTER DELETE) that updates or deletes *other* rows, another
 tenant's included, runs and is not checked. MySQL has no statement-level
 triggers or rules.
+
+## What the host must provide
+
+Selecto's statements run in the host's session, as the host's own queries do.
+The adapter checks the session before each read, stream and write (see Session
+and tenant semantics) and trusts it for the rest of that call. The host
+provides:
+
+- the session settings that check names, set with MyXQL's `after_connect`;
+- no untrusted role with CREATE, ALTER, TRIGGER or CREATE ROUTINE on the
+  application's schemas: a view's function or a trigger that changes
+  `time_zone`, `sql_mode`, `sql_select_limit`, `div_precision_increment` or
+  `system_versioning_asof` mid-statement is not detected;
+- no TEMPORARY table named like a relation a domain reads or writes, in a
+  session Selecto uses: it shadows the base table and the catalog checks read
+  the base table;
+- statement bounds (`max_execution_time`, KILL) as the host's own: a killed
+  ROLLBACK that Selecto sends closes the connection rather than being retried.
 
 ## Session and tenant semantics
 
@@ -98,16 +116,11 @@ triggers or rules.
 - Only a BASE TABLE or SYSTEM VERSIONED table is a write target: a write to a
   SEQUENCE (`reason: :sequence_target`, an INSERT would reset it) or a view
   (`reason: :unsupported_write_target`) refuses with `query_rule_not_evaluable`.
-- The time zone and sql_mode are compared again after every read, after
-  every fetched stream batch (before its rows are handed out) and after
-  every write statement: a stored function a domain view calls, or a row
-  trigger, can `SET time_zone` mid-statement and leave it changed. A change
-  restores the values seen before (session variables are not
-  transactional), discards the rows and refuses
-  (`query_rule_violation`, `reason: :session_state_changed`); a write's
-  transaction or savepoint rolls back. A switch made and undone inside one
-  statement cannot be seen that way, so host, trusted, required and tenant
-  comparisons, and association `where` pins, on a column stored as
+- Nothing is compared after a statement. A stored function a domain view
+  calls, or a row trigger, that SETs `time_zone`, `sql_mode` or a read
+  setting mid-statement is the host's own code (see What the host must
+  provide). Host, trusted, required and tenant comparisons, and association
+  `where` pins, on a column stored as
   TIMESTAMP compare `UNIX_TIMESTAMP(col)` with an epoch computed in Elixir
   (the storage types are read before each read and each write). DATETIME
   columns compare as before.
@@ -127,10 +140,6 @@ triggers or rules.
   expression (`ts + INTERVAL 0 SECOND` reports DATETIME but follows the
   session time zone), an alias or a nested view refuses scope compares
   (`reason: :column_unresolved`).
-- A Selecto read refuses a relation a TEMPORARY table shadows
-  (`query_rule_not_evaluable`, `reason: :temporary_shadow`); a row trigger
-  can create one for the rest of the session. Unrelated temporary tables
-  keep working.
 - A checked-out connection with `autocommit=0` is inside the host's implicit
   transaction even before its first statement: a write there takes a
   savepoint, never BEGIN/COMMIT (which would commit the host's work). A
@@ -143,8 +152,8 @@ triggers or rules.
   `START TRANSACTION READ ONLY`, ended
   by that ROLLBACK, so a view that writes refuses (`reason: :read_only_read`)
   and nothing survives the read. Read-only state lives in that transaction;
-  no session setting is touched. If the ending itself fails it is retried,
-  then the connection closes.
+  no session setting is touched. If the ending itself fails (a KILL
+  QUERY on it included) the connection closes; it is not retried.
 - A read inside a host transaction runs as written: no savepoint, no anchor,
   no read-only mode. A writing view reached there is the host's to undo, and
   a write it made to a non-transactional table cannot be undone by anyone.
@@ -153,7 +162,7 @@ triggers or rules.
   ends it. A pool whose connections are left at `autocommit=0` therefore keeps
   each connection's snapshot from one checkout to the next.
 - Text wholly the host's (no compile built it) runs as written, in the host's
-  session: no `time_zone` or `sql_mode` refusal, no TEMPORARY guard; only the
+  session: no `time_zone` or `sql_mode` refusal; only the
   encoding refusal stays. It must be a read by its first word (SELECT, WITH, VALUES,
   TABLE, SHOW, EXPLAIN, DESCRIBE, ANALYZE of a select, or
   `reason: :hand_built_not_a_read`). MariaDB's parser takes no

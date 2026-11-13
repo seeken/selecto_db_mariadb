@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- Generated-SQL guards against code planted by a role with DBA-level access
+  are removed, as in selecto-perl: the TEMPORARY-shadow refusals of reads,
+  streams and writes (`temporary_shadow`, `temporary_table_shadow`), the
+  session comparison after every read, catalog read, stream batch and write
+  statement (`session_state_changed`), and the KILL retries of Selecto's own
+  ROLLBACK and ROLLBACK TO SAVEPOINT (a failed one closes the connection or
+  fails the caller's transaction, as before after the retries).
+  Kept: the session check before each operation, zone-independent TIMESTAMP
+  scope comparisons, the result-cut check, the lock probe, the write's
+  metadata lock, InnoDB and trigger checks and post-image re-read. A simple
+  or joined read sends 16 protocol commands, from 20 and 21. README gains
+  What the host must provide.
 - A negated IN write predicate (the read's NOT IN) renders its Decimal
   operands with the inequality class, as the read does: a Decimal of more than
   38 fraction digits stays bare there (exact) instead of refusing.
