@@ -149,8 +149,8 @@ defmodule SelectoDBMariaDB.Session do
   @doc false
   # Text wholly the host's: no compile stamped it, and no compile carried it as a
   # fragment. It runs in the host's session (R71), under no time_zone or sql_mode
-  # refusal and no TEMPORARY guard; only the encoding check stays. A statement
-  # Selecto built that carries a host fragment keeps every guard.
+  # refusal; only the encoding check stays. A statement Selecto built that
+  # carries a host fragment keeps every check.
   def host_text?(opts),
     do:
       Keyword.get(opts, :selecto_generated) != true and
@@ -686,57 +686,12 @@ defmodule SelectoDBMariaDB.Session do
   end
 
   @doc false
-  # A TEMPORARY table shadows a base table of the same name for this session
-  # (a host's, or one a write's row trigger created), and MySQL lists no
-  # temporary table in information_schema. A Selecto read refuses when any
-  # relation its statement names after FROM or JOIN (parenthesised joins
-  # included, R2) resolves to one
-  # (SHOW CREATE TABLE answers for the temporary table first); a name that
-  # does not resolve (a CTE, a derived table, a keyword) is no temporary
-  # table.
-  def refuse_temporary_shadows(conn, query, opts \\ []) do
-    query
-    |> relations()
-    |> Enum.reduce_while(:ok, fn relation, :ok ->
-      case MyXQL.query(
-             conn,
-             "SHOW CREATE TABLE " <> relation,
-             [],
-             [query_type: :text] ++ Keyword.take(opts, [:timeout])
-           ) do
-        {:ok, %MyXQL.Result{rows: [[_name, create | _]]}} when is_binary(create) ->
-          if Regex.match?(~r/\A\s*CREATE\s+TEMPORARY\s+TABLE/i, create),
-            do: {:halt, temporary_shadow()},
-            else: {:cont, :ok}
-
-        {:error, %MyXQL.Error{mysql: %{code: code}}} when code in @absent ->
-          {:cont, :ok}
-
-        {:error, reason} ->
-          {:halt, {:error, sanitize(reason)}}
-
-        {:ok, _unreadable} ->
-          {:halt, temporary_shadow()}
-      end
-    end)
-  end
-
-  @doc false
   def relations(query) do
     ~r/\b(?:from|join)\s*(?:\(\s*)*((?:`(?:[^`]|``)+`|[A-Za-z_][A-Za-z0-9_$]*)(?:\s*\.\s*(?:`(?:[^`]|``)+`|[A-Za-z_][A-Za-z0-9_$]*))?)/i
     |> Regex.scan(IO.iodata_to_binary(query), capture: :all_but_first)
     |> Enum.map(fn [relation] -> String.replace(relation, ~r/\s+/, "") end)
     |> Enum.uniq()
   end
-
-  defp temporary_shadow,
-    do:
-      {:error,
-       %Selecto.Error{
-         type: :query_enforcement,
-         message: "MariaDB read relation is shadowed by a TEMPORARY table",
-         details: %{code: :query_rule_not_evaluable, reason: :temporary_shadow, adapter: :mariadb}
-       }}
 
   @doc false
   def changed,

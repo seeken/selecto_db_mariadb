@@ -39,8 +39,7 @@ defmodule SelectoDBMariaDB.RowStream do
               # The session is checked on the connection the cursor then
               # uses, before the cursor opens and again after every fetched
               # batch, before its rows are handed out (items 59, 62); a
-              # Selecto read also refuses a relation a TEMPORARY table
-              # shadows, and runs as Session.guarded_read/5 says.
+              # Selecto read runs as Session.guarded_read/5 says.
               # Text wholly the host's takes neither (R71).
               host? =
                 Keyword.get(opts, :selecto_session_guard) == true and Session.host_text?(opts)
@@ -51,31 +50,27 @@ defmodule SelectoDBMariaDB.RowStream do
                        else: Session.state(checked_out)
                      ) do
                 cursor = fn ->
-                  with :ok <- if(host?, do: :ok, else: shadow_check(checked_out, statement, opts)) do
-                    checked_out
-                    |> MyXQL.stream(statement, params,
-                      max_rows: max_rows,
-                      timeout: stream_timeout
-                    )
-                    |> Enum.reduce_while(:ok, fn %MyXQL.Result{} = result, :ok ->
-                      %{rows: rows, columns: columns, num_warnings: warnings} = result
+                  checked_out
+                  |> MyXQL.stream(statement, params,
+                    max_rows: max_rows,
+                    timeout: stream_timeout
+                  )
+                  |> Enum.reduce_while(:ok, fn %MyXQL.Result{} = result, :ok ->
+                    %{rows: rows, columns: columns, num_warnings: warnings} = result
 
-                      # A stored value outside the supported range ends the
-                      # stream with a typed error (StoredValues). The cursor's
-                      # first result carries what the statement warned of.
-                      with :ok <- Session.not_cut(checked_out, warnings, opts),
-                           :ok <-
-                             if(host?, do: :ok, else: Session.unchanged(checked_out, session)),
-                           :ok <- StoredValues.check(rows) do
-                        send_chunk.(rows || [], columns || [])
-                        {:cont, :ok}
-                      else
-                        {:error, error} -> {:halt, {:producer_failed, error}}
-                      end
-                    end)
-                  else
-                    {:error, error} -> {:producer_failed, error}
-                  end
+                    # A stored value outside the supported range ends the
+                    # stream with a typed error (StoredValues). The cursor's
+                    # first result carries what the statement warned of.
+                    with :ok <- Session.not_cut(checked_out, warnings, opts),
+                         :ok <-
+                           if(host?, do: :ok, else: Session.unchanged(checked_out, session)),
+                         :ok <- StoredValues.check(rows) do
+                      send_chunk.(rows || [], columns || [])
+                      {:cont, :ok}
+                    else
+                      {:error, error} -> {:halt, {:producer_failed, error}}
+                    end
+                  end)
                 end
 
                 if Keyword.get(opts, :selecto_session_guard) == true,
@@ -122,12 +117,6 @@ defmodule SelectoDBMariaDB.RowStream do
           {:error, reason}
       end
     end
-  end
-
-  defp shadow_check(conn, statement, opts) do
-    if Keyword.get(opts, :selecto_session_guard) == true,
-      do: SelectoDBMariaDB.Session.refuse_temporary_shadows(conn, statement),
-      else: :ok
   end
 
   defp positive_integer(_name, value) when is_integer(value) and value > 0, do: :ok

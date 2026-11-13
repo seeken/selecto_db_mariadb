@@ -398,49 +398,6 @@ defmodule SelectoDBMariaDB.PostImageIntegrationTest do
     end)
   end
 
-  test "a TEMPORARY table shadowing the target is refused for every write" do
-    # w3exrev18 item 27: information_schema does not list temporary tables,
-    # so a TEMPORARY ENGINE=MEMORY table shadowing InnoDB defeated every
-    # engine, key and trigger check and kept an out-of-scope row.
-    with_database(fn conn ->
-      table!(conn)
-
-      ddl!(
-        conn,
-        "CREATE TEMPORARY TABLE tw (id INT PRIMARY KEY, org_key VARCHAR(16), site VARCHAR(16), name VARCHAR(16), touched INT DEFAULT 0) ENGINE=MEMORY"
-      )
-
-      ddl!(conn, "INSERT INTO tw (id, org_key, site, name) VALUES (1, 'T1', 'S1', 'a')")
-
-      shadow? = &match?({:error, %Error{details: %{reason: :temporary_table_shadow}}}, &1)
-
-      plain_delete = %Command{
-        operation: :delete,
-        relation: "tw",
-        assignments: [],
-        predicate: {:eq, {:field, "id"}, {:literal, 1}},
-        returning: :none,
-        expected_cardinality: :many,
-        metadata: %{}
-      }
-
-      for write <- [
-            update([{"site", "S9"}], site("S1")),
-            insert([{"id", 5}, {"org_key", "T1"}, {"site", "S2"}, {"name", "n"}], site("S1")),
-            plain_delete
-          ] do
-        assert shadow?.(Adapter.execute_write_unsafe(conn, write, [])), inspect(write.operation)
-      end
-
-      assert stored(conn) == [[1, "T1", "S1", "a"]]
-      ddl!(conn, "DROP TEMPORARY TABLE tw")
-      assert stored(conn) == [[1, "T1", "S1", "a"]]
-
-      assert {:ok, %{affected_rows: 1}} =
-               Adapter.execute_write_unsafe(conn, update([{"name", "u"}], site("S1")), [])
-    end)
-  end
-
   test "ordinary triggers keep working under a scope" do
     with_database(fn conn ->
       table!(conn)

@@ -141,7 +141,7 @@ defmodule SelectoDBMariaDB.Adapter do
     connection = resolve_connection(connection)
 
     # A Selecto read's stream (Selecto.Executor.selecto_read?/1, captured
-    # here: the producer runs in its own process) refuses TEMPORARY shadows.
+    # here: the producer runs in its own process) runs as Session.guarded_read/5.
     opts =
       if Selecto.Executor.selecto_read?(opts),
         do: Keyword.put(opts, :selecto_session_guard, true),
@@ -247,7 +247,7 @@ defmodule SelectoDBMariaDB.Adapter do
         route(
           connection,
           query,
-          &execute_checked(&1, query, params, opts),
+          &execute_unchecked(&1, query, params, opts),
           Keyword.put(opts, :selecto_statement, {normalize_query(query), params})
         )
       end
@@ -265,19 +265,6 @@ defmodule SelectoDBMariaDB.Adapter do
       Selecto.Executor.selecto_read?(opts) -> Session.read(connection, query, fun, opts)
       Keyword.get(opts, :selecto_catalog) == true -> Session.catalog(connection, fun, opts)
       true -> Session.run(connection, fun, opts)
-    end
-  end
-
-  # A Selecto read (marked by Selecto's executor,
-  # Selecto.Executor.selecto_read?/1) first refuses a relation a TEMPORARY
-  # table shadows.
-  defp execute_checked(connection, query, params, opts) do
-    if Selecto.Executor.selecto_read?(opts) and not Session.host_text?(opts) do
-      with :ok <- Session.refuse_temporary_shadows(connection, query, opts) do
-        execute_unchecked(connection, query, params, opts)
-      end
-    else
-      execute_unchecked(connection, query, params, opts)
     end
   end
 
