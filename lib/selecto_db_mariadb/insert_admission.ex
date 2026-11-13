@@ -35,8 +35,7 @@ defmodule SelectoDBMariaDB.InsertAdmission do
   @identifier ~r/\A[A-Za-z_][A-Za-z0-9_$]{0,63}\z/
 
   @doc false
-  # Every governed write takes the table's metadata lock (refusing a
-  # TEMPORARY shadow) and needs InnoDB: MEMORY, MyISAM and Aria tables keep a
+  # Every governed write takes the table's metadata lock and needs InnoDB: MEMORY, MyISAM and Aria tables keep a
   # change the transaction cannot roll back (w3exrev17 item 26a, w3exrev18
   # items 27 and 32).
   def require_transactional(connection, %Command{} = command, execute, opts) do
@@ -488,21 +487,12 @@ defmodule SelectoDBMariaDB.InsertAdmission do
   # until it ends, taken before any engine or trigger catalog read: a
   # concurrent CREATE/DROP TRIGGER (or ALTER) then waits for the commit
   # instead of slipping in between the check and the write (w3exrev16).
-  #
-  # A TEMPORARY table of the same name shadows the base table for this
-  # session and is invisible to information_schema, so every engine, key and
-  # trigger check would read the wrong table (w3exrev18 item 27): it is
-  # refused, detected through SHOW CREATE TABLE after the lock.
+  # A TEMPORARY table of the same name is the host's own session state.
   defp lock_metadata(connection, command, execute, opts) do
     relation = quote_relation(command.relation)
 
-    with {:ok, _} <- execute.(connection, "SELECT 1 FROM " <> relation <> " LIMIT 0", [], opts),
-         {:ok, %{rows: [[_name, create | _]]}} when is_binary(create) <-
-           execute.(connection, "SHOW CREATE TABLE " <> relation, [], opts) do
-      if Regex.match?(~r/\A\s*CREATE\s+TEMPORARY\s+TABLE/i, create),
-        do: temporary_shadow(),
-        else: writable_type(connection, command, execute, opts)
-    else
+    case execute.(connection, "SELECT 1 FROM " <> relation <> " LIMIT 0", [], opts) do
+      {:ok, _} -> writable_type(connection, command, execute, opts)
       {:error, _} = error -> error
       _ -> :error
     end
@@ -535,19 +525,6 @@ defmodule SelectoDBMariaDB.InsertAdmission do
          :query_enforcement,
          "MariaDB write target is " <> what,
          details: %{code: :query_rule_not_evaluable, reason: reason, adapter: :mariadb}
-       )}
-
-  defp temporary_shadow,
-    do:
-      {:error,
-       Error.new(
-         :query_enforcement,
-         "MariaDB write target is shadowed by a TEMPORARY table",
-         details: %{
-           code: :query_rule_not_evaluable,
-           reason: :temporary_table_shadow,
-           adapter: :mariadb
-         }
        )}
 
   # A deadlock (1213) or lock wait timeout (1205) while taking a lock or

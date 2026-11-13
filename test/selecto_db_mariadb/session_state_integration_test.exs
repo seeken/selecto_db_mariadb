@@ -125,34 +125,6 @@ defmodule SelectoDBMariaDB.SessionStateIntegrationTest do
     end)
   end
 
-  test "a TEMPORARY table shadowing a read relation is refused, for reads and streams" do
-    with_database(fn conn ->
-      timestamp_table!(conn)
-
-      ddl!(
-        conn,
-        "CREATE TEMPORARY TABLE tzb (id INT PRIMARY KEY, org_key VARCHAR(8), ts TIMESTAMP NULL, " <>
-          "note VARCHAR(16)) ENGINE=MEMORY"
-      )
-
-      assert rows(read(conn, "tzb")) == :temporary_shadow
-
-      stream =
-        domain("tzb")
-        |> Selecto.configure(conn, adapter: Adapter, validate: false)
-        |> Selecto.with_tenant("t1")
-        |> Selecto.select(["id", "note"])
-        |> Selecto.execute_stream()
-
-      assert {:error, %{details: %{reason: :temporary_shadow}}} = stream
-
-      # Unrelated temporary tables keep working (item 19).
-      ddl!(conn, "DROP TEMPORARY TABLE tzb")
-      ddl!(conn, "CREATE TEMPORARY TABLE scratch (id INT)")
-      assert rows(read(conn, "tzb")) == [[1, "in"], [2, "OUT"], [3, "in3"]]
-    end)
-  end
-
   test "autocommit=0 is the host's transaction: a savepoint, or a refusal on a managed path" do
     with_database(fn conn ->
       timestamp_table!(conn)

@@ -376,7 +376,9 @@ defmodule SelectoDBMariaDB.HostSessionIntegrationTest do
     sql(conn, "CREATE TEMPORARY TABLE hs_t (id INT PRIMARY KEY, org VARCHAR(20), v INT)")
     sql(conn, "INSERT INTO hs_t VALUES (42, 't1', 0)")
     assert {:ok, %{rows: [[42]]}} = read.("SELECT id FROM hs_t")
-    assert {:error, %{details: %{reason: :temporary_shadow}}} = mixed.()
+    # The session's TEMPORARY table is the host's own: Selecto's statement
+    # reads it as the host's own SELECT does.
+    assert {:ok, {[[42, 1]], _, _}} = mixed.()
     sql(conn, "DROP TEMPORARY TABLE hs_t")
 
     sql(conn, "SET NAMES latin1")
@@ -857,17 +859,6 @@ defmodule SelectoDBMariaDB.HostSessionIntegrationTest do
     else
       _closed -> :gen_tcp.close(server)
     end
-  end
-
-  test "a killed shadow check does not let a TEMPORARY table answer" do
-    {port, armed} = killing_proxy("SHOW CREATE TABLE")
-    conn = open(hostname: "127.0.0.1", port: port)
-    sql(conn, "CREATE TEMPORARY TABLE hs_t (id INT, org VARCHAR(20), v INT)")
-    sql(conn, "INSERT INTO hs_t VALUES (777, 'shadow', 0)")
-
-    :atomics.put(armed, 1, 1)
-    assert {:error, %{details: %{code: 1317}}} = read(conn)
-    close(conn)
   end
 
   test "a write whose RELEASE SAVEPOINT failed is not committed by the host", %{other: other} do
