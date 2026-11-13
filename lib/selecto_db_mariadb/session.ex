@@ -67,7 +67,6 @@ defmodule SelectoDBMariaDB.Session do
   # not locked. A read of such a name fails on its own. Nothing else says the
   # name is absent, a kill above all: a guard does not pass on its own failure.
   @absent [1146, 1049, 1046, 1064, 1142, 1100]
-  @undo_attempts 3
 
   @doc false
   def commit_statement, do: @commit
@@ -411,25 +410,24 @@ defmodule SelectoDBMariaDB.Session do
   end
 
   @doc false
-  # Returns `value` once the connection is idle. A rollback can be killed like
-  # any statement (MariaDB fails it with 1317, the transaction still open): it
-  # is retried, then the connection closes, since a connection that may still
-  # hold Selecto's transaction must not be reused. Nothing else runs in between:
+  # Returns `value` once the connection is idle. A rollback that fails (a kill
+  # lands on it: MariaDB fails it with 1317, the transaction still open) is not
+  # retried: the connection closes, since a connection that may still hold
+  # Selecto's transaction must not be reused. Nothing else runs in between:
   # Selecto never sets autocommit, so no later statement can commit what the
   # rollback did not undo. `value` is the original result in every
   # case. The read-only state a read carries lives in the transaction this
   # ends: START TRANSACTION READ ONLY rather than one-shot SET TRANSACTION,
   # which survives a failed read and a table-less SELECT.
   def settle(conn, value, opts \\ []) do
-    if idle?(conn, opts, @undo_attempts), do: value, else: {:selecto_session_close, value}
+    if idle?(conn, opts), do: value, else: {:selecto_session_close, value}
   end
 
-  defp idle?(conn, opts, attempts) do
+  defp idle?(conn, opts) do
     case DBConnection.status(conn) do
       :transaction ->
         case text(conn, @rollback, opts) do
           {:ok, _} -> DBConnection.status(conn) != :transaction
-          {:error, %MyXQL.Error{}} when attempts > 1 -> idle?(conn, opts, attempts - 1)
           {:error, %MyXQL.Error{}} -> false
           {:error, _} -> DBConnection.status(conn) != :transaction
         end
