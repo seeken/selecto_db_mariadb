@@ -877,6 +877,11 @@ defmodule SelectoDBMariaDB.Adapter do
     ]
   end
 
+  # The explorer quarter text, YYYY-Qn.
+  def format_datetime(expression, "quarter") do
+    ["CONCAT(DATE_FORMAT(", expression, ", '%Y'), '-Q', QUARTER(", expression, "))"]
+  end
+
   def format_datetime(expression, format) do
     case mysql_datetime_format(format) do
       nil -> ["CAST(", expression, " AS CHAR)"]
@@ -1436,6 +1441,10 @@ defmodule SelectoDBMariaDB.Adapter do
   defp mysql_datetime_format("DD"), do: "%d"
   defp mysql_datetime_format("D"), do: "%w"
   defp mysql_datetime_format("HH24"), do: "%H"
+  # Explorer group formats (remote_query.explorer.v1, section 5.2).
+  defp mysql_datetime_format("YYYY-MM-DD HH24"), do: "%Y-%m-%d %H"
+  defp mysql_datetime_format("iso_week"), do: "%x-W%v"
+  defp mysql_datetime_format("day_of_week"), do: "%W"
   defp mysql_datetime_format(_format), do: nil
 
   @impl true
