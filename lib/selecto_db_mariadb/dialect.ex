@@ -26,6 +26,52 @@ defmodule SelectoDBMariaDB.Dialect do
   def render_datetime_operation(%DateTimeOperation{} = operation, _selecto),
     do: unsupported_datetime(operation)
 
+  # Step buckets (numeric and year increments): floor(value / step) * step
+  # per row, labelled "<start>-<start + step - 1>", NULL as Other. Other
+  # bucket kinds stay unsupported, as before.
+  @impl true
+  def render_bucket(
+        %Selecto.Dialect.Bucket.Expression{kind: kind, increment: increment} = bucket,
+        _selecto
+      )
+      when kind in [:numeric_increment, :year_increment] and is_integer(increment) and
+             increment > 0 do
+    if Map.get(bucket, :temporal_options, %{}) in [nil, %{}] do
+      value =
+        if kind == :year_increment,
+          do: ["YEAR(", bucket.expression, ")"],
+          else: bucket.expression
+
+      step = Integer.to_string(increment)
+      start = ["(FLOOR(", value, " / ", step, ") * ", step, ")"]
+
+      {:ok,
+       [
+         "CASE WHEN ",
+         value,
+         " IS NULL THEN 'Other' ELSE CONCAT(CAST(",
+         start,
+         " AS SIGNED), '-', CAST(",
+         start,
+         " + ",
+         Integer.to_string(increment - 1),
+         " AS SIGNED)) END"
+       ]}
+    else
+      unsupported_bucket()
+    end
+  end
+
+  def render_bucket(_bucket, _selecto), do: unsupported_bucket()
+
+  defp unsupported_bucket,
+    do:
+      {:error,
+       Selecto.Error.validation_error("Adapter does not support the requested SQL fragment", %{
+         adapter: :mariadb,
+         unsupported_feature: :bucket_expression
+       })}
+
   @impl true
   def render_comparison(%Comparison{} = comparison, _selecto) do
     operator = if comparison.operation == :case_insensitive_not_like, do: "NOT LIKE", else: "LIKE"
