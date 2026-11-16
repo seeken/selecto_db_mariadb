@@ -107,7 +107,7 @@ defmodule SelectoDBMariaDB.PostImageIntegrationTest do
     end)
   end
 
-  test "a guarded insert or tenant upsert on a table with a BEFORE INSERT trigger is refused" do
+  test "typed insert admission still refuses BEFORE INSERT triggers" do
     # w3exrev15: a BEFORE INSERT trigger can rewrite the key itself, so the
     # stored row is not found under the key the statement reported.
     with_database(fn conn ->
@@ -129,147 +129,6 @@ defmodule SelectoDBMariaDB.PostImageIntegrationTest do
                    []
                  )
       end
-
-      ddl!(
-        conn,
-        "CREATE TABLE tu (id INT PRIMARY KEY, org_key VARCHAR(16) NOT NULL, code VARCHAR(16) NOT NULL, name VARCHAR(16), UNIQUE KEY tc (org_key, code)) ENGINE=InnoDB"
-      )
-
-      ddl!(conn, "INSERT INTO tu VALUES (1, 'T1', 'a', 'x')")
-
-      upsert = %Command{
-        operation: :upsert,
-        relation: "tu",
-        assignments: [
-          %{field: "id", value: {:literal, 2}},
-          %{field: "org_key", value: {:literal, "T1"}},
-          %{field: "code", value: {:literal, "a"}},
-          %{field: "name", value: {:literal, "evil"}}
-        ],
-        predicate: nil,
-        returning: :none,
-        expected_cardinality: {:exactly, 1},
-        metadata: %{
-          conflict_target: ["org_key", "code"],
-          declared_conflict_targets: [["org_key", "code"]],
-          upsert_update_fields: ["name"],
-          tenant_fields: ["org_key"],
-          field_types: %{"org_key" => :string},
-          post_image: %{predicate: {:eq, {:field, "org_key"}, {:literal, "T1"}}, key: ["id"]}
-        }
-      }
-
-      assert {:ok, %{affected_rows: _}} = Adapter.execute_write_unsafe(conn, upsert, [])
-
-      ddl!(
-        conn,
-        "CREATE TRIGGER tu_bu BEFORE UPDATE ON tu FOR EACH ROW SET NEW.org_key = LOWER(NEW.org_key)"
-      )
-
-      assert {:error, %Error{details: %{code: :query_rule_not_evaluable}}} =
-               Adapter.execute_write_unsafe(conn, upsert, [])
-
-      assert MyXQL.query!(conn, "SELECT id, org_key, code, name FROM tu ORDER BY id", [],
-               query_type: :text
-             ).rows ==
-               [[1, "T1", "a", "evil"]]
-
-      assert stored(conn) == [[1, "T1", "S1", "a"]]
-    end)
-  end
-
-  test "a trigger created while the write waits for the metadata lock is seen" do
-    # w3exrev16 item 11, three connections: C holds a shared metadata lock,
-    # B's CREATE TRIGGER queues behind it, and the write's catalog checks
-    # must wait behind B (they take the lock first) instead of reading the
-    # catalog before the trigger exists.
-    with_database(fn conn ->
-      table!(conn)
-
-      ddl!(
-        conn,
-        "CREATE TABLE tu (id INT PRIMARY KEY, org_key VARCHAR(16) NOT NULL, code VARCHAR(16) NOT NULL, name VARCHAR(16), UNIQUE KEY tc (org_key, code)) ENGINE=InnoDB"
-      )
-
-      ddl!(conn, "INSERT INTO tu VALUES (1, 'T1', 'a', 'x')")
-      [[database]] = MyXQL.query!(conn, "SELECT DATABASE()", [], query_type: :text).rows
-      options = Keyword.put(connection_options(), :database, database)
-      {:ok, b} = MyXQL.start_link(options)
-      {:ok, c} = MyXQL.start_link(options)
-
-      race = fn table, trigger, write ->
-        parent = self()
-
-        {:ok, _} =
-          MyXQL.transaction(
-            c,
-            fn tx ->
-              MyXQL.query!(tx, "SELECT * FROM #{table} LIMIT 0", [], query_type: :text)
-              tb = Task.async(fn -> MyXQL.query(b, trigger, [], query_type: :text) end)
-              Process.sleep(500)
-              ta = Task.async(fn -> Adapter.execute_write_unsafe(conn, write, []) end)
-              Process.sleep(1_500)
-              send(parent, {:tasks, ta, tb})
-            end,
-            timeout: 30_000
-          )
-
-        assert_receive {:tasks, ta, tb}
-        assert {:ok, _} = Task.await(tb, 30_000)
-        Task.await(ta, 30_000)
-      end
-
-      evil =
-        "BEGIN IF NEW.name = 'evil' THEN SET NEW.id = NEW.id + 100; SET NEW.org_key = 'T8'; END IF; END"
-
-      assert {:error, %Error{details: %{code: :query_rule_not_evaluable}}} =
-               race.(
-                 "tw",
-                 "CREATE TRIGGER tw_race BEFORE INSERT ON tw FOR EACH ROW " <> evil,
-                 insert(
-                   [{"id", 2}, {"org_key", "T1"}, {"site", "S1"}, {"name", "evil"}],
-                   site("S1")
-                 )
-               )
-
-      assert stored(conn) == [[1, "T1", "S1", "a"]]
-
-      upsert = %Command{
-        operation: :upsert,
-        relation: "tu",
-        assignments: [
-          %{field: "id", value: {:literal, 2}},
-          %{field: "org_key", value: {:literal, "T1"}},
-          %{field: "code", value: {:literal, "b"}},
-          %{field: "name", value: {:literal, "evil"}}
-        ],
-        predicate: nil,
-        returning: :none,
-        expected_cardinality: {:exactly, 1},
-        metadata: %{
-          conflict_target: ["org_key", "code"],
-          declared_conflict_targets: [["org_key", "code"]],
-          upsert_update_fields: ["name"],
-          tenant_fields: ["org_key"],
-          field_types: %{"org_key" => :string},
-          post_image: %{predicate: {:eq, {:field, "org_key"}, {:literal, "T1"}}, key: ["id"]}
-        }
-      }
-
-      assert {:error, %Error{details: %{code: :query_rule_not_evaluable}}} =
-               race.(
-                 "tu",
-                 "CREATE TRIGGER tu_race BEFORE INSERT ON tu FOR EACH ROW " <> evil,
-                 upsert
-               )
-
-      assert MyXQL.query!(conn, "SELECT id, org_key, code FROM tu ORDER BY id", [],
-               query_type: :text
-             ).rows ==
-               [[1, "T1", "a"]]
-
-      GenServer.stop(b)
-      GenServer.stop(c)
     end)
   end
 
@@ -556,8 +415,6 @@ defmodule SelectoDBMariaDB.PostImageIntegrationTest do
       }
     }
   end
-
-  defp ids(query), do: query |> rows() |> Enum.map(&hd/1) |> Enum.sort()
 
   defp rows(query) do
     {:ok, {rows, _columns, _aliases}} = Selecto.execute(query)

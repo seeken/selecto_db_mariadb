@@ -53,7 +53,7 @@ for application code.
 
 A write bound to a tenant or trusted scope (`metadata.post_image`, set by
 `SelectoUpdato`) runs in its own transaction (a savepoint inside the
-caller's), after a shared metadata lock on the table, and its written rows
+caller's), and its written rows
 are re-read by key under the scope before it ends. A row that left the scope
 rolls the write back (`query_rule_violation`); what the check cannot see
 through is refused (`query_rule_not_evaluable`): non-InnoDB tables, views,
@@ -286,3 +286,10 @@ mix test test/selecto_db_mariadb/write_execution_integration_test.exs \
 
 The suite creates a uniquely named database, verifies governed write and
 rollback behavior, and drops the database before disconnecting.
+
+### Governed write boundary
+
+Host-installed triggers, rules and concurrent owner DDL are outside the
+governed-write boundary. No separate catalog-stability lock is taken.
+InnoDB/strict-session checks, exact-key affected-row reads and typed insert
+admission remain because they establish rollback and storage semantics.

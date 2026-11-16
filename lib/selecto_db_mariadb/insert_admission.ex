@@ -39,7 +39,9 @@ defmodule SelectoDBMariaDB.InsertAdmission do
   # change the transaction cannot roll back (w3exrev17 item 26a, w3exrev18
   # items 27 and 32).
   def require_transactional(connection, %Command{} = command, execute, opts) do
-    with :ok <- lock_metadata(connection, command, execute, opts) do
+    # A SEQUENCE can report InnoDB but an INSERT resets its durable state.
+    # Keep this rollback boundary; no separate catalog-stability lock runs.
+    with :ok <- writable_type(connection, command, execute, opts) do
       if engine_checked_here?(command),
         do: transactional_engine(connection, command, execute, opts),
         else: :ok
@@ -97,7 +99,6 @@ defmodule SelectoDBMariaDB.InsertAdmission do
     with %{predicate: _predicate, primary_key: key} <- admission,
          true <- is_binary(key) and Regex.match?(@identifier, key),
          {:ok, schema, table} <- relation(command.relation),
-         :ok <- lock_metadata(connection, command, execute, opts),
          # Without strict mode MariaDB stores a converted value with only a
          # warning (`'0x10'` becomes 0), which the re-read would then admit.
          {:ok, %{rows: [[sql_mode]]}} <-
@@ -145,7 +146,6 @@ defmodule SelectoDBMariaDB.InsertAdmission do
         opts
       ) do
     with {:ok, schema, table} <- relation(command.relation),
-         :ok <- lock_metadata(connection, command, execute, opts),
          {:ok, %{rows: [[engine]]}} <-
            execute.(
              connection,
@@ -154,27 +154,9 @@ defmodule SelectoDBMariaDB.InsertAdmission do
              schema_params(schema) ++ [table],
              opts
            ),
-         true <- is_binary(engine) and String.downcase(engine) == "innodb",
-         {:ok, %{rows: [[0]]}} <-
-           execute.(
-             connection,
-             "SELECT COUNT(*) FROM information_schema.TRIGGERS WHERE EVENT_OBJECT_SCHEMA = " <>
-               schema_sql(schema) <>
-               " AND EVENT_OBJECT_TABLE = ? AND EVENT_MANIPULATION IN ('INSERT', 'UPDATE')",
-             schema_params(schema) ++ [table],
-             opts
-           ) do
+         true <- is_binary(engine) and String.downcase(engine) == "innodb" do
       :ok
     else
-      other -> retryable_or_denied(other)
-    end
-  end
-
-  # Every upsert's emulation reads the engine and unique indexes; hold the
-  # metadata lock before that too.
-  def before_upsert(connection, %Command{operation: :upsert} = command, execute, opts) do
-    case lock_metadata(connection, command, execute, opts) do
-      :ok -> :ok
       other -> retryable_or_denied(other)
     end
   end
@@ -271,7 +253,6 @@ defmodule SelectoDBMariaDB.InsertAdmission do
       ) do
     with true <- Regex.match?(@identifier, key),
          {:ok, schema, table} <- relation(command.relation),
-         :ok <- lock_metadata(connection, command, execute, opts),
          {:ok, %{rows: [[engine]]}} <-
            execute.(
              connection,
@@ -482,21 +463,6 @@ defmodule SelectoDBMariaDB.InsertAdmission do
   defp schema_sql(_schema), do: "?"
   defp schema_params(nil), do: []
   defp schema_params(schema), do: [schema]
-
-  # A shared metadata lock on the table, held by the write's transaction
-  # until it ends, taken before any engine or trigger catalog read: a
-  # concurrent CREATE/DROP TRIGGER (or ALTER) then waits for the commit
-  # instead of slipping in between the check and the write (w3exrev16).
-  # A TEMPORARY table of the same name is the host's own session state.
-  defp lock_metadata(connection, command, execute, opts) do
-    relation = quote_relation(command.relation)
-
-    case execute.(connection, "SELECT 1 FROM " <> relation <> " LIMIT 0", [], opts) do
-      {:ok, _} -> writable_type(connection, command, execute, opts)
-      {:error, _} = error -> error
-      _ -> :error
-    end
-  end
 
   # What a table is comes from the catalog: SHOW CREATE TABLE prints no SEQUENCE
   # option under NO_TABLE_OPTIONS. An INSERT would reset a SEQUENCE.
