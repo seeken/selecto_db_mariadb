@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+set -euo pipefail
+backend=$1
+baseline=${2:-none}
+dpkg-query -W -f='${binary:Package}\n' > /evidence/system-packages.txt
+while read -r pkg; do
+ case "$pkg" in
+  libpq*|postgresql*) [[ $backend = postgresql ]] || { echo "foreign system package $pkg"; exit 1; };;
+  libmysql*|libmariadb*|mysql*|mariadb*) [[ $backend = mysql || $backend = mariadb ]] || { echo "foreign system package $pkg"; exit 1; };;
+  libsqlite3*|sqlite3*) [[ $backend = sqlite || $baseline = sqlite ]] || { echo "foreign system package $pkg"; exit 1; };;
+  *duckdb*) [[ $backend = duckdb ]] || { echo "foreign system package $pkg"; exit 1; };;
+  *odbc*|freetds*|tdsodbc*) echo "foreign system package $pkg"; exit 1;;
+ esac
+done < /evidence/system-packages.txt
+# Headers and loose native libraries must agree with the package inventory.
+find /usr /lib /opt -type f \( -name sqlite3.h -o -name libpq-fe.h -o -name mysql.h -o -name duckdb.h -o -name 'libpq.so*' -o -name 'libsqlite3.so*' -o -name 'libmariadb.so*' -o -name 'libodbc.so*' -o -name 'libduckdb.so*' \) 2>/dev/null > /evidence/system-native-assets.txt
+while read -r file; do
+ case "$file" in
+  *sqlite*) [[ $backend = sqlite || $baseline = sqlite ]];;
+  *libpq*) [[ $backend = postgresql ]];;
+  *mysql*|*mariadb*) [[ $backend = mysql || $backend = mariadb ]];;
+  *duckdb*) [[ $backend = duckdb ]];;
+  *odbc*) exit 1;;
+ esac
+done < /evidence/system-native-assets.txt

@@ -1,0 +1,26 @@
+name: Selected backend consumer
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  consumer:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [mariadb]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: seeken/selecto
+          ref: 64bc30fc2f9d8d919f6cc6d1a41d05180b6c4806
+          token: ${{ secrets.SELECTO_ECOSYSTEM_TOKEN || github.token }}
+          path: core-source
+      - run: SELECTO_CORE_SOURCE=$GITHUB_WORKSPACE/core-source bash ci/single-backend/run "${{ matrix.backend }}"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: selected-${{ matrix.backend }}
+          path: single-backend-evidence

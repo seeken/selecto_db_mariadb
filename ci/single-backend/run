@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# Each invocation owns its network, containers and evidence directory.
+set -euo pipefail
+backend=${1:?backend required}
+case "$backend" in core|postgresql|mysql|mariadb|sqlite|duckdb) ;; *) exit 2;; esac
+repo=$(cd "$(dirname "$0")/../.." && pwd)
+name=sb-managed-dynamic-${GITHUB_RUN_ID:-local}-$$
+evidence=${EVIDENCE_DIR:-$repo/single-backend-evidence/$backend}
+mkdir -p "$evidence"; evidence=$(cd "$evidence" && pwd)
+images_before=$(docker image ls -q --no-trunc | sort -u)
+printf '%s\n' "$images_before" > "$evidence/images-before.txt"
+cleanup() {
+ code=$?
+ if [[ $code != 0 ]]; then docker logs "$name-db" > "$evidence/service-failure.log" 2>&1 || true; fi
+ docker rm -f "$name-consumer" "$name-db" "$name-producer" >/dev/null 2>&1 || true
+ docker network rm "$name" >/dev/null 2>&1 || true
+ printf '%s\n' "$code" > "$evidence/exit-code"
+ exit "$code"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+extra=(); if [[ -n ${SELECTO_CI_CPUSET:-} ]]; then extra+=(--cpuset-cpus "$SELECTO_CI_CPUSET"); fi
+docker network create "$name" >/dev/null
+port=55990
+case "$backend" in
+ postgresql)
+  docker run -d --name "$name-db" --network "$name" --network-alias database --memory 512m --memory-swap 512m "${extra[@]}" --tmpfs /var/lib/postgresql/data:rw,size=384m --tmpfs /tmp:rw,size=64m -e PGDATA=/var/lib/postgresql/data -e POSTGRES_HOST_AUTH_METHOD=trust -e POSTGRES_DB=single_backend postgres:17-bookworm -p "$port" >/dev/null
+  for i in {1..90}; do docker exec "$name-db" pg_isready -p "$port" -U postgres -d single_backend >/dev/null 2>&1 && break; sleep 1; done
+  docker exec "$name-db" pg_isready -p "$port" -U postgres -d single_backend
+  docker exec "$name-db" sh -c 'test "$(stat -f -c %T "$PGDATA")" = tmpfs && test "$(stat -f -c %T "$PGDATA/pg_wal")" = tmpfs'
+ ;;
+ mysql|mariadb)
+  image=mysql:8.4; admin=mysqladmin; server=mysqld
+  if [[ $backend = mariadb ]]; then image=mariadb:11.4; admin=mariadb-admin; server=mariadbd; fi
+  docker run -d --name "$name-db" --network "$name" --network-alias database --memory 1024m --memory-swap 1024m "${extra[@]}" --tmpfs /var/lib/mysql:rw,size=640m --tmpfs /var/run/mysqld:rw,size=32m --tmpfs /tmp:rw,size=64m -e MYSQL_ALLOW_EMPTY_PASSWORD=yes -e MYSQL_ROOT_HOST=% -e MYSQL_DATABASE=single_backend "$image" --port="$port" --skip-log-bin >/dev/null
+  for i in {1..120}; do
+   if docker exec "$name-db" sh -c 'tr "\0" " " </proc/1/cmdline' | grep -q "$server" && docker exec "$name-db" "$admin" --protocol=tcp -h127.0.0.1 -P "$port" -uroot ping >/dev/null 2>&1; then break; fi
+   sleep 1
+  done
+  docker exec "$name-db" "$admin" --protocol=tcp -h127.0.0.1 -P "$port" -uroot ping
+  docker exec "$name-db" sh -c 'test "$(stat -f -c %T /var/lib/mysql)" = tmpfs'
+ ;;
+esac
+if [[ $backend = postgresql || $backend = mysql || $backend = mariadb ]]; then
+ docker inspect "$name-db" > "$evidence/service.json"
+fi
+image=ubuntu:24.04
+core=${SELECTO_CORE_SOURCE:-$repo/../selecto}
+core=$(cd "$core" && pwd)
+docker image inspect "$image" >/dev/null 2>&1 || docker pull "$image"
+docker image inspect "$image" > "$evidence/toolchain-image.json"
+# The toolchain image is fresh for every backend; no developer install/cache mount.
+docker run --name "$name-consumer" --network "$name" --memory 4g --memory-swap 4g "${extra[@]}" -e DB_HOST=database -e DB_PORT="$port" -e DEBIAN_FRONTEND=noninteractive -v "$repo:/source:ro" -v "$core:/core:ro" -v "$evidence:/evidence" "$image" nice -n 10 bash /source/ci/single-backend/consumer.sh "$backend" 2>&1 | tee "$evidence/run.log"
