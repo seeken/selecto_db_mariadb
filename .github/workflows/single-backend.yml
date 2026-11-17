@@ -15,7 +15,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: seeken/selecto
-          ref: 64bc30fc2f9d8d919f6cc6d1a41d05180b6c4806
+          ref: c519a85b5f642181c47ef7799571a562825ae7d0
           token: ${{ secrets.SELECTO_ECOSYSTEM_TOKEN || github.token }}
           path: core-source
       - run: SELECTO_CORE_SOURCE=$GITHUB_WORKSPACE/core-source bash ci/single-backend/run "${{ matrix.backend }}"
