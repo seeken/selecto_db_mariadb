@@ -913,6 +913,9 @@ defmodule SelectoDBMariaDB.Adapter do
         :transactions,
         :rollup,
         :rollup_with_rollup,
+        # WITH ROLLUP has no GROUPING(): a subtotal row's NULL key cannot be
+        # told from a stored NULL, so callers that need the marker refuse.
+        :rollup_without_grouping,
         :schema_introspection,
         :json
       ]

@@ -142,6 +142,8 @@ defmodule SelectoDBMariaDB.AdapterTest do
 
   test "mariadb adapter reports rollup support" do
     assert SelectoDBMariaDB.Adapter.supports?(:rollup)
+    # WITH ROLLUP without GROUPING(): marker-dependent callers refuse.
+    assert SelectoDBMariaDB.Adapter.supports?(:rollup_without_grouping)
   end
 
   test "mariadb adapter reports schema introspection support" do

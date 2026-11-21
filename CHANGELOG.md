@@ -3,6 +3,10 @@
 ## Unreleased
 
 - `days_between` computed values: `DATEDIFF` of the two dates.
+- `supports?(:rollup_without_grouping)` is true: MariaDB's `WITH ROLLUP` has
+  no `GROUPING()`, so callers that need the subtotal marker (the selecto_api
+  engine handler's `grouping` column) refuse with `unsupported_feature`
+  instead of failing in the database.
 - Generated-SQL guards against code planted by a role with DBA-level access
   are removed, as in selecto-perl: the TEMPORARY-shadow refusals of reads,
   streams and writes (`temporary_shadow`, `temporary_table_shadow`), the
