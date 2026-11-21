@@ -399,6 +399,23 @@ defmodule SelectoDBMariaDB.Dialect do
     end
   end
 
+  # Whole calendar days from start to end: the difference of their dates.
+  def render_computed_value(
+        %{
+          __struct__: Selecto.Dialect.ComputedValue,
+          operation: :days_between,
+          expression: [start, finish],
+          type: "integer",
+          path: []
+        } = fragment,
+        _selecto
+      )
+      when map_size(fragment) == 5 do
+    if computed_expression?(start) and computed_expression?(finish),
+      do: {:ok, ["DATEDIFF(CAST(", finish, " AS DATE), CAST(", start, " AS DATE))"]},
+      else: invalid_computed_value(:days_between)
+  end
+
   def render_computed_value(_fragment, _selecto), do: invalid_computed_value(:unknown)
 
   defp path_segment({:param, value} = marker) do

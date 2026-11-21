@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- `days_between` computed values: `DATEDIFF` of the two dates.
 - Generated-SQL guards against code planted by a role with DBA-level access
   are removed, as in selecto-perl: the TEMPORARY-shadow refusals of reads,
   streams and writes (`temporary_shadow`, `temporary_table_shadow`), the
