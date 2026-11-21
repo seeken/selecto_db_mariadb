@@ -917,7 +917,10 @@ defmodule SelectoDBMariaDB.Adapter do
         # told from a stored NULL, so callers that need the marker refuse.
         :rollup_without_grouping,
         :schema_introspection,
-        :json
+        :json,
+        # RIGHT JOIN; MariaDB has no FULL JOIN, so a full join refuses
+        # (unsupported_feature) before any SQL.
+        :right_join
       ]
 
   @column_catalog_sql """
