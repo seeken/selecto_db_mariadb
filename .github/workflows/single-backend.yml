@@ -4,7 +4,8 @@ permissions:
   contents: read
 jobs:
   consumer:
-    runs-on: ubuntu-latest
+    # The existing consumer harness needs Docker, including embedded/scaffold lanes.
+    runs-on: [self-hosted, beep-vm]
     timeout-minutes: 25
     strategy:
       fail-fast: false
@@ -12,12 +13,19 @@ jobs:
         backend: [mariadb]
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/checkout@v4
         with:
-          repository: seeken/selecto
-          ref: fc07414dab4b23d3bccc2c1afb6a94a0c31c8d67
-          token: ${{ secrets.SELECTO_ECOSYSTEM_TOKEN || github.token }}
-          path: core-source
+          persist-credentials: false
+      - name: Check out immutable public Core anonymously
+        env:
+          CORE_REF: fc07414dab4b23d3bccc2c1afb6a94a0c31c8d67
+          GIT_TERMINAL_PROMPT: '0'
+        run: |
+          [[ "$CORE_REF" =~ ^[0-9a-f]{40}$ ]] || exit 1
+          git init core-source
+          git -c credential.helper= -C core-source fetch --no-tags --depth=1 https://github.com/seeken/selecto.git "$CORE_REF"
+          git -C core-source checkout --detach FETCH_HEAD
+          test "$(git -C core-source rev-parse HEAD)" = "$CORE_REF"
+          test -z "$(git -C core-source status --porcelain)"
       - run: SELECTO_CORE_SOURCE=$GITHUB_WORKSPACE/core-source bash ci/single-backend/run "${{ matrix.backend }}"
       - uses: actions/upload-artifact@v4
         if: always()
