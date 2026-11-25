@@ -766,6 +766,24 @@ defmodule SelectoDBMariaDB.Adapter do
     })
   end
 
+  def sanitize_error(%MyXQL.Error{mysql: %{code: code}} = error)
+      when code in @unique_violation_codes do
+    key =
+      case Regex.run(~r/\bfor key ['`]([A-Za-z_][A-Za-z0-9_.]*)['`]\s*\z/i, error.message || "",
+             capture: :all_but_first
+           ) do
+        [name] -> name |> String.split(".") |> List.last()
+        _ -> nil
+      end
+
+    Selecto.Error.query_error("mariadb rejected a unique key", nil, [], %{
+      adapter: :mariadb,
+      category: :unique_violation,
+      code: code,
+      constraint: key
+    })
+  end
+
   def sanitize_error(%MyXQL.Error{mysql: %{code: code}}) when is_integer(code) do
     Selecto.Error.query_error("MariaDB rejected the statement", nil, [], %{
       adapter: :mariadb,
@@ -1431,6 +1449,12 @@ defmodule SelectoDBMariaDB.Adapter do
      Error.new(:invalid_command, "expected a portable write command or batch",
        details: %{actual: write}
      )}
+  end
+
+  defp write_error(type, %Selecto.Error{details: %{category: :unique_violation} = details}) do
+    Error.new(type, "mariadb unique key rejected write",
+      details: Map.take(details, [:adapter, :category, :constraint, :code])
+    )
   end
 
   defp write_error(type, reason),

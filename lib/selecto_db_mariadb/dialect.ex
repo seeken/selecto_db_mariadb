@@ -348,7 +348,8 @@ defmodule SelectoDBMariaDB.Dialect do
   def render_computed_value(
         %{__struct__: Selecto.Dialect.ComputedValue, operation: :month_day, expression: value},
         _query
-      ), do: {:ok, ["(MONTH(", value, ") * 100 + DAY(", value, "))"]}
+      ),
+      do: {:ok, ["(MONTH(", value, ") * 100 + DAY(", value, "))"]}
 
   def render_computed_value(
         %{
