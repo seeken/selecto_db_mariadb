@@ -17,7 +17,7 @@ jobs:
           persist-credentials: false
       - name: Check out immutable public Core anonymously
         env:
-          CORE_REF: 41abd7292a42f7464d9eeb815a9d7fbd292c2dfa
+          CORE_REF: ba6d682912728880912c0dc826d6fff4e64aba3e
           GIT_TERMINAL_PROMPT: '0'
         run: |
           [[ "$CORE_REF" =~ ^[0-9a-f]{40}$ ]] || exit 1
