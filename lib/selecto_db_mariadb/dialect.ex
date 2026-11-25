@@ -346,6 +346,90 @@ defmodule SelectoDBMariaDB.Dialect do
 
   @impl true
   def render_computed_value(
+        %{__struct__: Selecto.Dialect.ComputedValue, operation: :month_day, expression: value},
+        _query
+      ), do: {:ok, ["(MONTH(", value, ") * 100 + DAY(", value, "))"]}
+
+  def render_computed_value(
+        %{
+          __struct__: Selecto.Dialect.ComputedValue,
+          operation: :months_between,
+          expression: [start, finish]
+        },
+        _query
+      ),
+      do:
+        {:ok,
+         [
+           "((YEAR(",
+           finish,
+           ") * 12 + MONTH(",
+           finish,
+           ")) - (YEAR(",
+           start,
+           ") * 12 + MONTH(",
+           start,
+           ")))"
+         ]}
+
+  def render_computed_value(
+        %{__struct__: Selecto.Dialect.ComputedValue, operation: :read_clock, expression: value},
+        _query
+      ),
+      do: {:ok, ["CAST(REPLACE(REPLACE(", value, ", 'T', ' '), 'Z', '') AS DATETIME)"]}
+
+  def render_computed_value(
+        %{
+          __struct__: Selecto.Dialect.ComputedValue,
+          operation: :period_bound,
+          expression: value,
+          type: type
+        },
+        _query
+      ),
+      do: {:ok, ["CAST(", value, " AS ", if(type == "date", do: "DATE", else: "DATETIME"), ")"]}
+
+  def render_computed_value(
+        %{
+          __struct__: Selecto.Dialect.ComputedValue,
+          operation: operation,
+          expression: [start, finish],
+          type: "decimal",
+          path: []
+        },
+        _selecto
+      )
+      when operation in [:hours_between, :fractional_days_between] do
+    divisor = if operation == :hours_between, do: "3600.0", else: "86400.0"
+
+    {:ok,
+     ["(TIMESTAMPDIFF(MICROSECOND, ", start, ", ", finish, ") / (", divisor, " * 1000000.0))"]}
+  end
+
+  def render_computed_value(
+        %{
+          __struct__: Selecto.Dialect.ComputedValue,
+          operation: :epoch_datetime,
+          expression: value,
+          type: unit,
+          path: []
+        },
+        _selecto
+      )
+      when unit in ["seconds", "milliseconds"] do
+    scale = if unit == "milliseconds", do: "1000.0", else: "1.0"
+
+    {:ok,
+     [
+       "TIMESTAMPADD(MICROSECOND, ",
+       value,
+       " * (1000000.0 / ",
+       scale,
+       "), CAST('1970-01-01 00:00:00' AS DATETIME))"
+     ]}
+  end
+
+  def render_computed_value(
         %{
           __struct__: Selecto.Dialect.ComputedValue,
           operation: :cast,

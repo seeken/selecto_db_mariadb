@@ -134,4 +134,33 @@ defmodule SelectoDBMariaDB.ParityDialectTest do
                Dialect.render_text_search_predicate(%{predicate | query: query}, %{})
     end
   end
+
+  test "elapsed durations and period bounds retain dialect arithmetic and binds" do
+    for {operation, divisor} <- [
+          {:hours_between, "3600.0"},
+          {:fractional_days_between, "86400.0"}
+        ] do
+      fragment = %Selecto.Dialect.ComputedValue{
+        operation: operation,
+        expression: ["started", "ended"],
+        type: "decimal"
+      }
+
+      assert {:ok, sql} = Dialect.render_computed_value(fragment, %{})
+      sql = IO.iodata_to_binary(sql)
+      assert sql =~ "TIMESTAMPDIFF(MICROSECOND, started, ended)"
+      assert sql =~ divisor
+    end
+
+    fragment = %Selecto.Dialect.ComputedValue{
+      operation: :period_bound,
+      expression: {:param, "2026-03-08 07:00:00"},
+      type: "datetime"
+    }
+
+    assert {:ok, sql} = Dialect.render_computed_value(fragment, %{})
+
+    assert {"CAST(? AS DATETIME)", ["2026-03-08 07:00:00"]} =
+             Selecto.SQL.Params.finalize(sql, adapter: SelectoDBMariaDB.Adapter)
+  end
 end
